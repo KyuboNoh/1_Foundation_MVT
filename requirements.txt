@@ -1,0 +1,26 @@
+# --- Linux prerequisites for UI (SSL/TLS) ---
+# Make sure your Python has SSL support; otherwise Gradio/websockets won't run.
+# 1) System packages:
+#    sudo apt-get update && sudo apt-get install -y openssl ca-certificates libssl-dev
+# 2) If you built Python from source, libssl-dev must be installed BEFORE building Python.
+# 3) Verify:
+#    python - << 'PY'
+#    import ssl; print("SSL OK:", ssl.OPENSSL_VERSION)
+#    PY
+
+# ---- Core (headless) runtime ----
+numpy>=1.23
+pandas>=1.5
+scikit-learn>=1.2
+xgboost>=1.7           # optional at runtime; code falls back to RF if absent
+matplotlib>=3.7
+pydantic>=2,<3         # code uses Pydantic v2 APIs
+
+# ---- Backbone (STAC) ----
+rasterio 
+rio-cogeo 
+geopandas 
+pyogrio 
+shapely 
+pyarrow
+pystac
