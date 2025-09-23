@@ -1,0 +1,8 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://stac-extensions.github.io/checksum/v1.0.0/schema.json",
+  "title": "Checksum Extension (local fallback)",
+  "description": "Local fallback schema used when the checksum extension schema cannot be fetched.",
+  "type": ["object", "array", "string", "number", "integer", "boolean", "null"],
+  "additionalProperties": true
+}

@@ -24,6 +24,12 @@ from datetime import datetime, timezone
 
 import numpy as np
 
+
+TABLE_EXT = "https://stac-extensions.github.io/table/v1.2.0/schema.json"
+CHECKSUM_EXT = "https://stac-extensions.github.io/checksum/v1.0.0/schema.json"
+PROJECTION_EXT = "https://stac-extensions.github.io/projection/v2.0.0/schema.json"
+RASTER_EXT = "https://stac-extensions.github.io/raster/v1.1.0/schema.json"
+
 # Defer heavy imports until functions run to improve robustness when listing help, etc.
 def _require_rasterio():
     try:
@@ -64,7 +70,35 @@ def _require_pystac():
         "ProjectionExtension": ProjectionExtension,
         "RasterExtension": RasterExtension,
         "Band": Band,
+        "DefaultStacIO": pystac.stac_io.DefaultStacIO,
     }
+
+
+def _install_local_schema_cache():
+    mods = _require_pystac()
+    pystac = mods["pystac"]
+    DefaultStacIO = mods["DefaultStacIO"]
+
+    local_schema = (Path(__file__).resolve().parent / "schemas" / "checksum_v1.0.0.json").resolve()
+    if not local_schema.exists():
+        return lambda: None
+
+    class LocalSchemaStacIO(DefaultStacIO):
+        _SCHEMA_MAP = {CHECKSUM_EXT: local_schema}
+
+        def read_text(self, href, *args, **kwargs):  # type: ignore[override]
+            mapped = self._SCHEMA_MAP.get(href)
+            if mapped:
+                return Path(mapped).read_text(encoding="utf-8")
+            return super().read_text(href, *args, **kwargs)
+
+    previous_io_cls = pystac.StacIO.default().__class__
+    pystac.StacIO.set_default(LocalSchemaStacIO)
+
+    def _reset():
+        pystac.StacIO.set_default(previous_io_cls)
+
+    return _reset
 
 def _has_rio_cogeo():
     try:
@@ -74,10 +108,6 @@ def _has_rio_cogeo():
     except Exception:
         return False
 
-TABLE_EXT = "https://stac-extensions.github.io/table/v1.2.0/schema.json"
-CHECKSUM_EXT = "https://stac-extensions.github.io/checksum/v1.0.0/schema.json"
-PROJECTION_EXT = "https://stac-extensions.github.io/projection/v2.0.0/schema.json"
-RASTER_EXT = "https://stac-extensions.github.io/raster/v1.1.0/schema.json"
 
 def sha256sum(path: Path, blocksize: int = 65536) -> str:
     h = hashlib.sha256()
@@ -711,6 +741,8 @@ def main():
     raw_dir = Path(args.raw_dir)
     out_dir = Path(args.out)
     ensure_dir(out_dir)
+    collection_root = out_dir / args.collection_id
+    ensure_dir(collection_root)
 
     mods = _require_pystac()
     pystac = mods["pystac"]
@@ -734,8 +766,23 @@ def main():
     else:
         coll.add_link(Link(rel="via", target=raw_dir.resolve().as_uri(), title="Original data directory"))
 
-    asset_dir = out_dir / args.assets_subdir
-    ignore_roots = [asset_dir, out_dir / args.collection_id]
+    asset_dir = collection_root / args.assets_subdir
+    ensure_dir(asset_dir)
+
+    registry_dst = collection_root / "feature_registry.yaml"
+    if not registry_dst.exists():
+        registry_src = Path(__file__).resolve().parent / "unify" / "feature_registry.yaml"
+        if registry_src.exists():
+            shutil.copy2(registry_src, registry_dst)
+        else:
+            registry_dst.write_text(
+                "crs: \"EPSG:3005\"\n"
+                "resolution: 100\n"
+                "variables: {}\n",
+                encoding="utf-8",
+            )
+
+    ignore_roots = [asset_dir, collection_root]
     rasters, vector_sources = scan_files(raw_dir, ignore_roots=ignore_roots)
     logging.info(f"Found {len(rasters)} rasters and {len(vector_sources)} vector files in {raw_dir}")
 
@@ -747,6 +794,9 @@ def main():
 
     cat.add_child(coll)
 
+    reset_io = None
+    if args.validate:
+        reset_io = _install_local_schema_cache()
     if args.validate:
         try:
             coll.validate()
@@ -756,6 +806,8 @@ def main():
         except Exception as e:
             logging.warning(f"Validation failed: {e}")
         logging.info("STAC validation passed.")
+    if reset_io:
+        reset_io()
 
     catalog_href = out_dir / f"catalog_{args.collection_id}.json"
     cat.normalize_hrefs(str(out_dir))

@@ -25,4 +25,5 @@ shapely
 pyarrow
 xarray
 zarr
-pystac
+#pystac
+pystac[validation]
