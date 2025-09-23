@@ -23,4 +23,6 @@ geopandas
 pyogrio 
 shapely 
 pyarrow
+xarray
+zarr
 pystac

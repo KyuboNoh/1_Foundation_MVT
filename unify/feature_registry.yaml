@@ -1,0 +1,18 @@
+crs: "EPSG:3005"
+resolution: 100  # meters (square pixels)
+variables:
+  mag_tilt_deg:
+    long_name: Magnetic tilt
+    units: deg
+    nodata: null
+    dtype: float32
+  grav_bouguer_mGal:
+    long_name: Bouguer gravity
+    units: mGal
+    nodata: null
+    dtype: float32
+  K_pct:
+    long_name: Potassium
+    units: percent
+    nodata: -9999
+    dtype: float32
