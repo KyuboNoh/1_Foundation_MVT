@@ -1,0 +1,9 @@
+torch>=2.2
+numpy
+rasterio
+scikit-learn
+pyyaml
+tqdm
+torchmetrics
+captum
+shapely

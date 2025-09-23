@@ -1,0 +1,53 @@
+# Paths
+raster_dir: /path/to/stacked_bands # directory of aligned GeoTIFF bands (*.tif)
+label_points: /path/to/deposit_points.geojson # points with class=1; unknowns are unlabelled
+work_dir: ./work
+
+
+# Raster sampling
+patch_size: 32 # w (pixels)
+stride: 16 # for dense tiling at inference
+nodata_val: null # if set, pixels equal to this are treated as missing
+
+
+# SSL pretraining (MAE‑ViT)
+ssl:
+embed_dim: 256
+depth: 6
+num_heads: 8
+mlp_ratio: 4.0
+mask_ratio: 0.75
+epochs: 30
+batch_size: 128
+lr: 2.5e-4
+
+
+# Classifier
+cls:
+hidden_dims: [256, 128]
+dropout_p: 0.2
+epochs: 60
+batch_size: 512
+lr: 1e-3
+balance_oversample: true
+
+
+# Positive–Unlabeled undersampling
+pu:
+filter_top_similar_pct: 0.10 # 0.05–0.10 suggested
+negatives_per_positive: 5
+
+
+# MC‑Dropout inference
+mc:
+passes: 30
+
+
+# Ablations
+ablation:
+sparse_feature_drop_prob: 0.5 # at test time
+
+
+# Misc
+seed: 1337
+num_workers: 8
