@@ -5,7 +5,9 @@ from sklearn.metrics import f1_score, matthews_corrcoef
 from torchmetrics.classification import BinaryAUROC, BinaryAveragePrecision
 from tqdm import tqdm
 
-def train_classifier(encoder, mlp, train_loader, val_loader, epochs=50, lr=1e-3, device='cuda'):
+def train_classifier(encoder, mlp, train_loader, val_loader, epochs=50, lr=1e-3, device=None):
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
     encoder.eval().to(device)
     mlp.to(device)
     opt = torch.optim.AdamW(mlp.parameters(), lr=lr)
@@ -28,7 +30,9 @@ def train_classifier(encoder, mlp, train_loader, val_loader, epochs=50, lr=1e-3,
     mlp.load_state_dict(best["state_dict"])
     return mlp
 
-def eval_classifier(encoder, mlp, loader, device='cuda'):
+def eval_classifier(encoder, mlp, loader, device=None):
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
     encoder.eval().to(device)
     mlp.eval().to(device)
     ys, ps = [], []

@@ -21,6 +21,8 @@ class GeoStack:
         self.transform = ref.transform
         self.crs = ref.crs
         self.count = len(self.srcs)
+        self.is_table = False
+        self.kind = "raster"
 
     def read_patch(self, row: int, col: int, size: int, nodata_val: Optional[float]=None) -> np.ndarray:
         """Return (C, H, W) patch centered at (row, col)."""
@@ -45,6 +47,16 @@ class GeoStack:
         rows = range(stride//2, self.height, stride)
         cols = range(stride//2, self.width, stride)
         return [(r,c) for r in rows for c in cols]
+
+    def random_coord(self, patch: int, rng: np.random.Generator) -> Tuple[int, int]:
+        half = patch // 2
+        r = int(rng.integers(half, max(self.height - half, half + 1)))
+        c = int(rng.integers(half, max(self.width - half, half + 1)))
+        return r, c
+
+    def coord_to_index(self, coord: Tuple[int, int]) -> int:
+        r, c = coord
+        return r * self.width + c
 
 def load_deposit_pixels(geojson_path: str, stack: GeoStack) -> List[Tuple[int,int]]:
     """Convert deposit points (class=1) into pixel indices (row, col)."""

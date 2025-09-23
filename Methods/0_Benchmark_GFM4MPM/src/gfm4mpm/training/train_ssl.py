@@ -11,7 +11,9 @@ class MAELoss(nn.Module):
     def forward(self, pred, target):
         return self.mse(pred, target)
 
-def train_ssl(model, dataloader: DataLoader, epochs=30, lr=2.5e-4, device='cuda'):
+def train_ssl(model, dataloader: DataLoader, epochs=30, lr=2.5e-4, device=None):
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model.to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9,0.95))
     criterion = MAELoss()

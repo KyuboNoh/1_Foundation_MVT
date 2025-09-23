@@ -3,7 +3,9 @@ import torch
 from captum.attr import IntegratedGradients
 
 @torch.no_grad()
-def ig_attribution_map(encoder, mlp, x_batch, baselines=None, device='cuda'):
+def ig_attribution_map(encoder, mlp, x_batch, baselines=None, device=None):
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
     encoder.eval().to(device)
     mlp.eval().to(device)
     if baselines is None:

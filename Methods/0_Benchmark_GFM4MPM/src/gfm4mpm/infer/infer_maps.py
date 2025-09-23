@@ -4,7 +4,9 @@ import torch
 import rasterio
 
 @torch.no_grad()
-def mc_predict_map(encoder, mlp, stack, patch_size=32, stride=16, passes=30, device='cuda'):
+def mc_predict_map(encoder, mlp, stack, patch_size=32, stride=16, passes=30, device=None):
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
     encoder.eval().to(device)
     mlp.train().to(device)  # keep dropout ON for MC
     H, W = stack.height, stack.width

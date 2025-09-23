@@ -1,8 +1,15 @@
 # scripts/eval_ablation_sparse.py
 # Drop 50% of channels at test time to measure robustness
-import argparse, glob, json, torch, numpy as np
+import argparse
+import glob
+import json
+import numpy as np
+import torch
+from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
+
 from gfm4mpm.data.geo_stack import GeoStack
+from gfm4mpm.data.stac_table import StacTableStack
 from gfm4mpm.models.mae_vit import MAEViT
 from gfm4mpm.models.mlp_dropout import MLPDropout
 from gfm4mpm.training.train_cls import eval_classifier
@@ -29,7 +36,12 @@ class SparseWrapper(Dataset):
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
-    ap.add_argument('--bands', required=True)
+    ap.add_argument('--bands', help='glob to raster bands (e.g. /data/*.tif)')
+    ap.add_argument('--stac-root', help='STAC collection root (table workflow)')
+    ap.add_argument('--stac-table', help='Direct path to STAC Parquet table asset')
+    ap.add_argument('--features', nargs='+', help='Feature columns to use for STAC table workflow')
+    ap.add_argument('--lat-column', type=str, help='Latitude column name for STAC table workflow')
+    ap.add_argument('--lon-column', type=str, help='Longitude column name for STAC table workflow')
     ap.add_argument('--val_json', required=True, help='JSON with {"coords": [[r,c],...], "labels":[0/1,...]}')
     ap.add_argument('--encoder', required=True)
     ap.add_argument('--mlp', required=True)
@@ -37,17 +49,36 @@ if __name__ == '__main__':
     ap.add_argument('--drop', type=float, default=0.5)
     args = ap.parse_args()
 
-    stack = GeoStack(sorted(glob.glob(args.bands)))
+    modes = [bool(args.bands), bool(args.stac_root), bool(args.stac_table)]
+    if sum(modes) != 1:
+        ap.error('Provide either --bands or one of --stac-root/--stac-table (exactly one input source)')
+
+    if args.stac_root or args.stac_table:
+        stack = StacTableStack(
+            Path(args.stac_table or args.stac_root),
+            feature_columns=args.features,
+            latitude_column=args.lat_column,
+            longitude_column=args.lon_column,
+        )
+        patch = 1
+        if args.patch != 1:
+            print('[info] STAC table detected; overriding patch size to 1')
+        if args.features:
+            print(f"[info] Using {len(stack.feature_columns)} feature columns from STAC table")
+    else:
+        stack = GeoStack(sorted(glob.glob(args.bands)))
+        patch = args.patch
+
     with open(args.val_json) as f:
         val = json.load(f)
     coords = [tuple(x) for x in val['coords']]
     labels = val['labels']
 
-    base_ds = LabeledPatches(stack, coords, labels, patch=args.patch)
+    base_ds = LabeledPatches(stack, coords, labels, patch=patch)
     ds = SparseWrapper(base_ds, drop_prob=args.drop)
     dl = DataLoader(ds, batch_size=1024, shuffle=False, num_workers=8)
 
-    enc = MAEViT(in_chans=stack.count)
+    enc = MAEViT(in_chans=stack.count, patch_size=patch)
     enc.load_state_dict(torch.load(args.encoder, map_location='cpu'))
     in_dim = enc.blocks[0].attn.embed_dim
     mlp = MLPDropout(in_dim=in_dim)
