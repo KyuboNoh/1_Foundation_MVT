@@ -31,7 +31,19 @@ class TransformerBlock(nn.Module):
 
 class MAEViT(nn.Module):
     """Masked Autoencoder with ViT encoder + tiny decoder."""
-    def __init__(self, in_chans=8, embed_dim=256, depth=6, num_heads=8, mlp_ratio=4.0, patch_size=4, dec_dim=128, dec_depth=2):
+
+    def __init__(
+        self,
+        in_chans: int = 8,
+        embed_dim: int = 256,
+        depth: int = 6,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        patch_size: int = 4,
+        dec_dim: int = 128,
+        dec_depth: int = 2,
+        mask_ratio: float = 0.75,
+    ) -> None:
         super().__init__()
         self.patch = PatchEmbed(in_chans, embed_dim, patch_size)
         self.pos_embed = None
@@ -46,6 +58,7 @@ class MAEViT(nn.Module):
         nn.init.trunc_normal_(self.mask_token, std=0.02)
         self.patch_size = patch_size
         self.in_chans = in_chans
+        self.mask_ratio = float(mask_ratio)
 
     def _positional(self, H, W, dim):
         pe = self._build_2d_sincos_pos_embed(H, W, dim)
@@ -55,25 +68,25 @@ class MAEViT(nn.Module):
     def _build_2d_sincos_pos_embed(H, W, dim):
         grid_h = torch.arange(H, dtype=torch.float32)
         grid_w = torch.arange(W, dtype=torch.float32)
-        grid = torch.stack(torch.meshgrid(grid_h, grid_w, indexing='ij'), dim=0)  # (2, H, W)
-        grid = grid.reshape(2, 1, H*W)
-        emb_h = MAEViT._build_sincos(grid[0], dim//2)
-        emb_w = MAEViT._build_sincos(grid[1], dim//2)
-        pos = torch.cat([emb_h, emb_w], dim=1).transpose(0,2)  # (N, dim)
-        return pos
+        grid = torch.stack(torch.meshgrid(grid_h, grid_w, indexing='ij'), dim=-1).reshape(-1, 2)  # (N, 2)
+        emb_h = MAEViT._build_sincos_1d(grid[:, 0], dim // 2)
+        emb_w = MAEViT._build_sincos_1d(grid[:, 1], dim // 2)
+        return torch.cat([emb_h, emb_w], dim=1)
 
     @staticmethod
-    def _build_sincos(pos, dim):
-        omega = torch.arange(dim//2, dtype=torch.float32) / (dim/2.)
-        omega = 1.0 / (10000**omega)
-        out = torch.einsum('np,d->ndp', pos, omega)
+    def _build_sincos_1d(pos: torch.Tensor, dim: int) -> torch.Tensor:
+        if dim % 2 != 0:
+            raise ValueError("dim must be even for sin/cos positional encoding")
+        omega = torch.arange(dim // 2, dtype=torch.float32) / (dim / 2.0)
+        omega = 1.0 / (10000 ** omega)
+        out = pos.unsqueeze(1) * omega.unsqueeze(0)
         sin = torch.sin(out)
         cos = torch.cos(out)
         return torch.cat([sin, cos], dim=1)  # (N, dim)
 
-    def random_mask(self, x, keep_ratio=0.25):
+    def random_mask(self, x, keep_ratio: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, N, D = x.shape
-        len_keep = int(N * keep_ratio)
+        len_keep = max(1, min(N, int(round(N * keep_ratio))))
         noise = torch.rand(B, N, device=x.device)
         ids_shuffle = noise.argsort(dim=1)
         ids_restore = ids_shuffle.argsort(dim=1)
@@ -89,7 +102,8 @@ class MAEViT(nn.Module):
         x, H, W = self.patch(x)
         pos = self._positional(H, W, x.shape[-1]).to(x.device)  # (N,D)
         x = x + pos.unsqueeze(0)
-        x_keep, mask, ids_restore = self.random_mask(x, keep_ratio=0.25)
+        keep_ratio = 1.0 - self.mask_ratio
+        x_keep, mask, ids_restore = self.random_mask(x, keep_ratio=keep_ratio)
         for blk in self.blocks:
             x_keep = blk(x_keep)
         latents = self.norm(x_keep)

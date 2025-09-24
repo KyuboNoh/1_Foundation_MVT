@@ -37,15 +37,15 @@ python -m scripts.inspect_labels \
   --out-plot ./work/label_summary.png
 ```
 
-
 1) **Pretrain SSL encoder** (masked autoencoder):
 ```bash
 python -m scripts.pretrain_ssl \
-  --stac-table /home/qubuntu25/Desktop/GitHub/1_Foundation_MVT_Result/gsc-2021/assets/tables/2021_Table04_Datacube_temp.parquet \
+  --stac-table /home/qubuntu25/Desktop/GitHub/1_Foundation_MVT_Result/gsc-2021/assets/tables/2021_Table04_Datacube.parquet \
   --features Magnetotelluric HeatFlow \
   --lat-column Latitude_EPSG4326 \
   --lon-column Longitude_EPSG4326 \
   --out ./work/ssl_table \
+  --preview-samples 10
   --epochs 30
 ```
 
@@ -92,6 +92,14 @@ python -m scripts.make_ig \
     --patch 32
 ```
 
+### Pretraining knobs & telemetry
+- `--mask-ratio` (default 0.75) determines the fraction of MAE tokens hidden each step.
+- `--encoder-depth` / `--decoder-depth` configure the number of transformer blocks (defaults 6 / 2).
+- `--patch` sets the spatial window sampled from rasters (defaults 16). Random window sampling is used—no sliding window tiling occurs during SSL.
+- `--optimizer` (`adamw` or `adam`), `--lr`, and `--batch` expose the optimiser family, learning rate, and batch size.
+- Each run writes `ssl_history.json` alongside the encoder checkpoint, capturing epoch-wise reconstruction loss, mean absolute error, PSNR, and SSIM (SSIM reported only when patches are larger than 1×1, so STAC table runs will show `null`).
+- `--preview-samples` (default 0) saves side-by-side original/masked/reconstructed panels for the requested number of samples in `out/previews/` (one PNG per sample with rows for each feature/channel).
+
 ## Working with GSC STAC tables
 The helper scripts can also ingest the STAC directory produced by
 `stacify_GCS_data.py` (Parquet table). In this mode each table row becomes a
@@ -105,16 +113,23 @@ label:
 ```bash
 # 1) Pretrain (patch size forced to 1 for tables)
 python -m scripts.pretrain_ssl \
-    --stac-table /home/qubuntu25/Desktop/GitHub/1_Foundation_MVT_Result/gsc-2021/assets/tables/2021_Table04_Datacube_temp.parquet \
+    --stac-table /home/qubuntu25/Desktop/GitHub/1_Foundation_MVT_Result/gsc-2021/assets/tables/2021_Table04_Datacube.parquet \
     --features Magnetotelluric HeatFlow \
     --lat-column Latitude_EPSG4326 \
     --lon-column Longitude_EPSG4326 \
-    --out ./work/ssl_table \
-    --epochs 30
+    --mask-ratio 0.75 \
+    --encoder-depth 6 \
+    --decoder-depth 2 \
+    --preview-samples 16 \
+    --optimizer adamw \
+    --lr 2.5e-4 \
+    --batch 128 \
+    --epochs 30 \
+    --out ./work/ssl_table
 
 # 2) Build PU splits from the Training_MVT_Occurrence label
 python -m scripts.build_splits \
-    --stac-table /home/qubuntu25/Desktop/GitHub/1_Foundation_MVT_Result/gsc-2021/assets/tables/2021_Table04_Datacube_temp.parquet \
+    --stac-table /home/qubuntu25/Desktop/GitHub/1_Foundation_MVT_Result/gsc-2021/assets/tables/2021_Table04_Datacube.parquet \
     --features Magnetotelluric HeatFlow \
     --label-column Training_MVT_Occurrence \
     --lat-column Latitude_EPSG4326 \
@@ -124,7 +139,7 @@ python -m scripts.build_splits \
 
 # 3) Train classifier using the generated splits
 python -m scripts.train_classifier \
-    --stac-table /home/qubuntu25/Desktop/GitHub/1_Foundation_MVT_Result/gsc-2021/assets/tables/2021_Table04_Datacube_temp.parquet \
+    --stac-table /home/qubuntu25/Desktop/GitHub/1_Foundation_MVT_Result/gsc-2021/assets/tables/2021_Table04_Datacube.parquet \
     --features Magnetotelluric HeatFlow \
     --lat-column Latitude_EPSG4326 \
     --lon-column Longitude_EPSG4326 \
@@ -133,7 +148,7 @@ python -m scripts.train_classifier \
 
 # 4) Prospectivity scores saved to CSV (adding per-row metadata)
 python -m scripts.make_maps \
-    --stac-table /home/qubuntu25/Desktop/GitHub/1_Foundation_MVT_Result/gsc-2021/assets/tables/2021_Table04_Datacube_temp.parquet \
+    --stac-table /home/qubuntu25/Desktop/GitHub/1_Foundation_MVT_Result/gsc-2021/assets/tables/2021_Table04_Datacube.parquet \
     --features Magnetotelluric HeatFlow \
     --lat-column Latitude_EPSG4326 \
     --lon-column Longitude_EPSG4326 \
@@ -143,7 +158,7 @@ python -m scripts.make_maps \
 
 # 5) Integrated gradients per feature
 python -m scripts.make_ig \
-    --stac-table /home/qubuntu25/Desktop/GitHub/1_Foundation_MVT_Result/gsc-2021/assets/tables/2021_Table04_Datacube_temp.parquet \
+    --stac-table /home/qubuntu25/Desktop/GitHub/1_Foundation_MVT_Result/gsc-2021/assets/tables/2021_Table04_Datacube.parquet \
     --features Magnetotelluric HeatFlow \
     --lat-column Latitude_EPSG4326 \
     --lon-column Longitude_EPSG4326 \
@@ -156,12 +171,18 @@ python -m scripts.inspect_labels \
     --stac-root /home/qubuntu25/Desktop/GitHub/1_Foundation_MVT_Result/gsc-2021 \
     --out-json ./work/label_summary.json \
     --out-plot ./work/label_summary.png
+
+# (Optional) Plot SSL training metrics
+python -m scripts.plot_ssl_history \
+    ./work/ssl_table/ssl_history.json \
+    --out ./work/ssl_table/ssl_metrics.png
 ```
 
 Notes:
 - Only numeric columns are used as features; provide `--features` to pick an explicit subset.
 - Label column defaults to `Training_MVT_Deposit`; override with `--label-column` (e.g., `Training_MVT_Occurrence`) and ensure it actually contains `Present` entries.
 - Outputs from `make_maps`/`make_ig` become CSV files for easier inspection.
+- STAC table runs operate on 1×1 pseudo-patches, so SSIM will be reported as `null` in `ssl_history.json`.
 
 ## Notes
 - Bring aligned GeoTIFF stacks and positive points (GeoJSON). Reprojection is out‑of‑scope here.
