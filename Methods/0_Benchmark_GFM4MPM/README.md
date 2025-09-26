@@ -39,14 +39,7 @@ python -m scripts.inspect_labels \
 
 1) **Pretrain SSL encoder** (masked autoencoder):
 ```bash
-python -m scripts.pretrain_ssl \
-  --stac-table /home/qubuntu25/Desktop/GitHub/1_Foundation_MVT_Result/gsc-2021/assets/tables/2021_Table04_Datacube.parquet \
-  --features Magnetotelluric HeatFlow \
-  --lat-column Latitude_EPSG4326 \
-  --lon-column Longitude_EPSG4326 \
-  --out ./work/ssl_table \
-  --preview-samples 10
-  --epochs 30
+python -m scripts.pretrain_ssl   --stac-root /home/qubuntu25/Desktop/GitHub/1_Foundation_MVT_Result/gsc-2021_temp       --features Gravity_Bouguer_HGM_Worms_Proximity   --check-feature Gravity_Bouguer_HGM_Worms_Proximity       --lat-column Latitude_EPSG4326   --lon-column Longitude_EPSG4326       --mask-ratio 0.75     --encoder-depth 6     --decoder-depth 2  --patch 4   --window 16   --preview-samples 5   --check-image-preproc   --out ./work/test   --epochs 2 --mask-scope patch --skip-nan
 ```
 
 2) **Build PU splits**:
@@ -113,19 +106,37 @@ label:
 ```bash
 # 1) Pretrain (patch size forced to 1 for tables)
 python -m scripts.pretrain_ssl \
-    --stac-table /home/qubuntu25/Desktop/GitHub/1_Foundation_MVT_Result/gsc-2021/assets/tables/2021_Table04_Datacube.parquet \
-    --features Magnetotelluric HeatFlow \
+    --stac-root /home/qubuntu25/Desktop/GitHub/1_Foundation_MVT_Result/gsc-2021 \
+    --features Geology_Eon_Maximum_Majority Geology_Eon_Minimum_Majority Geology_Era_Maximum_Majority Geology_Era_Minimum_Majority Geology_Period_Maximum_Majority Geology_Period_Minimum_Majority Geology_Period_Contact Geology_Lithology_Majority Geology_Lithology_Contact Seismic_LAB_Hoggard Seismic_LAB_Priestley Seismic_Moho Seismic_Moho_GEMMA Seismic_Moho_Szwillus Seismic_Velocity_050km Seismic_Velocity_100km Seismic_Velocity_150km Seismic_Velocity_200km Gravity_GOCE_Differential Gravity_GOCE_MaximumCurve Gravity_GOCE_MinimumCurve Gravity_GOCE_MeanCurve Gravity_GOCE_ShapeIndex Gravity_Bouguer Gravity_Bouguer_BGI Gravity_Bouguer_HGM Gravity_Bouguer_HGM_Worms_Proximity Gravity_Bouguer_UpCont30km Gravity_Bouguer_UpCont30km_HGM Gravity_Bouguer_UpCont30km_HGM_Worms_Proximity Magnetic_RTP Magnetic_EMAG2v3 Magnetic_EMAG2v3_CuriePoint Magnetic_1VD Magnetic_HGM Magnetic_HGM_Worms_Proximity Magnetic_LongWavelength_HGM Magnetic_LongWavelength_HGM_Worms_Proximity HeatFlow Magnetotelluric Litmod_Density_Asthenosphere Litmod_Density_Crust Litmod_Density_Lithosphere Crust1_Type Crust1_CrustalThickness Crust1_SedimentThickness \
     --lat-column Latitude_EPSG4326 \
     --lon-column Longitude_EPSG4326 \
     --mask-ratio 0.75 \
     --encoder-depth 6 \
     --decoder-depth 2 \
+    --preview-samples 3 \
+    --window 16 \
+    --optimizer adamw \
+    --lr 2.5e-4 \
+    --batch 128 \
+    --epochs 2 \
+    --out ./work/test
+
+
+python -m scripts.pretrain_ssl \
+    --stac-root /home/qubuntu25/Desktop/GitHub/1_Foundation_MVT_Result/gsc-2021 \
+    --features Terrane_Majority Terrane_Minority Terrane_Contact Terrane_Proximity Geology_Eon_Maximum_Majority Geology_Eon_Maximum_Minority Geology_Eon_Minimum_Majority Geology_Eon_Minimum_Minority Geology_Era_Maximum_Majority Geology_Era_Maximum_Minority Geology_Era_Minimum_Majority Geology_Era_Minimum_Minority Geology_Period_Maximum_Majority Geology_Period_Maximum_Minority Geology_Period_Minimum_Majority Geology_Period_Minimum_Minority Geology_Period_Contact Geology_Lithology_Majority Geology_Lithology_Minority Geology_Lithology_Contact Geology_Dictionary_Alkalic Geology_Dictionary_Anatectic Geology_Dictionary_Calcareous Geology_Dictionary_Carbonaceous Geology_Dictionary_Cherty Geology_Dictionary_CoarseClastic Geology_Dictionary_Evaporitic Geology_Dictionary_Felsic Geology_Dictionary_FineClastic Geology_Dictionary_Gneissose Geology_Dictionary_Igneous Geology_Dictionary_Intermediate Geology_Dictionary_Pegmatitic Geology_Dictionary_RedBed Geology_Dictionary_Schistose Geology_Dictionary_Sedimentary Geology_Dictionary_UltramaficMafic Geology_PassiveMargin_Proximity Geology_BlackShale_Proximity Geology_Fault_Proximity Geology_CoverThickness Geology_Paleolongitude_Period_Maximum Geology_Paleolongitude_Period_Minimum Geology_Paleolatitude_Period_Maximum Geology_Paleolatitude_Period_Minimum Seismic_LAB_Hoggard Seismic_LAB_Priestley Seismic_Moho Seismic_Moho_GEMMA Seismic_Moho_Szwillus Seismic_Velocity_050km Seismic_Velocity_100km Seismic_Velocity_150km Seismic_Velocity_200km Gravity_GOCE_Differential Gravity_GOCE_MaximumCurve Gravity_GOCE_MinimumCurve Gravity_GOCE_MeanCurve Gravity_GOCE_ShapeIndex Gravity_Bouguer Gravity_Bouguer_BGI Gravity_Bouguer_HGM Gravity_Bouguer_HGM_Worms_Proximity Gravity_Bouguer_UpCont30km Gravity_Bouguer_UpCont30km_HGM Gravity_Bouguer_UpCont30km_HGM_Worms_Proximity Magnetic_RTP Magnetic_EMAG2v3 Magnetic_EMAG2v3_CuriePoint Magnetic_1VD Magnetic_HGM Magnetic_HGM_Worms_Proximity Magnetic_LongWavelength_HGM Magnetic_LongWavelength_HGM_Worms_Proximity HeatFlow Magnetotelluric Litmod_Density_Asthenosphere Litmod_Density_Crust Litmod_Density_Lithosphere Crust1_Type Crust1_CrustalThickness Crust1_SedimentThickness \
+    --lat-column Latitude_EPSG4326 \
+    --lon-column Longitude_EPSG4326 \
+    --mask-ratio 0.75 \
+    --encoder-depth 6 \
+    --decoder-depth 2 \
+    --window 16 \
     --preview-samples 16 \
     --optimizer adamw \
     --lr 2.5e-4 \
     --batch 128 \
-    --epochs 30 \
-    --out ./work/ssl_table
+    --epochs 2 \
+    --out ./work/test
 
 # 2) Build PU splits from the Training_MVT_Occurrence label
 python -m scripts.build_splits \
@@ -179,7 +190,7 @@ python -m scripts.plot_ssl_history \
 ```
 
 Notes:
-- Only numeric columns are used as features; provide `--features` to pick an explicit subset.
+- String features are automatically expanded to one-hot columns when present, so mixed numeric/categorical selections (e.g., `Terrane_Majority`) now work out-of-the-box.
 - Label column defaults to `Training_MVT_Deposit`; override with `--label-column` (e.g., `Training_MVT_Occurrence`) and ensure it actually contains `Present` entries.
 - Outputs from `make_maps`/`make_ig` become CSV files for easier inspection.
 - STAC table runs operate on 1×1 pseudo-patches, so SSIM will be reported as `null` in `ssl_history.json`.

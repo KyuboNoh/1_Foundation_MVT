@@ -27,11 +27,39 @@ except ModuleNotFoundError as exc:  # pragma: no cover - import guard
 _LOG = logging.getLogger(__name__)
 
 
+def _candidate_roots(root: Path) -> List[Path]:
+    """Return possible directories that may contain table assets."""
+    if not root.exists():
+        return []
+
+    candidates: List[Path] = []
+    if root.is_dir():
+        assets_dir = root / "assets"
+        if assets_dir.exists():
+            for sub in ("tables", "table", "tabular"):
+                maybe = assets_dir / sub
+                if maybe.exists():
+                    candidates.append(maybe)
+            candidates.append(assets_dir)
+        for sub in ("tables", "table", "tabular"):
+            maybe = root / sub
+            if maybe.exists():
+                candidates.append(maybe)
+        candidates.append(root)
+    return list(dict.fromkeys(path.resolve() for path in candidates))
+
+
 def _find_parquet(root: Path) -> Path:
-    candidates = sorted(root.rglob("*.parquet"))
-    if not candidates:
-        raise FileNotFoundError(f"No Parquet assets found under {root}")
-    return candidates[0]
+    if root.is_file() and root.suffix.lower() == ".parquet":
+        return root
+
+    search_roots = _candidate_roots(root) or [root]
+    for base in search_roots:
+        candidates = sorted(base.rglob("*.parquet"))
+        if candidates:
+            return candidates[0]
+
+    raise FileNotFoundError(f"No Parquet assets found under {root}")
 
 
 def _to_numpy_float(col: pa.ChunkedArray) -> np.ndarray:
@@ -41,6 +69,59 @@ def _to_numpy_float(col: pa.ChunkedArray) -> np.ndarray:
 
 def _to_numpy_any(col: pa.ChunkedArray) -> np.ndarray:
     return np.asarray(col.to_numpy(zero_copy_only=False))
+
+
+def _is_missing(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, float) and np.isnan(value):
+        return True
+    return False
+
+
+def _ordered_unique(values: Sequence[object]) -> List[object]:
+    seen = set()
+    ordered: List[object] = []
+    for val in values:
+        if _is_missing(val):
+            continue
+        key = val if isinstance(val, (int, float, bool)) else str(val)
+        if key not in seen:
+            seen.add(key)
+            ordered.append(val)
+    return ordered
+
+
+def _encode_categorical(name: str, column: pa.ChunkedArray) -> Tuple[List[str], List[np.ndarray]]:
+    # Consolidate to avoid per-chunk conversions when creating indicator bands.
+    combined = column.combine_chunks()
+    data = combined.to_numpy(zero_copy_only=False)
+
+    normalized = np.empty(data.shape, dtype=object)
+    for idx, val in enumerate(data):
+        if isinstance(val, bytes):
+            normalized[idx] = val.decode("utf-8", errors="replace")
+        else:
+            normalized[idx] = val
+
+    categories = _ordered_unique(normalized)
+    arrays: List[np.ndarray] = []
+    names: List[str] = []
+
+    for cat in categories:
+        label = str(cat).replace("\n", " ")
+        if label == "":
+            label = "__empty__"
+        mask = normalized == cat
+        arrays.append(mask.astype(np.float32))
+        names.append(f"{name}={label}")
+
+    missing_mask = np.fromiter((_is_missing(v) for v in normalized), dtype=bool, count=len(normalized))
+    if missing_mask.any():
+        arrays.append(missing_mask.astype(np.float32))
+        names.append(f"{name}=__missing__")
+
+    return names, arrays
 
 
 def _binary_from_values(values: Sequence) -> np.ndarray:
@@ -72,10 +153,14 @@ class StacTableStack:
         self.root = Path(self.root).resolve()
         self.is_table = True
         self.kind = "table"
+        self._requested_feature_columns = list(self.feature_columns) if self.feature_columns is not None else None
         if self.root.is_file():
             self.table_path = self.root
         else:
             self.table_path = _find_parquet(self.root)
+        self.feature_columns = []
+        self.feature_metadata: List[Dict[str, Optional[str]]] = []
+        self.categorical_expansions: Dict[str, List[str]] = {}
         self._load_table()
         self._prepare_feature_matrix()
         self._prepare_labels()
@@ -92,38 +177,95 @@ class StacTableStack:
         self._schema = self._table.schema
 
     def _prepare_feature_matrix(self) -> None:
-        drop = set(c for c in (self.drop_columns or []))
+        drop = set(self.drop_columns or [])
         label_cols = set(self.label_columns or [])
-        requested = [c for c in (self.feature_columns or []) if c not in drop]
 
-        numeric_fields: List[str] = []
+        requested = [c for c in (self._requested_feature_columns or []) if c not in drop]
+        feature_candidates: List[str] = []
         if requested:
             for name in requested:
                 if name not in self._schema.names:
                     _LOG.warning("Requested feature '%s' not found in table", name)
                     continue
-                field = self._schema.field(name)
-                if pa.types.is_floating(field.type) or pa.types.is_integer(field.type):
-                    numeric_fields.append(name)
-                else:
-                    _LOG.warning("Feature '%s' is not numeric and will be skipped", name)
+                feature_candidates.append(name)
         else:
             for field in self._schema:
                 if field.name in drop or field.name in label_cols:
                     continue
-                if pa.types.is_floating(field.type) or pa.types.is_integer(field.type):
-                    numeric_fields.append(field.name)
+                feature_candidates.append(field.name)
 
-        if not numeric_fields:
-            raise ValueError("No numeric columns found to use as features in STAC table")
+        feature_arrays: List[np.ndarray] = []
+        feature_names: List[str] = []
+        feature_meta: List[Dict[str, Optional[str]]] = []
+        categorical_expansions: Dict[str, List[str]] = {}
 
-        cols = [_to_numpy_float(self._table.column(name)) for name in numeric_fields]
-        self.feature_columns = numeric_fields
+        for name in feature_candidates:
+            field = self._schema.field(name)
+            column = self._table.column(name)
+            _LOG.info("Processing feature '%s' (%s)", name, field.type)
+            print(f"Processing feature '{name}' ({field.type})")
+
+            if pa.types.is_floating(field.type) or pa.types.is_integer(field.type):
+                arr = _to_numpy_float(column)
+                feature_arrays.append(arr)
+                feature_names.append(name)
+                feature_meta.append({"source": name, "category": None})
+            elif pa.types.is_boolean(field.type):
+                arr = _to_numpy_any(column).astype(np.float32)
+                feature_arrays.append(arr)
+                feature_names.append(name)
+                feature_meta.append({"source": name, "category": None})
+            elif pa.types.is_string(field.type) or pa.types.is_large_string(field.type) or pa.types.is_dictionary(field.type):
+                encoded_names, encoded_arrays = _encode_categorical(name, column)
+                if not encoded_arrays:
+                    _LOG.warning("Categorical feature '%s' has no valid categories and will be skipped", name)
+                    continue
+                feature_arrays.extend(encoded_arrays)
+                feature_names.extend(encoded_names)
+                feature_meta.extend(
+                    {"source": name, "category": encoded.partition("=")[2]} for encoded in encoded_names
+                )
+                categorical_expansions[name] = encoded_names
+                _LOG.info("  expanded to %d indicator columns", len(encoded_names))
+                print(f"  expanded to {len(encoded_names)} indicator columns")
+            else:
+                _LOG.warning("Feature '%s' with type '%s' is not supported and will be skipped", name, field.type)
+                print(f"[warn] Feature '{name}' with type '{field.type}' skipped")
+
+        if not feature_arrays:
+            raise ValueError("No usable columns found to use as features in STAC table")
+
+        cols = [np.asarray(col, dtype=np.float32) for col in feature_arrays]
         matrix = np.column_stack(cols).astype(np.float32)
+        raw_gb = matrix.nbytes / (1024 ** 3)
+        total_gb = raw_gb * 2  # raw + normalized copy
+        _LOG.info(
+            "Stacked %d feature arrays into shape %s (raw ~%.2f GiB, normalized copy pushes total ~%.2f GiB)",
+            len(feature_names),
+            matrix.shape,
+            raw_gb,
+            total_gb,
+        )
+        print(
+            f"Stacked {len(feature_names)} feature arrays into shape {matrix.shape} "
+            f"(raw ~{raw_gb:.2f} GiB, normalized copy pushes total ~{total_gb:.2f} GiB)"
+        )
+        if total_gb > 6:
+            _LOG.warning(
+                "Large STAC feature matrix detected (~%.2f GiB in memory). Consider reducing features or running on a high-memory host.",
+                total_gb,
+            )
+            print(
+                f"[warn] Large STAC feature matrix detected (~{total_gb:.2f} GiB). "
+                "Consider reducing features or using a high-memory host."
+            )
         mean = np.nanmean(matrix, axis=0)
         std = np.nanstd(matrix, axis=0)
         std[std < 1e-6] = 1.0
         self.features = matrix
+        self.feature_columns = feature_names
+        self.feature_metadata = feature_meta
+        self.categorical_expansions = categorical_expansions
         self.feature_mean = mean.astype(np.float32)
         self.feature_std = std.astype(np.float32)
         normalized = (self.features - self.feature_mean) / self.feature_std

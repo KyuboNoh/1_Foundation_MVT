@@ -1,17 +1,23 @@
 # src/gfm4mpm/models/mae_vit.py
 import math
-from typing import Tuple
+from typing import Dict, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
 class PatchEmbed(nn.Module):
     def __init__(self, in_chans=8, embed_dim=256, patch_size=4):
         super().__init__()
+        self.patch_size = patch_size
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
     def forward(self, x):  # (B,C,H,W) -> (B, N, D)
+        B, C, H, W = x.shape
+        if H % self.patch_size != 0 or W % self.patch_size != 0:
+            raise ValueError(
+                f"Input spatial dims {H}x{W} must be divisible by patch size {self.patch_size}"
+            )
         x = self.proj(x)
         B, D, H, W = x.shape
-        x = x.flatten(2).transpose(1,2)
+        x = x.flatten(2).transpose(1, 2)
         return x, H, W
 
 class TransformerBlock(nn.Module):
@@ -43,6 +49,7 @@ class MAEViT(nn.Module):
         dec_dim: int = 128,
         dec_depth: int = 2,
         mask_ratio: float = 0.75,
+        image_size: Optional[Union[Tuple[int, int], int]] = None,
     ) -> None:
         super().__init__()
         self.patch = PatchEmbed(in_chans, embed_dim, patch_size)
@@ -59,10 +66,29 @@ class MAEViT(nn.Module):
         self.patch_size = patch_size
         self.in_chans = in_chans
         self.mask_ratio = float(mask_ratio)
+        self.image_size = self._normalize_image_size(image_size)
+        self._pos_cache: Dict[Tuple[int, int, int], torch.Tensor] = {}
+
+    @staticmethod
+    def _normalize_image_size(image_size: Optional[Union[Tuple[int, int], int]]) -> Optional[Tuple[int, int]]:
+        if image_size is None:
+            return None
+        if isinstance(image_size, int):
+            if image_size <= 0:
+                raise ValueError("image_size must be positive")
+            return (image_size, image_size)
+        if len(image_size) != 2:
+            raise ValueError("image_size must be an int or a tuple of two ints")
+        h, w = image_size
+        if h <= 0 or w <= 0:
+            raise ValueError("image_size dimensions must be positive")
+        return (int(h), int(w))
 
     def _positional(self, H, W, dim):
-        pe = self._build_2d_sincos_pos_embed(H, W, dim)
-        return pe
+        key = (H, W, dim)
+        if key not in self._pos_cache:
+            self._pos_cache[key] = self._build_2d_sincos_pos_embed(H, W, dim)
+        return self._pos_cache[key]
 
     @staticmethod
     def _build_2d_sincos_pos_embed(H, W, dim):
@@ -98,6 +124,12 @@ class MAEViT(nn.Module):
         return x_keep, mask, ids_restore
 
     def forward(self, x) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.image_size is not None:
+            expected_h, expected_w = self.image_size
+            if x.shape[-2] != expected_h or x.shape[-1] != expected_w:
+                raise ValueError(
+                    f"Expected input spatial dims {expected_h}x{expected_w}, received {x.shape[-2:]}"
+                )
         # encoder
         x, H, W = self.patch(x)
         pos = self._positional(H, W, x.shape[-1]).to(x.device)  # (N,D)
@@ -127,6 +159,12 @@ class MAEViT(nn.Module):
 
     @torch.no_grad()
     def encode(self, x):
+        if self.image_size is not None:
+            expected_h, expected_w = self.image_size
+            if x.shape[-2] != expected_h or x.shape[-1] != expected_w:
+                raise ValueError(
+                    f"Expected input spatial dims {expected_h}x{expected_w}, received {x.shape[-2:]}"
+                )
         z, H, W = self.patch(x)
         pos = self._positional(H, W, z.shape[-1]).to(z.device)
         z = z + pos.unsqueeze(0)

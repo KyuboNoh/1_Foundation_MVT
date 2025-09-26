@@ -1,6 +1,7 @@
 # src/gfm4mpm/data/geo_stack.py
 from __future__ import annotations
 import os, json
+import math
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 import numpy as np
@@ -23,6 +24,68 @@ class GeoStack:
         self.count = len(self.srcs)
         self.is_table = False
         self.kind = "raster"
+        self.band_mean, self.band_std = self._compute_band_stats()
+
+    # ------------------------------------------------------------------
+    def _compute_band_stats(self) -> Tuple[np.ndarray, np.ndarray]:
+        means = []
+        stds = []
+        for src in self.srcs:
+            mean, std = self._estimate_band_stats(src)
+            means.append(mean)
+            stds.append(std)
+        mean_arr = np.asarray(means, dtype=np.float32).reshape(-1, 1, 1)
+        std_arr = np.asarray(stds, dtype=np.float32).reshape(-1, 1, 1)
+        return mean_arr, std_arr
+
+    def _estimate_band_stats(self, src) -> Tuple[float, float]:
+        try:
+            stats = src.statistics(1, approx=True)
+        except Exception:
+            stats = None
+
+        if (
+            stats is not None
+            and getattr(stats, "count", 0)
+            and np.isfinite(stats.mean)
+            and np.isfinite(stats.std)
+        ):
+            mean = float(stats.mean)
+            std = float(stats.std)
+            if std < 1e-6:
+                std = 1.0
+            return mean, std
+
+        sum_vals = 0.0
+        sum_sq = 0.0
+        total = 0
+        max_samples = 1_000_000
+        for _, window in src.block_windows(1):
+            band = src.read(1, window=window, masked=True)
+            if np.ma.isMaskedArray(band):
+                arr = band.filled(np.nan)
+            else:
+                arr = np.asarray(band)
+            arr = np.asarray(arr, dtype=np.float64)
+            mask = np.isfinite(arr)
+            if not mask.any():
+                continue
+            vals = arr[mask]
+            sum_vals += float(vals.sum())
+            sum_sq += float(np.square(vals).sum())
+            total += vals.size
+            if total >= max_samples:
+                break
+
+        if total == 0:
+            return 0.0, 1.0
+
+        mean = sum_vals / total
+        variance = max(sum_sq / total - mean * mean, 0.0)
+        std = float(math.sqrt(variance))
+        if not np.isfinite(std) or std < 1e-6:
+            std = 1.0
+        return float(mean), std
 
     def read_patch(self, row: int, col: int, size: int, nodata_val: Optional[float]=None) -> np.ndarray:
         """Return (C, H, W) patch centered at (row, col)."""
@@ -30,18 +93,41 @@ class GeoStack:
         r0, c0 = max(row-half, 0), max(col-half, 0)
         r1, c1 = min(r0+size, self.height), min(c0+size, self.width)
         window = Window(c0, r0, c1-c0, r1-r0)
-        patch = np.stack([s.read(1, window=window) for s in self.srcs], axis=0).astype(np.float32)
+        band_arrays = []
+        band_masks = []
+        for src in self.srcs:
+            band = src.read(1, window=window, masked=True)
+            if np.ma.isMaskedArray(band):
+                arr = band.filled(np.nan).astype(np.float32)
+                mask = ~band.mask
+            else:
+                arr = np.asarray(band, dtype=np.float32)
+                nodata = src.nodata
+                if nodata is not None:
+                    mask = ~np.isclose(arr, nodata, equal_nan=True)
+                    arr = np.where(mask, arr, np.nan)
+                else:
+                    mask = np.ones_like(arr, dtype=bool)
+            band_arrays.append(arr)
+            band_masks.append(mask)
+
+        patch = np.stack(band_arrays, axis=0)
+        mask = np.stack(band_masks, axis=0)
+
         # pad if near edges
         pad_h, pad_w = size - patch.shape[1], size - patch.shape[2]
         if pad_h or pad_w:
-            patch = np.pad(patch, ((0,0),(0,pad_h),(0,pad_w)), mode='edge')
+            patch = np.pad(patch, ((0, 0), (0, pad_h), (0, pad_w)), mode='edge')
+            mask = np.pad(mask, ((0, 0), (0, pad_h), (0, pad_w)), mode='edge')
+
         if nodata_val is not None:
-            patch[:, patch[0] == nodata_val] = 0.0
-        # per-band z-score
-        mean = patch.mean(axis=(1,2), keepdims=True)
-        std  = patch.std(axis=(1,2), keepdims=True) + 1e-6
-        patch = (patch - mean) / std
-        return patch
+            invalid = np.isclose(patch[0], nodata_val, equal_nan=True)
+            mask[:, invalid] = False
+
+        patch = np.where(mask, patch, np.nan)
+        patch = (patch - self.band_mean) / self.band_std
+        patch = np.nan_to_num(patch, nan=0.0, posinf=0.0, neginf=0.0)
+        return patch.astype(np.float32)
 
     def grid_centers(self, stride: int) -> List[Tuple[int,int]]:
         rows = range(stride//2, self.height, stride)
