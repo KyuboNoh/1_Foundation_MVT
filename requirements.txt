@@ -27,3 +27,4 @@ xarray
 zarr
 #pystac
 pystac[validation]
+datashader
