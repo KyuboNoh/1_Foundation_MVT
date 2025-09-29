@@ -232,6 +232,9 @@ def _infer_grid_size_from_data(
     
     # Target ~1km resolution but cap at reasonable sizes
     size = int(np.clip(span_km, 16, 512))
+
+    print("TODO: Edit grid size!!!"); exit()
+    
     logging.info("Auto-selected grid size %d for %.1f km extent", size, span_km)
     return size
 
@@ -240,7 +243,9 @@ def _select_grid_columns(
     requested: Optional[Iterable[str]],
     lat_column: Optional[str],
     lon_column: Optional[str],
-    
+    h3_column,      # TODO
+    geometry_column,
+    h3_resolution_column,    
 ) -> List[str]:
     if requested:
         return list(dict.fromkeys(requested))
@@ -295,7 +300,8 @@ def _normalize_lat_lon(
     for idx, cell in enumerate(h3_series):
         if not cell:
             continue
-        lat, lon = h3.h3_to_geo(cell)
+        # lat, lon = h3.h3_to_geo(cell)
+        lat, lon = h3.cell_to_latlng(cell)
         lat_vals[idx] = lat
         lon_vals[idx] = lon
     return lat_vals, lon_vals
@@ -351,7 +357,7 @@ def _generate_raster_assets(
             logging.warning("Column %s not found in table schema; skipping rasterization.", column)
             continue
         value_pairs.append((column, resolved))
-    logging.info("Resolved value columns for rasterization: %s", value_pairs)
+    # logging.info("Resolved value columns for rasterization: %s", value_pairs)
 
     if not value_pairs:
         logging.info("No valid numeric columns remained after schema resolution; skipping raster assets.")
@@ -740,7 +746,7 @@ def main() -> None:
     csv_to_parquet(csv_path, parquet_path, schema_hints=schema_hints)
 
     columns = infer_columns(parquet_path)
-    logging.info("Inferred table columns: %s", [c.get("name") for c in columns])
+    # logging.info("Inferred table columns: %s", [c.get("name") for c in columns])
 
     requested_columns = args.features if args.features else args.grid_columns
     grid_columns = _select_grid_columns(
