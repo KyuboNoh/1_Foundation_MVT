@@ -16,7 +16,7 @@ xgboost>=1.7           # optional at runtime; code falls back to RF if absent
 matplotlib>=3.7
 pydantic>=2,<3         # code uses Pydantic v2 APIs
 
-# ---- Backbone (STAC) ----
+# ---- Backbone (Preproc/STAC) ----
 rasterio 
 rio-cogeo 
 geopandas 
@@ -28,3 +28,8 @@ zarr
 #pystac
 pystac[validation]
 datashader
+h3-py
+
+# ---- Backbone (ML) ----
+torch
+torchmetrics

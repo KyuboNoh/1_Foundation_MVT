@@ -32,16 +32,11 @@ AUTO_EXCLUDED_FEATURES = frozenset({
     "Dict_Metamorphic",
 })
 
-# python .\1_Preproc2_Outlier_FeatureSelect_GCS_data.py `
-
+# python .\1_Preproc2_ReGrid_Outlier_Norm_GCS_data.py `
 # --csv "C:\Users\kyubo\Desktop\Research\Data\2021_Table04_Datacube_temp_selected.csv" `
-
 # --out "C:\Users\kyubo\Desktop\Research\Data\2021_Table04_Datacube_temp_selected_Norm.csv" `
-
 # --lat-column "Latitude_EPSG4326" --lon-column "Longitude_EPSG4326" `
-
 # --features Terrane_Proximity Geology_Period_Maximum_Majority Geology_Period_Minimum_Majority Geology_Lithology_Majority Geology_Lithology_Minority Geology_PassiveMargin_Proximity Geology_BlackShale_Proximity Geology_Fault_Proximity Geology_Paleolatitude_Period_Maximum Geology_Paleolatitude_Period_Minimum Seismic_LAB_Hoggard Seismic_Moho Gravity_GOCE_Differential Gravity_GOCE_MaximumCurve Gravity_GOCE_MinimumCurve Gravity_GOCE_MeanCurve Gravity_GOCE_ShapeIndex Gravity_Bouguer Gravity_Bouguer_HGM Gravity_Bouguer_HGM_Worms_Proximity Gravity_Bouguer_UpCont30km_HGM Gravity_Bouguer_UpCont30km_HGM_Worms_Proximity Magnetic_HGM Magnetic_HGM_Worms_Proximity Magnetic_LongWavelength_HGM Magnetic_LongWavelength_HGM_Worms_Proximity Dict_Sedimentary Dict_Igneous Dict_Metamorphic `
-
 # --validate
 
 
@@ -861,58 +856,31 @@ def main() -> None:
     logging.info("Processing %d feature columns.", len(processed_columns))
 
     for column in processed_columns:
-
         logging.info(" - Processing %s feature .", column)
-
         numeric = pd.to_numeric(frame[column], errors="coerce")
-
         clipped = _apply_tukey_fence(numeric)
-
-        imputed = _inverse_distance_weighted_impute(
-            clipped, neighbour_distances, safe_neighbour_indices, valid_neighbour_mask)
-
-        smoothed = _smooth_with_neighbours(
-            imputed, safe_neighbour_indices, valid_neighbour_mask)
-
+        imputed = _inverse_distance_weighted_impute(clipped, neighbour_distances, safe_neighbour_indices, valid_neighbour_mask)
+        smoothed = _smooth_with_neighbours(imputed, safe_neighbour_indices, valid_neighbour_mask)
         frame[column] = smoothed
 
     _standard_scale(frame, processed_columns)
 
     if args.out is None:
-
         output_path = args.csv.with_name(f"{args.csv.stem}_Processed.csv")
-
     else:
-
         output_path = args.out
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if args.validate:
-
-        _generate_validation_plots(
-            frame, output_path, args.lat_column, args.lon_column, processed_columns)
-
+        _generate_validation_plots(frame, output_path, args.lat_column, args.lon_column, processed_columns)
         dtypes = frame.dtypes
-
-        excluded_candidates = [
-            col for col in AUTO_EXCLUDED_FEATURES
-            if col in dtypes.index and col not in processed_columns
-        ]
-
-        excluded_numeric = [
-            col for col in excluded_candidates
-            if pd.api.types.is_numeric_dtype(dtypes[col])
-        ]
+        excluded_candidates = [col for col in AUTO_EXCLUDED_FEATURES if col in dtypes.index and col not in processed_columns]
+        excluded_numeric = [col for col in excluded_candidates if pd.api.types.is_numeric_dtype(dtypes[col])]
 
         if excluded_numeric:
-            _generate_validation_plots(
-                frame, output_path, args.lat_column, args.lon_column, excluded_numeric)
+            _generate_validation_plots(frame, output_path, args.lat_column, args.lon_column, excluded_numeric)
 
-        excluded_categorical = [
-            col for col in excluded_candidates
-            if not pd.api.types.is_numeric_dtype(dtypes[col])
-        ]
+        excluded_categorical = [col for col in excluded_candidates if not pd.api.types.is_numeric_dtype(dtypes[col])]
 
         skip_for_categorical = set(processed_columns)
         skip_for_categorical.update(excluded_candidates)
@@ -927,20 +895,13 @@ def main() -> None:
                 continue
             if not pd.api.types.is_numeric_dtype(dtypes[column]):
                 categorical_columns.append(column)
-
         if categorical_columns:
             _generate_categorical_plots(frame, output_path, categorical_columns)
-
-
     try:
-
         frame.to_csv(output_path, index=False)
 
     except Exception as exc:
-
-        logging.error("Failed to write processed CSV to %s: %s",
-                      output_path, exc)
-
+        logging.error("Failed to write processed CSV to %s: %s", output_path, exc)
         sys.exit(1)
 
     logging.info("Wrote processed CSV with %d rows and %d columns to %s", len(

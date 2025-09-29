@@ -13,3 +13,16 @@ pip install -r requirements.txt
 
 # 4) run in UI mode
 #python app.py --ui
+
+
+
+
+############################## For Windows PowerShell ##############################
+# activate venv
+# Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+# .\.venv\Scripts\Activate.ps1
+
+# Check
+# where python
+# python -V
+# python -m pip -V

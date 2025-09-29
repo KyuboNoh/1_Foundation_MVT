@@ -208,31 +208,12 @@ def _parse_geometry_series(values: Sequence[str]) -> tuple[list[Optional[np.ndar
     return polygons, lat_centroids, lon_centroids
 
 
-def _infer_grid_size_from_h3(
+def _infer_grid_size_from_data(
     frame: pd.DataFrame,
     lat_vals: np.ndarray,
     lon_vals: np.ndarray,
-    resolution_column: Optional[str],
-    default: int = 512,
+    default: int = 256,
 ) -> int:
-    try:
-        import h3
-    except ImportError:
-        logging.debug("h3 not available; using default grid size %d", default)
-        return default
-
-    if not resolution_column or resolution_column not in frame.columns:
-        logging.debug("Resolution column missing; using default grid size %d", default)
-        return default
-
-    res_series = pd.to_numeric(frame[resolution_column], errors="coerce")
-    if res_series.dropna().empty:
-        logging.debug("No finite H3 resolutions; using default grid size %d", default)
-        return default
-
-    h3_res = int(res_series.dropna().mode().iat[0])
-    edge_km = h3.edge_length(h3_res, unit="km")
-
     finite_lat = lat_vals[np.isfinite(lat_vals)]
     finite_lon = lon_vals[np.isfinite(lon_vals)]
     if finite_lat.size == 0 or finite_lon.size == 0:
@@ -244,22 +225,14 @@ def _infer_grid_size_from_h3(
     if lat_span <= 0 or lon_span <= 0:
         return default
 
+    # Aim for roughly square cells
     lat_mean = float(finite_lat.mean())
-    deg_per_km_lat = 1.0 / 110.574
-    deg_per_km_lon = 1.0 / (111.320 * max(math.cos(math.radians(lat_mean)), 1e-6))
-
-    pixel_height = max(edge_km * deg_per_km_lat, 1e-6)
-    pixel_width = max(edge_km * deg_per_km_lon, 1e-6)
-
-    rows = math.ceil(lat_span / pixel_height)
-    cols = math.ceil(lon_span / pixel_width)
-    size = int(np.clip(max(rows, cols), 16, 4096))
-    logging.info(
-        "Auto-selected grid size %d using H3 resolution %d (edge %.2f km)",
-        size,
-        h3_res,
-        edge_km,
-    )
+    deg_per_km = 1.0 / (111.320 * max(math.cos(math.radians(lat_mean)), 1e-6))
+    span_km = max(lat_span, lon_span) / deg_per_km
+    
+    # Target ~1km resolution but cap at reasonable sizes
+    size = int(np.clip(span_km, 16, 512))
+    logging.info("Auto-selected grid size %d for %.1f km extent", size, span_km)
     return size
 
 def _select_grid_columns(
@@ -267,17 +240,11 @@ def _select_grid_columns(
     requested: Optional[Iterable[str]],
     lat_column: Optional[str],
     lon_column: Optional[str],
-    h3_column: Optional[str],
-    geometry_column: Optional[str],
-    resolution_column: Optional[str],
+    
 ) -> List[str]:
     if requested:
         return list(dict.fromkeys(requested))
-    exclude = {
-        c
-        for c in (lat_column, lon_column, h3_column, geometry_column, resolution_column)
-        if c
-    }
+    exclude = {c for c in (lat_column, lon_column) if c}
     numeric_kinds = {"number", "integer"}
     selected: List[str] = []
     for entry in schema_columns:
@@ -364,7 +331,9 @@ def _generate_raster_assets(
         return [], assetization_dir
 
     available_names = list(schema.names)
+    logging.debug("Parquet schema columns: %s", available_names)
     norm_lookup = {_normalize_column_key(real): real for real in available_names}
+    logging.debug("Normalized name lookup keys: %s", list(norm_lookup.keys()))
 
     def _resolve(name: Optional[str]) -> Optional[str]:
         if not name:
@@ -382,6 +351,7 @@ def _generate_raster_assets(
             logging.warning("Column %s not found in table schema; skipping rasterization.", column)
             continue
         value_pairs.append((column, resolved))
+    logging.info("Resolved value columns for rasterization: %s", value_pairs)
 
     if not value_pairs:
         logging.info("No valid numeric columns remained after schema resolution; skipping raster assets.")
@@ -421,6 +391,22 @@ def _generate_raster_assets(
 
     table = pq.read_table(parquet_path, columns=list(columns_to_read))
     frame = table.to_pandas()
+    # Force numeric coercion for value columns (help when CSV columns are strings like 'N/A' or use comma decimals)
+    import pandas as _pd
+    for orig_name, resolved_name in value_pairs:
+        if resolved_name in frame.columns:
+            before_finite = _pd.to_numeric(frame[resolved_name], errors='coerce').notna().sum()
+            # Try a straight numeric coercion first
+            frame[resolved_name] = _pd.to_numeric(frame[resolved_name], errors='coerce')
+            after_finite = frame[resolved_name].notna().sum()
+            if after_finite == 0 and before_finite == 0:
+                # Try common locale decimal comma transformation as a fallback
+                try:
+                    frame[resolved_name] = _pd.to_numeric(frame[resolved_name].astype(str).str.replace(',', '.'), errors='coerce')
+                except Exception:
+                    pass
+            final_finite = frame[resolved_name].notna().sum()
+            logging.debug("Column %s (resolved %s): finite samples before=%d after=%d final=%d", orig_name, resolved_name, before_finite, after_finite, final_finite)
     row_count = len(frame)
     geometry_polygons: list[Optional[np.ndarray]]
     geometry_lat_centroids: Optional[np.ndarray] = None
@@ -454,7 +440,7 @@ def _generate_raster_assets(
         return [], assetization_dir
 
     if grid_size <= 0:
-        grid_size = _infer_grid_size_from_h3(frame, lat_vals, lon_vals, resolution_resolved)
+        grid_size = _infer_grid_size_from_data(frame, lat_vals, lon_vals)
 
     if grid_size <= 1:
         logging.warning("Grid size must be greater than 1 to rasterize; skipping raster assets.")
@@ -754,6 +740,7 @@ def main() -> None:
     csv_to_parquet(csv_path, parquet_path, schema_hints=schema_hints)
 
     columns = infer_columns(parquet_path)
+    logging.info("Inferred table columns: %s", [c.get("name") for c in columns])
 
     requested_columns = args.features if args.features else args.grid_columns
     grid_columns = _select_grid_columns(
@@ -809,6 +796,8 @@ def main() -> None:
 
     try:
         raster_targets = args.features if args.features else grid_columns
+        logging.info("Raster targets requested: %s", raster_targets)
+        logging.info("Grid columns selected for rasterization: %s", grid_columns)
         raster_products, assetization_dir = _generate_raster_assets(
             parquet_path,
             coll,
