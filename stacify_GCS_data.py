@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # python stacify_GCS_data.py   --csv /home/qubuntu25/Desktop/Data/GSC/2021_Table04_Datacube_temp.csv   --out /home/qubuntu25/Desktop/GitHub/1_Foundation_MVT_Result/   --collection-id gsc-2021_temp   --title "GSC 2021 Table"   --description "GSC 2021 Datacube Table"   --license "CC-BY-4.0"   --keywords GSC Datacube 2021 --validate --check-raster --check-raster-features Magnetic_HGM
 # python stacify_GCS_data.py   --csv /home/qubuntu25/Desktop/Data/GSC/2021_Table04_Datacube.csv   --out /home/qubuntu25/Desktop/GitHub/1_Foundation_MVT_Result/   --collection-id gsc-2021   --title "GSC 2021 Table"   --description "GSC 2021 Datacube Table"   --license "CC-BY-4.0"   --keywords GSC Datacube 2021 --validate   --check-raster --check-raster-features Magnetic_HGM
+
 # python stacify_GCS_data.py   --csv C:\Users\kyubo\Desktop\Research\Data\2021_Table04_Datacube_selected_Norm.csv   --out C:\Users\kyubo\Desktop\Research\Data\1_Stacify   --collection-id gsc-2021   --title "GSC 2021 Table"   --description "GSC 2021 Datacube Table"   --license "CC-BY-4.0"   --keywords GSC Datacube 2021 --validate   --check-raster --check-raster-features Magnetic_HGM
+
+# python stacify_GCS_data.py   --csv /home/qubuntu25/Desktop/Research/Data/2021_Table04_Datacube_selected_Norm.csv   --out /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/   --collection-id gsc-2021   --title "GSC 2021 Table"   --description "GSC 2021 Datacube Table"   --license "CC-BY-4.0"   --keywords GSC Datacube 2021 --validate   --check-raster --check-raster-features Magnetic_HGM
 """Convert a single GSC CSV table into a STAC catalog with tabular + raster assets."""
 
 import argparse
@@ -284,6 +287,9 @@ def _normalize_lat_lon(
         return lat_vals, lon_vals
 
     if not h3_column or h3_column not in frame.columns:
+        logging.warning(
+            "h3 column not provided; cannot generate raster files."
+        )
         return None
 
     try:

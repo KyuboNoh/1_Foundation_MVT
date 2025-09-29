@@ -28,7 +28,7 @@ zarr
 #pystac
 pystac[validation]
 datashader
-h3-py
+h3
 
 # ---- Backbone (ML) ----
 torch
