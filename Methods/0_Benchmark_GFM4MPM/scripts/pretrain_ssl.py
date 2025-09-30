@@ -5,7 +5,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Tuple, Dict, Any, Iterable
 
 import numpy as np
 import torch
@@ -71,7 +71,94 @@ def _slugify(name: str) -> str:
     return slug or "feature"
 
 
-def _collect_stac_raster_paths(stac_root: Path, features: Optional[Sequence[str]]) -> list[str]:
+def _load_training_metadata(stac_root: Path) -> Optional[Dict[str, Any]]:
+    candidates = [
+        stac_root / "training_metadata.json",
+        stac_root / "assetization" / "training_metadata.json",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            with open(candidate, "r", encoding="utf-8") as fh:
+                try:
+                    return json.load(fh)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"Failed to parse training metadata JSON at {candidate}: {exc}") from exc
+    return None
+
+
+def _find_feature_entry(entries: Dict[str, Any], feature_name: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+    if feature_name in entries:
+        return feature_name, entries[feature_name]
+    lowered = feature_name.lower()
+    for key, value in entries.items():
+        if key.lower() == lowered:
+            return key, value
+    return None
+
+
+def _collect_stac_raster_paths(stac_root: Path, features: Optional[Sequence[str]]) -> Tuple[list[str], Optional[Dict[str, Any]]]:
+    metadata = _load_training_metadata(stac_root)
+    if metadata:
+        features_section = metadata.get("features", {})
+        entries: Dict[str, Any] = features_section.get("entries", {})
+        total_features = features_section.get("total_features", len(entries))
+        print(f"[info] training_metadata.json reports {total_features} feature(s).")
+
+        if not entries:
+            print("[warn] training_metadata.json contained no feature entries; falling back to filesystem scan.")
+            metadata = None
+        else:
+            if features:
+                selected_features: Iterable[str] = features
+            else:
+                selected_features = sorted(entries.keys())
+                summary_names = ", ".join(selected_features)
+                print(
+                    f"[info] No explicit --features provided; using all {len(selected_features)} features"
+                    f" from metadata: {summary_names}"
+                )
+
+            raster_paths: list[str] = []
+            for feature_name in selected_features:
+                lookup = _find_feature_entry(entries, feature_name)
+                if lookup is None:
+                    raise FileNotFoundError(
+                        f"Feature '{feature_name}' not present in training_metadata.json; available keys: {', '.join(entries.keys())}"
+                    )
+                actual_name, entry = lookup
+                tif_records = entry.get("tifs", [])
+                if not tif_records:
+                    raise FileNotFoundError(f"No TIFF records listed for feature '{actual_name}' in training_metadata.json")
+
+                num_tifs = entry.get("num_tifs", len(tif_records))
+                print(f"[info] Feature '{actual_name}' has {num_tifs} map(s):")
+                for record in tif_records:
+                    path_value = record.get("path")
+                    if not path_value:
+                        continue
+                    tif_path = (stac_root / path_value).resolve()
+                    region = record.get("region")
+                    print(f"        - {tif_path} (region={region})")
+
+                preferred = None
+                for record in tif_records:
+                    if str(record.get("region", "")).upper() == "NA":
+                        preferred = record
+                        break
+                if preferred is None:
+                    preferred = tif_records[0]
+
+                path_value = preferred.get("path")
+                if not path_value:
+                    raise FileNotFoundError(
+                        f"Preferred TIFF record for feature '{actual_name}' lacked a path entry in training_metadata.json"
+                    )
+                tif_path = (stac_root / path_value).resolve()
+                raster_paths.append(str(tif_path))
+
+            return raster_paths, metadata
+
+    # Fallback: file system scan
     assets_dir = (stac_root / "assets" / "rasters").resolve()
     if not assets_dir.exists():
         raise FileNotFoundError(f"No raster assets directory found at {assets_dir}")
@@ -107,7 +194,7 @@ def _collect_stac_raster_paths(stac_root: Path, features: Optional[Sequence[str]
     else:
         candidates = sorted(candidates)
 
-    return [str(path.resolve()) for path in candidates]
+    return [str(path.resolve()) for path in candidates], None
 
 
 def _maybe_check_image_preproc(
@@ -455,8 +542,8 @@ if __name__ == '__main__':
             print(f"[info] Using {len(stack.feature_columns)} feature columns from STAC table")
     elif args.stac_root:
         stac_root_path = Path(args.stac_root).resolve()
-        raster_paths = _collect_stac_raster_paths(stac_root_path, args.features)
-        print(f"[info] Found {len(raster_paths)} raster asset(s) under {stac_root_path}")
+        raster_paths, metadata = _collect_stac_raster_paths(stac_root_path, args.features)
+        print(f"[info] Using {len(raster_paths)} raster asset(s) from {stac_root_path}")
         stack = GeoStack(raster_paths)
         window_size = args.window
     else:
