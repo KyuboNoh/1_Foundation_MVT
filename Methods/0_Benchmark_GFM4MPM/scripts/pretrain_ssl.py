@@ -922,6 +922,21 @@ if __name__ == '__main__':
         stack = GeoStack(sorted(glob.glob(args.bands)))
         window_size = args.window
 
+    requested_out = Path(args.out)
+    if stac_root_path is not None:
+        output_base = (stac_root_path / "work").resolve()
+        relative_part = requested_out
+        if requested_out.is_absolute():
+            relative_part = Path(requested_out.name)
+        relative_str = str(relative_part).strip()
+        if not relative_str or relative_str in {".", "./"}:
+            output_dir = output_base
+        else:
+            output_dir = (output_base / relative_part).resolve()
+        print(f"[info] Output artifacts will be stored under {output_dir}")
+    else:
+        output_dir = requested_out.resolve()
+
     if args.window <= 0:
         ap.error('--window must be positive')
     if args.patch <= 0:
@@ -929,7 +944,7 @@ if __name__ == '__main__':
     if args.window % args.patch != 0:
         ap.error('--window must be divisible by --patch to form an integer patch grid')
 
-    preview_dir = Path(args.out) / 'previews'
+    preview_dir = output_dir / 'previews'
 
 
     # why new GeoStack is created here?
@@ -1025,8 +1040,8 @@ if __name__ == '__main__':
         mask_scope=args.mask_scope,
         norm_per_patch=args.norm_per_patch,
     )
-    os.makedirs(args.out, exist_ok=True)
-    torch.save(model.state_dict(), os.path.join(args.out, 'mae_encoder.pth'))
-    history_path = Path(args.out) / 'ssl_history.json'
+    output_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), output_dir / 'mae_encoder.pth')
+    history_path = output_dir / 'ssl_history.json'
     history_path.write_text(json.dumps(history, indent=2), encoding='utf-8')
     print(f"Saved training history to {history_path}")
