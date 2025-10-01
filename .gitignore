@@ -2,3 +2,5 @@
 .venv/
 *.log
 outputs/
+# large binaries
+*.pth
