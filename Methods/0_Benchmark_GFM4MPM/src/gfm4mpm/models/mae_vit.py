@@ -43,24 +43,50 @@ class MAEViT(nn.Module):
         in_chans: int = 8,
         embed_dim: int = 256,
         depth: int = 6,
-        num_heads: int = 8,
+        encoder_num_heads: int = 8,
         mlp_ratio: float = 4.0,
+        mlp_ratio_dec: float = 2.0,
         patch_size: int = 4,
         dec_dim: int = 128,
         dec_depth: int = 2,
+        decoder_num_heads: Optional[int] = None,
         mask_ratio: float = 0.75,
         image_size: Optional[Union[Tuple[int, int], int]] = None,
     ) -> None:
         super().__init__()
+        if embed_dim <= 0:
+            raise ValueError("embed_dim must be positive")
+        if encoder_num_heads <= 0:
+            raise ValueError("encoder_num_heads must be positive")
+        if embed_dim % encoder_num_heads != 0:
+            raise ValueError("embed_dim must be divisible by encoder_num_heads")
+        if mlp_ratio <= 0:
+            raise ValueError("mlp_ratio must be positive")
+        if mlp_ratio_dec <= 0:
+            raise ValueError("mlp_ratio must be positive")
+        if patch_size <= 0:
+            raise ValueError("patch_size must be positive")
+        if dec_dim <= 0:
+            raise ValueError("dec_dim must be positive")
+        if dec_depth < 0:
+            raise ValueError("dec_depth must be non-negative")
+        if decoder_num_heads is None:
+            decoder_num_heads = encoder_num_heads
+        if decoder_num_heads <= 0:
+            raise ValueError("decoder_num_heads must be positive")
+        if dec_dim % decoder_num_heads != 0:
+            raise ValueError("dec_dim must be divisible by decoder_num_heads")
+        if not (0.0 <= mask_ratio < 1.0):
+            raise ValueError("mask_ratio must be in the range [0, 1)")
         self.patch = PatchEmbed(in_chans, embed_dim, patch_size)
         self.pos_embed = None
-        self.blocks = nn.ModuleList([TransformerBlock(embed_dim, num_heads, mlp_ratio) for _ in range(depth)])
+        self.blocks = nn.ModuleList([TransformerBlock(embed_dim, encoder_num_heads, mlp_ratio) for _ in range(depth)])
         self.norm = nn.LayerNorm(embed_dim)
         # decoder
         self.dec_proj = nn.Linear(embed_dim, dec_dim)
         self.mask_token = nn.Parameter(torch.zeros(1,1,dec_dim))
         self.dec_pos = None
-        self.dec_blocks = nn.ModuleList([TransformerBlock(dec_dim, num_heads, 2.0) for _ in range(dec_depth)])
+        self.dec_blocks = nn.ModuleList([TransformerBlock(dec_dim, decoder_num_heads, mlp_ratio_dec) for _ in range(dec_depth)])
         self.head = nn.Linear(dec_dim, patch_size*patch_size*in_chans)
         nn.init.trunc_normal_(self.mask_token, std=0.02)
         self.patch_size = patch_size

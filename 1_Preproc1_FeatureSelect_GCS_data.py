@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Select a subset of GSC CSV columns for downstream processing."""
 
+# python 1_Preproc1_FeatureSelect_GCS_data.py --csv "/home/qubuntu25/Desktop/Research/Data/2021_Table04_Datacube.csv" --out "/home/qubuntu25/Desktop/Research/Data/2021_Table04_Datacube_selected.csv" --lat-column "Latitude_EPSG4326" --lon-column "Longitude_EPSG4326" --features Terrane_Proximity Geology_Period_Maximum_Majority Geology_Period_Minimum_Majority Geology_Lithology_Majority Geology_Lithology_Minority Geology_PassiveMargin_Proximity Geology_BlackShale_Proximity Geology_Fault_Proximity Geology_Paleolatitude_Period_Maximum Geology_Paleolatitude_Period_Minimum Seismic_LAB_Hoggard Seismic_Moho Gravity_GOCE_Differential Gravity_GOCE_MaximumCurve Gravity_GOCE_MinimumCurve Gravity_GOCE_MeanCurve Gravity_GOCE_ShapeIndex Gravity_Bouguer Gravity_Bouguer_HGM Gravity_Bouguer_HGM_Worms_Proximity Gravity_Bouguer_UpCont30km_HGM Gravity_Bouguer_UpCont30km_HGM_Worms_Proximity Magnetic_HGM Magnetic_HGM_Worms_Proximity Magnetic_LongWavelength_HGM Magnetic_LongWavelength_HGM_Worms_Proximity --special-columns1 Geology_Lithology_Contact Geology_Dictionary_Alkalic Geology_Dictionary_Anatectic Geology_Dictionary_Calcareous Geology_Dictionary_Carbonaceous Geology_Dictionary_Cherty Geology_Dictionary_CoarseClastic Geology_Dictionary_Evaporitic Geology_Dictionary_Felsic Geology_Dictionary_FineClastic Geology_Dictionary_Gneissose Geology_Dictionary_Igneous Geology_Dictionary_Intermediate Geology_Dictionary_Pegmatitic Geology_Dictionary_RedBed Geology_Dictionary_Schistose Geology_Dictionary_Sedimentary Geology_Dictionary_UltramaficMafic --extra-columns H3_Address H3_Resolution H3_Geometry Training_MVT_Deposit Training_MVT_Occurrence --validate
+
 # python .\1_Preproc1_FeatureSelect_GCS_data.py `
 # --csv "C:\Users\kyubo\Desktop\Research\Data\2021_Table04_Datacube_temp.csv" `
 # --out "C:\Users\kyubo\Desktop\Research\Data\2021_Table04_Datacube_temp_selected.csv" `
 # --lat-column "Latitude_EPSG4326" --lon-column "Longitude_EPSG4326" `
 # --features Terrane_Proximity Geology_Period_Maximum_Majority Geology_Period_Minimum_Majority Geology_Lithology_Majority Geology_Lithology_Minority Geology_PassiveMargin_Proximity Geology_BlackShale_Proximity Geology_Fault_Proximity Geology_Paleolatitude_Period_Maximum Geology_Paleolatitude_Period_Minimum Seismic_LAB_Hoggard Seismic_Moho Gravity_GOCE_Differential Gravity_GOCE_MaximumCurve Gravity_GOCE_MinimumCurve Gravity_GOCE_MeanCurve Gravity_GOCE_ShapeIndex Gravity_Bouguer Gravity_Bouguer_HGM Gravity_Bouguer_HGM_Worms_Proximity Gravity_Bouguer_UpCont30km_HGM Gravity_Bouguer_UpCont30km_HGM_Worms_Proximity Magnetic_HGM Magnetic_HGM_Worms_Proximity Magnetic_LongWavelength_HGM Magnetic_LongWavelength_HGM_Worms_Proximity `
 # --special-columns1 Geology_Lithology_Contact Geology_Dictionary_Alkalic Geology_Dictionary_Anatectic Geology_Dictionary_Calcareous Geology_Dictionary_Carbonaceous Geology_Dictionary_Cherty Geology_Dictionary_CoarseClastic Geology_Dictionary_Evaporitic Geology_Dictionary_Felsic Geology_Dictionary_FineClastic Geology_Dictionary_Gneissose Geology_Dictionary_Igneous Geology_Dictionary_Intermediate Geology_Dictionary_Pegmatitic Geology_Dictionary_RedBed Geology_Dictionary_Schistose Geology_Dictionary_Sedimentary Geology_Dictionary_UltramaficMafic `
-# --extra-columns H3_Address H3_Resolution H3_Geometry `
+# --extra-columns H3_Address H3_Resolution H3_Geometry Training_MVT_Deposit Training_MVT_Occurrence`
 # --validate
 
 from __future__ import annotations
@@ -628,14 +630,15 @@ def main() -> None:
     # Generate validation plots
     import logging as _logging
     _logging.getLogger("matplotlib").setLevel(_logging.WARNING)
-    _generate_validation_plots(
-            frame,
-            output_path,
-            selected_columns,
-            aggregated_columns,
-            lat_column=args.lat_column,
-            lon_column=args.lon_column,
-    )
+    if args.validate:
+        _generate_validation_plots(
+                frame,
+                output_path,
+                selected_columns,
+                aggregated_columns,
+                lat_column=args.lat_column,
+                lon_column=args.lon_column,
+        )
 
     try:
         frame.to_csv(output_path, index=False)

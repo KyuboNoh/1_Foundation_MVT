@@ -33,3 +33,4 @@ h3
 # ---- Backbone (ML) ----
 torch
 torchmetrics
+tqdm

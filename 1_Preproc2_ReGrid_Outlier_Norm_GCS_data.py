@@ -13,19 +13,24 @@ import numpy as np
 import pandas as pd
 from unify.one_d import _read_csv_with_fallback as _csv_read_with_fallback
 DEFAULT_NEIGHBOR_COUNT = 6
+MAX_IDW_RECURSION = 8
 AUTO_EXCLUDED_FEATURES = frozenset({
     "Dict_Sedimentary",
     "Dict_Igneous",
     "Dict_Metamorphic",
 })
+# Windows
 # python .\1_Preproc2_ReGrid_Outlier_Norm_GCS_data.py `
 # --csv "C:\Users\kyubo\Desktop\Research\Data\2021_Table04_Datacube_temp_selected.csv" `
 # --out "C:\Users\kyubo\Desktop\Research\Data\2021_Table04_Datacube_temp_selected_Norm.csv" `
 # --lat-column "Latitude_EPSG4326" --lon-column "Longitude_EPSG4326" `
 # --features Terrane_Proximity Geology_Period_Maximum_Majority Geology_Period_Minimum_Majority Geology_Lithology_Majority Geology_Lithology_Minority Geology_PassiveMargin_Proximity Geology_BlackShale_Proximity Geology_Fault_Proximity Geology_Paleolatitude_Period_Maximum Geology_Paleolatitude_Period_Minimum Seismic_LAB_Hoggard Seismic_Moho Gravity_GOCE_Differential Gravity_GOCE_MaximumCurve Gravity_GOCE_MinimumCurve Gravity_GOCE_MeanCurve Gravity_GOCE_ShapeIndex Gravity_Bouguer Gravity_Bouguer_HGM Gravity_Bouguer_HGM_Worms_Proximity Gravity_Bouguer_UpCont30km_HGM Gravity_Bouguer_UpCont30km_HGM_Worms_Proximity Magnetic_HGM Magnetic_HGM_Worms_Proximity Magnetic_LongWavelength_HGM Magnetic_LongWavelength_HGM_Worms_Proximity Dict_Sedimentary Dict_Igneous Dict_Metamorphic `
-# --extra-columns H3_Address H3_Resolution `
+# --extra-columns H3_Address H3_Resolution Training_MVT_Deposit Training_MVT_Occurrence`
 # --validate
-# python 1_Preproc2_ReGrid_Outlier_Norm_GCS_data.py --csv "/home/qubuntu25/Desktop/Research/Data/2021_Table04_Datacube_temp_selected.csv" --out "/home/qubuntu25/Desktop/Research/Data/2021_Table04_Datacube_temp_selected_Norm.csv" --lat-column "Latitude_EPSG4326" --lon-column "Longitude_EPSG4326" --features Terrane_Proximity Geology_Period_Maximum_Majority Geology_Period_Minimum_Majority Geology_Lithology_Majority Geology_Lithology_Minority Geology_PassiveMargin_Proximity Geology_BlackShale_Proximity Geology_Fault_Proximity Geology_Paleolatitude_Period_Maximum Geology_Paleolatitude_Period_Minimum Seismic_LAB_Hoggard Seismic_Moho Gravity_GOCE_Differential Gravity_GOCE_MaximumCurve Gravity_GOCE_MinimumCurve Gravity_GOCE_MeanCurve Gravity_GOCE_ShapeIndex Gravity_Bouguer Gravity_Bouguer_HGM Gravity_Bouguer_HGM_Worms_Proximity Gravity_Bouguer_UpCont30km_HGM Gravity_Bouguer_UpCont30km_HGM_Worms_Proximity Magnetic_HGM Magnetic_HGM_Worms_Proximity Magnetic_LongWavelength_HGM Magnetic_LongWavelength_HGM_Worms_Proximity Dict_Sedimentary Dict_Igneous Dict_Metamorphic --extra-columns H3_Address H3_Resolution --validate
+
+# Linux
+# python 1_Preproc2_ReGrid_Outlier_Norm_GCS_data.py --csv "/home/qubuntu25/Desktop/Research/Data/2021_Table04_Datacube_temp_selected.csv" --out "/home/qubuntu25/Desktop/Research/Data/2021_Table04_Datacube_temp_selected_Norm.csv" --lat-column "Latitude_EPSG4326" --lon-column "Longitude_EPSG4326" --features Terrane_Proximity Geology_Period_Maximum_Majority Geology_Period_Minimum_Majority Geology_Lithology_Majority Geology_Lithology_Minority Geology_PassiveMargin_Proximity Geology_BlackShale_Proximity Geology_Fault_Proximity Geology_Paleolatitude_Period_Maximum Geology_Paleolatitude_Period_Minimum Seismic_LAB_Hoggard Seismic_Moho Gravity_GOCE_Differential Gravity_GOCE_MaximumCurve Gravity_GOCE_MinimumCurve Gravity_GOCE_MeanCurve Gravity_GOCE_ShapeIndex Gravity_Bouguer Gravity_Bouguer_HGM Gravity_Bouguer_HGM_Worms_Proximity Gravity_Bouguer_UpCont30km_HGM Gravity_Bouguer_UpCont30km_HGM_Worms_Proximity Magnetic_HGM Magnetic_HGM_Worms_Proximity Magnetic_LongWavelength_HGM Magnetic_LongWavelength_HGM_Worms_Proximity Dict_Sedimentary Dict_Igneous Dict_Metamorphic --extra-columns H3_Address H3_Resolution Training_MVT_Deposit Training_MVT_Occurrence --validate
+# python 1_Preproc2_ReGrid_Outlier_Norm_GCS_data.py --csv "/home/qubuntu25/Desktop/Research/Data/2021_Table04_Datacube_selected.csv"      --out "/home/qubuntu25/Desktop/Research/Data/2021_Table04_Datacube_selected_Norm.csv"      --lat-column "Latitude_EPSG4326" --lon-column "Longitude_EPSG4326" --features Terrane_Proximity Geology_Period_Maximum_Majority Geology_Period_Minimum_Majority Geology_Lithology_Majority Geology_Lithology_Minority Geology_PassiveMargin_Proximity Geology_BlackShale_Proximity Geology_Fault_Proximity Geology_Paleolatitude_Period_Maximum Geology_Paleolatitude_Period_Minimum Seismic_LAB_Hoggard Seismic_Moho Gravity_GOCE_Differential Gravity_GOCE_MaximumCurve Gravity_GOCE_MinimumCurve Gravity_GOCE_MeanCurve Gravity_GOCE_ShapeIndex Gravity_Bouguer Gravity_Bouguer_HGM Gravity_Bouguer_HGM_Worms_Proximity Gravity_Bouguer_UpCont30km_HGM Gravity_Bouguer_UpCont30km_HGM_Worms_Proximity Magnetic_HGM Magnetic_HGM_Worms_Proximity Magnetic_LongWavelength_HGM Magnetic_LongWavelength_HGM_Worms_Proximity Dict_Sedimentary Dict_Igneous Dict_Metamorphic --extra-columns H3_Address H3_Resolution Training_MVT_Deposit Training_MVT_Occurrence --validate
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -91,33 +96,40 @@ def _determine_feature_columns(frame: pd.DataFrame, args: argparse.Namespace) ->
         normalized_auto = {str(col).strip().casefold() for col in AUTO_EXCLUDED_FEATURES}
         candidate = []
         missing = []
+        skipped = []
         for col in args.features:
             if col not in frame_columns:
                 missing.append(col)
                 continue
             if str(col).strip().casefold() in normalized_auto:
                 continue
+            if not pd.api.types.is_numeric_dtype(frame[col]):
+                skipped.append(col)
+                continue
             candidate.append(col)
         if missing:
-            logging.warning(
-                "Skipping missing requested features: %s", ", ".join(missing))
+            logging.warning("Skipping missing requested features: %s", ", ".join(missing))
+        if skipped:
+            logging.warning("Skipping non-numeric requested features: %s", ", ".join(skipped))
         return _unique_ordered(candidate)
+
     exclude = {args.lat_column, args.lon_column}
     exclude.update(AUTO_EXCLUDED_FEATURES)
     normalized_exclude = {str(col).strip().casefold() for col in exclude}
+
     def _skip_column(name: object) -> bool:
         return str(name).strip().casefold() in normalized_exclude
+
     numeric_cols = [
         col
         for col in frame.columns
         if not _skip_column(col) and pd.api.types.is_numeric_dtype(frame[col])
     ]
-    print(exclude)
-    print(numeric_cols);
-    exit()
+
     if not numeric_cols:
         logging.error("No numeric feature columns detected.")
         sys.exit(1)
+
     return numeric_cols
 
 def _apply_tukey_fence(series: pd.Series) -> pd.Series:
@@ -213,6 +225,8 @@ def _inverse_distance_weighted_impute(
     neighbour_distances: np.ndarray,
     safe_neighbour_indices: np.ndarray,
     valid_neighbour_mask: np.ndarray,
+    *,
+    _depth: int = 0,
 ) -> pd.Series:
     values = series.to_numpy(dtype=float, copy=True)
     missing_mask = np.isnan(values)
@@ -232,7 +246,19 @@ def _inverse_distance_weighted_impute(
     weighted_values = np.nansum(neighbour_vals * weights, axis=1)
     fill_mask = missing_mask & (weight_sums > 0)
     values[fill_mask] = weighted_values[fill_mask] / weight_sums[fill_mask]
-    return pd.Series(values, index=series.index)
+    updated_series = pd.Series(values, index=series.index)
+    remaining_mask = np.isnan(values)
+    if not remaining_mask.any():
+        return updated_series
+    if np.array_equal(remaining_mask, missing_mask) or _depth >= MAX_IDW_RECURSION:
+        return _impute_with_mean(updated_series)
+    return _inverse_distance_weighted_impute(
+        updated_series,
+        neighbour_distances,
+        safe_neighbour_indices,
+        valid_neighbour_mask,
+        _depth=_depth + 1,
+    )
 
 def _smooth_with_neighbours(
     series: pd.Series,
@@ -455,6 +481,7 @@ def main() -> None:
     if not processed_columns:
         logging.error("No feature columns selected for processing.")
         sys.exit(1)
+
     neighbour_count = max(1, args.neighbor_count)
     logging.info("Processing neighbour map (k=%d).", neighbour_count)
     neighbour_indices, neighbour_distances = _compute_neighbour_map(
@@ -464,6 +491,9 @@ def main() -> None:
         valid_neighbour_mask, neighbour_indices, 0)
     logging.info("Processing %d feature columns.", len(processed_columns))
     for column in processed_columns:
+        if not pd.api.types.is_numeric_dtype(frame[column]):
+            logging.warning("Skipping non-numeric feature %s", column)
+            continue        
         logging.info(" - Processing %s feature .", column)
         numeric = pd.to_numeric(frame[column], errors="coerce")
         clipped = _apply_tukey_fence(numeric)
@@ -487,6 +517,7 @@ def main() -> None:
         skip_for_categorical.update(excluded_candidates)
         skip_for_categorical.add(args.lat_column)
         skip_for_categorical.add(args.lon_column)
+        skip_for_categorical.update(extra_columns_to_keep)
         categorical_columns: list[str] = []
         categorical_columns.extend(excluded_categorical)
         for column in frame.columns:
@@ -496,20 +527,22 @@ def main() -> None:
                 categorical_columns.append(column)
         if categorical_columns:
             _generate_categorical_plots(frame, output_path, categorical_columns)
+    def _append_column(name: str, seen: set[str], target: list[str]) -> None:
+        if name in seen or name not in frame.columns:
+            return
+        target.append(name)
+        seen.add(name)
+
     columns_to_export: list[str] = []
+    seen_columns: set[str] = set()
     for column in (args.lat_column, args.lon_column):
-        if column in frame.columns:
-            columns_to_export.append(column)
-    columns_to_export.extend(extra_columns_to_keep)
-    columns_to_export.extend(processed_columns)
-    already_listed = set(columns_to_export)
-    categorical_columns = [
-        column
-        for column in frame.columns
-        if column not in already_listed and not pd.api.types.is_numeric_dtype(dtypes[column])
-    ]
-    columns_to_export.extend(categorical_columns)
-    columns_to_export = _unique_ordered(columns_to_export)
+        _append_column(column, seen_columns, columns_to_export)
+    for column in extra_columns_to_keep:
+        _append_column(column, seen_columns, columns_to_export)
+    for column in processed_columns:
+        _append_column(column, seen_columns, columns_to_export)
+    for column in frame.columns:
+        _append_column(column, seen_columns, columns_to_export)
     output_frame = frame.loc[:, columns_to_export]
     try:
         output_frame.to_csv(output_path, index=False)

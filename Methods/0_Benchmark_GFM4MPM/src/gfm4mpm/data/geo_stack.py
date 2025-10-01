@@ -25,6 +25,23 @@ class GeoStack:
         self.is_table = False
         self.kind = "raster"
         self.band_mean, self.band_std = self._compute_band_stats()
+        self._valid_rows: Optional[np.ndarray] = None
+        self._valid_cols: Optional[np.ndarray] = None
+        try:
+            mask = ref.dataset_mask()
+            if mask is not None:
+                mask_arr = np.asarray(mask) != 0
+                if mask_arr.ndim == 3:
+                    mask_arr = mask_arr[0]
+                if mask_arr.any():
+                    rows = np.where(mask_arr.any(axis=1))[0]
+                    cols = np.where(mask_arr.any(axis=0))[0]
+                    if rows.size and cols.size:
+                        self._valid_rows = rows
+                        self._valid_cols = cols
+        except Exception:
+            self._valid_rows = None
+            self._valid_cols = None
 
     # ------------------------------------------------------------------
     def _compute_band_stats(self) -> Tuple[np.ndarray, np.ndarray]:
@@ -39,22 +56,29 @@ class GeoStack:
         return mean_arr, std_arr
 
     def _estimate_band_stats(self, src) -> Tuple[float, float]:
+        stats = None
         try:
-            stats = src.statistics(1, approx=True)
+            if hasattr(src, "stats"):
+                result = src.stats(1, approx=True)
+                if isinstance(result, dict):
+                    stats = result
+                elif isinstance(result, (list, tuple)) and result:
+                    stats = result[0]
+            elif hasattr(src, "statistics"):
+                stats = src.statistics(1, approx=True)
         except Exception:
             stats = None
 
-        if (
-            stats is not None
-            and getattr(stats, "count", 0)
-            and np.isfinite(stats.mean)
-            and np.isfinite(stats.std)
-        ):
-            mean = float(stats.mean)
-            std = float(stats.std)
-            if std < 1e-6:
-                std = 1.0
-            return mean, std
+        if stats is not None:
+            count = stats.get("count") if isinstance(stats, dict) else getattr(stats, "count", 0)
+            mean_val = stats.get("mean") if isinstance(stats, dict) else getattr(stats, "mean", None)
+            std_val = stats.get("std") if isinstance(stats, dict) else getattr(stats, "std", None)
+            if count and np.isfinite(mean_val) and np.isfinite(std_val):
+                mean = float(mean_val)
+                std = float(std_val)
+                if std < 1e-6:
+                    std = 1.0
+                return mean, std
 
         sum_vals = 0.0
         sum_sq = 0.0
@@ -87,8 +111,13 @@ class GeoStack:
             std = 1.0
         return float(mean), std
 
-    def read_patch(self, row: int, col: int, size: int, nodata_val: Optional[float]=None) -> np.ndarray:
-        """Return (C, H, W) patch centered at (row, col)."""
+    def _read_patch_arrays(
+        self,
+        row: int,
+        col: int,
+        size: int,
+        nodata_val: Optional[float] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         half = size // 2
         r0, c0 = max(row-half, 0), max(col-half, 0)
         r1, c1 = min(r0+size, self.height), min(c0+size, self.width)
@@ -112,22 +141,42 @@ class GeoStack:
             band_masks.append(mask)
 
         patch = np.stack(band_arrays, axis=0)
-        mask = np.stack(band_masks, axis=0)
+        mask = np.stack(band_masks, axis=0).astype(bool, copy=False)
 
         # pad if near edges
         pad_h, pad_w = size - patch.shape[1], size - patch.shape[2]
         if pad_h or pad_w:
-            patch = np.pad(patch, ((0, 0), (0, pad_h), (0, pad_w)), mode='edge')
-            mask = np.pad(mask, ((0, 0), (0, pad_h), (0, pad_w)), mode='edge')
+            pad_config = ((0, 0), (0, max(0, pad_h)), (0, max(0, pad_w)))
+            patch = np.pad(patch, pad_config, mode='constant', constant_values=np.nan)
+            mask = np.pad(mask, pad_config, mode='constant', constant_values=False)
 
         if nodata_val is not None:
             invalid = np.isclose(patch[0], nodata_val, equal_nan=True)
             mask[:, invalid] = False
 
+        return patch, mask
+
+    def read_patch(self, row: int, col: int, size: int, nodata_val: Optional[float]=None) -> np.ndarray:
+        """Return (C, H, W) patch centered at (row, col)."""
+        patch, mask = self._read_patch_arrays(row, col, size, nodata_val)
         patch = np.where(mask, patch, np.nan)
         patch = (patch - self.band_mean) / self.band_std
         patch = np.nan_to_num(patch, nan=0.0, posinf=0.0, neginf=0.0)
         return patch.astype(np.float32)
+
+    def read_patch_with_mask(
+        self,
+        row: int,
+        col: int,
+        size: int,
+        nodata_val: Optional[float] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        patch, mask = self._read_patch_arrays(row, col, size, nodata_val)
+        patch = np.where(mask, patch, np.nan)
+        patch = (patch - self.band_mean) / self.band_std
+        patch = np.nan_to_num(patch, nan=0.0, posinf=0.0, neginf=0.0)
+        mask_pixel_no_feature = ~mask.any(axis=0)
+        return patch.astype(np.float32), mask_pixel_no_feature.astype(bool, copy=False)
 
     def grid_centers(self, stride: int) -> List[Tuple[int,int]]:
         rows = range(stride//2, self.height, stride)
@@ -136,8 +185,19 @@ class GeoStack:
 
     def random_coord(self, patch: int, rng: np.random.Generator) -> Tuple[int, int]:
         half = patch // 2
-        r = int(rng.integers(half, max(self.height - half, half + 1)))
-        c = int(rng.integers(half, max(self.width - half, half + 1)))
+        if (
+            self._valid_rows is not None
+            and self._valid_cols is not None
+            and self._valid_rows.size
+            and self._valid_cols.size
+        ):
+            r = int(self._valid_rows[int(rng.integers(0, self._valid_rows.size))])
+            c = int(self._valid_cols[int(rng.integers(0, self._valid_cols.size))])
+            r = int(np.clip(r, half, max(self.height - half - 1, half)))
+            c = int(np.clip(c, half, max(self.width - half - 1, half)))
+        else:
+            r = int(rng.integers(half, max(self.height - half, half + 1)))
+            c = int(rng.integers(half, max(self.width - half, half + 1)))
         return r, c
 
     def coord_to_index(self, coord: Tuple[int, int]) -> int:
