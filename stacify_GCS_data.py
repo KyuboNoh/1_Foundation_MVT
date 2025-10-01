@@ -811,6 +811,15 @@ def _generate_raster_assets(
         logging.info("No usable feature columns found after processing; skipping raster assets.")
         return [], assetization_dir
 
+    total_categorical_bands = sum(len(spec["columns"]) for spec in feature_specs if spec.get("kind") == "categorical")
+    total_categorical_features = sum(1 for spec in feature_specs if spec.get("kind") == "categorical")
+    if total_categorical_bands > 0:
+        logging.warning(
+            "WARNING we are about to rasterize %d categorical band(s) across %d feature(s) after one-hot encoding. This will take LONG.",
+            total_categorical_bands,
+            total_categorical_features,
+        )
+
     label_total_ones: Optional[float] = None
     if label_resolved and label_resolved in frame.columns:
         series = frame[label_resolved]
