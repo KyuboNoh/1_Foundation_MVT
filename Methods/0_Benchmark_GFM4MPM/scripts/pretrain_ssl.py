@@ -2,6 +2,7 @@
 import argparse
 import glob
 import json
+import math
 import os
 import re
 from collections import defaultdict
@@ -60,7 +61,6 @@ class SSLDataset(Dataset):
         }
         return sample
 
-    # TODO: Make this code to only consider samples that generates full window*window images?
     def __getitem__(self, idx):
         if hasattr(self.stack, "sample_patch"):
             attempts = self.max_resample_attempts if self.skip_nan else 1
@@ -772,6 +772,10 @@ if __name__ == '__main__':
                     help='Disable per-patch normalization when computing the reconstruction loss')
     ap.add_argument('--norm-per-patch', dest='norm_per_patch', action='store_true',
                     help='Enable per-patch normalization when computing the reconstruction loss')
+    ap.add_argument('--ssim', dest='use_ssim', action='store_true',
+                    help='Enable SSIM metric computation during training (disabled by default)')
+    ap.add_argument('--no-ssim', dest='use_ssim', action='store_false',
+                    help='Disable SSIM metric computation during training (default)')
     ap.add_argument('--epochs', type=int, default=30)
     ap.add_argument('--batch', type=int, default=128)
     ap.add_argument('--optimizer', choices=['adamw', 'adam'], default='adamw')
@@ -786,7 +790,7 @@ if __name__ == '__main__':
     ap.add_argument('--allow-nan', dest='skip_nan', action='store_false',
                     help='Allow NaNs in sampled patches (disables resampling)')
     ap.set_defaults(skip_nan=True)
-    ap.set_defaults(norm_per_patch=True)
+    ap.set_defaults(norm_per_patch=True, use_ssim=False)
     ap.add_argument('--skip-nan-attempts', type=int, default=64,
                     help='Maximum resampling attempts when skipping NaN-containing patches')
     args = ap.parse_args()
@@ -1027,6 +1031,29 @@ if __name__ == '__main__':
         mlp_ratio=args.mlp_ratio,
         mlp_ratio_dec=args.mlp_ratio_decoder,
     )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    history_path = output_dir / 'ssl_history.json'
+    checkpoint_path = output_dir / 'mae_encoder.pth'
+
+    checkpoint_percentages = (0.25, 0.5, 0.75, 1.0)
+    checkpoint_epochs = sorted(
+        {
+            min(args.epochs, max(1, math.ceil(args.epochs * pct)))
+            for pct in checkpoint_percentages
+        }
+    )
+
+    def _save_checkpoint(epoch: int, current_model: torch.nn.Module, history_entries: List[Dict[str, float]]):
+        if checkpoint_path.exists():
+            checkpoint_path.unlink()
+        torch.save(current_model.state_dict(), checkpoint_path)
+        if history_path.exists():
+            history_path.unlink()
+        history_path.write_text(json.dumps(history_entries, indent=2), encoding='utf-8')
+        print(
+            f"[info] Saved checkpoint artifacts at epoch {epoch} to {checkpoint_path.parent}"
+        )
+
     model, history = train_ssl(
         model,
         dl,
@@ -1039,9 +1066,10 @@ if __name__ == '__main__':
         feature_metadata=getattr(stack, 'feature_metadata', None),
         mask_scope=args.mask_scope,
         norm_per_patch=args.norm_per_patch,
+        use_ssim=args.use_ssim,
+        checkpoint_epochs=checkpoint_epochs,
+        checkpoint_callback=_save_checkpoint,
     )
-    output_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(model.state_dict(), output_dir / 'mae_encoder.pth')
-    history_path = output_dir / 'ssl_history.json'
-    history_path.write_text(json.dumps(history, indent=2), encoding='utf-8')
-    print(f"Saved training history to {history_path}")
+    if args.epochs not in checkpoint_epochs:
+        _save_checkpoint(args.epochs, model, history)
+    print(f"Training history available at {history_path}")

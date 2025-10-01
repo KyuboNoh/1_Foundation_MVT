@@ -39,7 +39,8 @@ python -m scripts.inspect_labels \
 
 1) **Pretrain SSL encoder** (masked autoencoder):
 ```bash
-python -m scripts.pretrain_ssl   --stac-root /home/qubuntu25/Desktop/GitHub/1_Foundation_MVT_Result/gsc-2021_temp       --features Gravity_Bouguer_HGM_Worms_Proximity   --check-feature Gravity_Bouguer_HGM_Worms_Proximity       --lat-column Latitude_EPSG4326   --lon-column Longitude_EPSG4326       --mask-ratio 0.75     --encoder-depth 6     --decoder-depth 2  --patch 4   --window 16   --preview-samples 5   --check-image-preproc   --out ./work/test   --epochs 2 --mask-scope patch --skip-nan
+python -m scripts.pretrain_ssl --stac-root /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021 --lat-column Latitude_EPSG4326 --lon-column Longitude_EPSG4326 --mask-ratio 0.75 --encoder-depth 6 --decoder-depth 2 --preview-samples 2 --lr 2.5e-4 --epochs 50 --out ./work/test --check-feature Gravity_Bouguer_HGM_Worms_Proximity --check-ima
+ge-preproc --patch 16 --window 224
 ```
 
 1) **Pretrain SSL encoder** (masked autoencoder) (windows ver.):

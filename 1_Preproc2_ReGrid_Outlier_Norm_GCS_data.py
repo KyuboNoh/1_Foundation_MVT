@@ -1,4 +1,11 @@
 from __future__ import annotations
+#
+# Stage 2 preprocessing for geoscience features:
+#   - loads the feature-selected CSV from stage 1
+#   - clips outliers, imputes gaps via IDW neighbours, and smooths with local means
+#   - standardises numeric features and preserves requested ancillary columns
+#   - optionally emits geographic validation maps and distribution plots
+#   - writes the cleaned, normalised dataset alongside diagnostics
 """Outlier and Missing value treatment."""
 
 # TODO: Later consider p025 and p975 for hyper-parameter tuning
@@ -308,6 +315,7 @@ def _generate_validation_plots(
     lat_column: str,
     lon_column: str,
     features: list[str],
+    subdir_name: str | None = None,
 ) -> None:
     try:
         import datashader as ds
@@ -320,7 +328,11 @@ def _generate_validation_plots(
             "Skipping validation plots; datashader/matplotlib unavailable: %s", exc)
         return
     plt.ioff()
-    plot_dir = output_path.parent / f"{output_path.stem}_plots"
+    if subdir_name:
+        root_dir = output_path.parent / f"{output_path.stem}_plots"
+        plot_dir = root_dir / subdir_name
+    else:
+        plot_dir = output_path.parent / f"{output_path.stem}_plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
     region_filters = {
         "AU": (frame[lon_column] > 100) & (frame[lat_column] < 0),
@@ -408,6 +420,186 @@ def _generate_validation_plots(
             fig.savefig(plot_dir / f"{safe_name}_{suffix}.png", dpi=150)
             plt.close(fig)
     logging.info("Validation plots saved to %s", plot_dir)
+
+def _generate_distribution_plots(
+    pre_frame: pd.DataFrame,
+    post_frame: pd.DataFrame,
+    reference_frame: pd.DataFrame,
+    output_path: Path,
+    features: Iterable[str],
+    lat_column: str,
+    lon_column: str,
+) -> None:
+    try:
+        import matplotlib
+        if "matplotlib.pyplot" not in sys.modules:
+            matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        logging.warning(
+            "Skipping distribution plots; matplotlib unavailable: %s", exc)
+        return
+
+    def _build_bins(series: pd.Series) -> np.ndarray:
+        data = series.to_numpy(dtype=float)
+        data = data[np.isfinite(data)]
+        if data.size == 0:
+            return np.linspace(-0.5, 0.5, 11)
+        vmin = float(np.min(data))
+        vmax = float(np.max(data))
+        if math.isclose(vmin, vmax):
+            delta = max(abs(vmin) * 1e-3, 1e-3)
+            vmin -= delta
+            vmax += delta
+        return np.linspace(vmin, vmax, 30)
+
+    plot_dir = output_path.parent / f"{output_path.stem}_plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    dist_dir = plot_dir / "distributions"
+    dist_dir.mkdir(parents=True, exist_ok=True)
+
+    default_series = pd.Series(index=reference_frame.index, dtype=float)
+    lat_series = pd.to_numeric(reference_frame.get(lat_column, default_series), errors="coerce")
+    lon_series = pd.to_numeric(reference_frame.get(lon_column, default_series), errors="coerce")
+    region_filters = {
+        "AU": ((lon_series > 100) & (lat_series < 0)).fillna(False),
+        "NA": (lon_series < 100).fillna(False),
+    }
+    region_colors = {
+        "AU": "#1f77b4",
+        "NA": "#ff7f0e",
+    }
+
+    for feature in features:
+        if feature not in pre_frame.columns or feature not in post_frame.columns:
+            continue
+        pre_series = pd.to_numeric(pre_frame[feature], errors="coerce")
+        post_series = pd.to_numeric(post_frame[feature], errors="coerce")
+
+        has_data = False
+        for mask in region_filters.values():
+            if pre_series.where(mask).notna().any() or post_series.where(mask).notna().any():
+                has_data = True
+                break
+        if not has_data:
+            continue
+
+        row_definitions = [
+            ("All regions", list(region_filters.items())),
+            ("North America", [("NA", region_filters["NA"])]),
+            ("Australia", [("AU", region_filters["AU"])]),
+        ]
+
+        fig, axes = plt.subplots(len(row_definitions), 2, figsize=(11, 10), sharey="row")
+        fig.suptitle(feature)
+
+        for row_idx, (row_label, row_regions) in enumerate(row_definitions):
+            before_ax = axes[row_idx, 0]
+            after_ax = axes[row_idx, 1]
+
+            union_mask = None
+            for _, region_mask in row_regions:
+                union_mask = region_mask.copy() if union_mask is None else (union_mask | region_mask)
+            if union_mask is None:
+                union_mask = pd.Series(False, index=pre_series.index)
+            union_mask = union_mask.fillna(False)
+
+            pre_bins = _build_bins(pre_series.where(union_mask))
+            post_bins = _build_bins(post_series.where(union_mask))
+
+            stats_lines: list[str] = []
+            row_pre_plotted = False
+            row_post_plotted = False
+
+            for region_name, region_mask in row_regions:
+                color = region_colors.get(region_name, "#1f77b4")
+
+                pre_mask = region_mask & pre_series.notna()
+                if pre_mask.any():
+                    region_pre = pre_series.loc[pre_mask].to_numpy(dtype=float)
+                    before_ax.hist(
+                        region_pre,
+                        bins=pre_bins,
+                        density=True,
+                        alpha=0.55,
+                        label=region_name,
+                        color=color,
+                    )
+                    mean_val = float(np.mean(region_pre)) if region_pre.size else float("nan")
+                    std_val = float(np.std(region_pre, ddof=0)) if region_pre.size else float("nan")
+                    if np.isfinite(mean_val):
+                        before_ax.axvline(mean_val, color=color, linestyle="--", linewidth=1)
+                    stats_lines.append(f"{region_name}: mu={mean_val:.2f}, sigma={std_val:.2f}")
+                    row_pre_plotted = True
+
+                post_mask = region_mask & post_series.notna()
+                if post_mask.any():
+                    region_post = post_series.loc[post_mask].to_numpy(dtype=float)
+                    after_ax.hist(
+                        region_post,
+                        bins=post_bins,
+                        density=True,
+                        alpha=0.55,
+                        label=region_name,
+                        color=color,
+                    )
+                    row_post_plotted = True
+
+            if stats_lines:
+                before_ax.text(
+                    0.02,
+                    0.98,
+                    "\n".join(stats_lines),
+                    transform=before_ax.transAxes,
+                    va="top",
+                    ha="left",
+                    fontsize=9,
+                    bbox={"facecolor": "white", "alpha": 0.6, "edgecolor": "none"},
+                )
+
+            if not row_pre_plotted:
+                before_ax.text(
+                    0.5,
+                    0.5,
+                    "No data",
+                    transform=before_ax.transAxes,
+                    ha="center",
+                    va="center",
+                    fontsize=9,
+                )
+            if not row_post_plotted:
+                after_ax.text(
+                    0.5,
+                    0.5,
+                    "No data",
+                    transform=after_ax.transAxes,
+                    ha="center",
+                    va="center",
+                    fontsize=9,
+                )
+
+            before_ax.set_title(f"{row_label} - before scaling")
+            after_ax.set_title(f"{row_label} - after scaling")
+            before_ax.set_xlabel(feature)
+            after_ax.set_xlabel(feature)
+            if row_idx == 0:
+                before_ax.set_ylabel("Density")
+            else:
+                before_ax.set_ylabel("")
+
+            handles, labels = before_ax.get_legend_handles_labels()
+            if not handles:
+                handles, labels = after_ax.get_legend_handles_labels()
+            if handles and row_idx == 0:
+                before_ax.legend(handles=handles, labels=labels, loc="upper right")
+                after_ax.legend(handles=handles, labels=labels, loc="upper right")
+
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", feature)
+        fig.savefig(dist_dir / f"{safe_name}_distribution.png", dpi=150)
+        plt.close(fig)
+
+    logging.info("Distribution plots saved to %s", dist_dir)
 
 def _generate_categorical_plots(
     frame: pd.DataFrame,
@@ -500,14 +692,41 @@ def main() -> None:
         imputed = _inverse_distance_weighted_impute(clipped, neighbour_distances, safe_neighbour_indices, valid_neighbour_mask)
         smoothed = _smooth_with_neighbours(imputed, safe_neighbour_indices, valid_neighbour_mask)
         frame[column] = smoothed
+    pre_map_frame = frame.copy(deep=True)
+    pre_normalized_values = pre_map_frame[processed_columns].copy()
     _standard_scale(frame, processed_columns)
+    post_normalized_values = frame[processed_columns].copy()
     if args.out is None:
         output_path = args.csv.with_name(f"{args.csv.stem}_Processed.csv")
     else:
         output_path = args.out
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if args.validate:
-        _generate_validation_plots(frame, output_path, args.lat_column, args.lon_column, processed_columns)
+        _generate_validation_plots(
+            pre_map_frame,
+            output_path,
+            args.lat_column,
+            args.lon_column,
+            processed_columns,
+            subdir_name="Plot_Before_Norm",
+        )
+        _generate_validation_plots(
+            frame,
+            output_path,
+            args.lat_column,
+            args.lon_column,
+            processed_columns,
+            subdir_name="Plot_After_Norm",
+        )
+        _generate_distribution_plots(
+            pre_normalized_values,
+            post_normalized_values,
+            frame,
+            output_path,
+            processed_columns,
+            args.lat_column,
+            args.lon_column,
+        )
         excluded_candidates = [col for col in AUTO_EXCLUDED_FEATURES if col in dtypes.index and col not in processed_columns]
         excluded_numeric = [col for col in excluded_candidates if pd.api.types.is_numeric_dtype(dtypes[col])]
         if excluded_numeric:

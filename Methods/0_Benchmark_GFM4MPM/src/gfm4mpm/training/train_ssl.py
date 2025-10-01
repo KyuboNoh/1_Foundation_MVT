@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -352,6 +352,11 @@ def train_ssl(
     feature_metadata: Optional[Iterable[Optional[Dict[str, Optional[str]]]]] = None,
     mask_scope: str = "pixel",
     norm_per_patch: bool = True,
+    use_ssim: bool = False,
+    checkpoint_epochs: Optional[Iterable[int]] = None,
+    checkpoint_callback: Optional[
+        Callable[[int, torch.nn.Module, List[Dict[str, float]]], None]
+    ] = None,
 ) -> Tuple[torch.nn.Module, List[Dict[str, float]]]:
     if mask_scope not in {"pixel", "patch"}:
         raise ValueError(f"mask_scope must be 'pixel' or 'patch', received '{mask_scope}'")
@@ -371,9 +376,62 @@ def train_ssl(
     skipped_ssim_scalar = False
     skipped_ssim_small_window = False
     last_spatial_shape: Optional[Tuple[int, int]] = None
-    sample_cache: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    checkpoint_epoch_set = {int(epoch) for epoch in checkpoint_epochs} if checkpoint_epochs else set()
+    checkpoint_epoch_set = {
+        epoch for epoch in checkpoint_epoch_set if 1 <= epoch <= max(1, epochs)
+    }
+
+    def _save_preview_samples(
+        cache: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
+        epoch_prefix: str,
+    ) -> None:
+        if preview_samples <= 0 or preview_dir is None or not cache:
+            return
+        limited = cache[:preview_samples]
+        original, masked, recon, mae_mask_stack, invalid_mask_stack = zip(*limited)
+        original_t = torch.stack(list(original), dim=0)
+        masked_t = torch.stack(list(masked), dim=0)
+        recon_t = torch.stack(list(recon), dim=0)
+        mae_masks = torch.stack(list(mae_mask_stack), dim=0)
+        invalid_masks = torch.stack(list(invalid_mask_stack), dim=0)
+
+        try:
+            orig_flat = original_t.detach().cpu().view(original_t.size(0), original_t.size(1), -1)
+            orig_min = orig_flat.min(dim=-1)[0]
+            orig_max = orig_flat.max(dim=-1)[0]
+            for sample_idx in range(min(3, orig_flat.size(0))):
+                channel_stats = [
+                    f"ch{ch}:min={orig_min[sample_idx, ch]:.4f},max={orig_max[sample_idx, ch]:.4f}"
+                    for ch in range(orig_flat.size(1))
+                ]
+                print(
+                    f"[debug] preview sample {sample_idx} value ranges -> " + ", ".join(channel_stats)
+                )
+        except Exception as exc:  # pragma: no cover - diagnostic helper
+            print(f"[debug] Failed to compute preview stats: {exc}")
+
+        _plot_samples(
+            original_t,
+            masked_t,
+            recon_t,
+            feature_names,
+            feature_metadata,
+            preview_dir,
+            prefix=epoch_prefix,
+            mae_masks=mae_masks,
+            invalid_masks=invalid_masks,
+        )
+        msg = (
+            f"Saved {len(limited)} reconstruction previews to {preview_dir} "
+            f"(prefix={epoch_prefix})"
+        )
+        _LOG.info(msg)
+        print(msg)
 
     for ep in range(1, epochs + 1):
+        sample_cache: List[
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = []
         running_loss = 0.0
         running_mae = 0.0
         running_psnr = 0.0
@@ -506,15 +564,16 @@ def train_ssl(
             psnr_val = peak_signal_noise_ratio(pred_metrics, target_metrics, data_range=data_range_val)
             running_psnr += psnr_val.item() * batch_size
             has_spatial = x.dim() >= 4
-            if has_spatial and x.shape[-1] > 1 and x.shape[-2] > 1 and min(x.shape[-2], x.shape[-1]) >= 11:
-                ssim_val = structural_similarity_index_measure(pred_metrics, target_metrics, data_range=data_range_val)
-                running_ssim += ssim_val.item() * batch_size
-                count_ssim += batch_size
-            else:
-                if not has_spatial or x.shape[-1] <= 1 or x.shape[-2] <= 1:
-                    skipped_ssim_scalar = True
-                elif min(x.shape[-2], x.shape[-1]) < 11:
-                    skipped_ssim_small_window = True
+            if use_ssim:
+                if has_spatial and x.shape[-1] > 1 and x.shape[-2] > 1 and min(x.shape[-2], x.shape[-1]) >= 11:
+                    ssim_val = structural_similarity_index_measure(pred_metrics, target_metrics, data_range=data_range_val)
+                    running_ssim += ssim_val.item() * batch_size
+                    count_ssim += batch_size
+                else:
+                    if not has_spatial or x.shape[-1] <= 1 or x.shape[-2] <= 1:
+                        skipped_ssim_scalar = True
+                    elif min(x.shape[-2], x.shape[-1]) < 11:
+                        skipped_ssim_small_window = True
 
             if preview_samples > 0 and len(sample_cache) < preview_samples:
                 if mask_scope == "patch" and pixel_mae_mask is not None:
@@ -556,7 +615,7 @@ def train_ssl(
         epoch_psnr = running_psnr / max(1, count)
         epoch_ssim = running_ssim / count_ssim if count_ssim else None
 
-        if epoch_ssim is None and not warned_ssim:
+        if use_ssim and epoch_ssim is None and not warned_ssim:
             if skipped_ssim_small_window:
                 min_dim = None
                 if last_spatial_shape is not None:
@@ -599,48 +658,17 @@ def train_ssl(
             }
         )
 
-    if preview_samples > 0 and preview_dir is not None and sample_cache:
-        limited = sample_cache[:preview_samples]
-        original, masked, recon, mae_mask_stack, invalid_mask_stack = zip(*limited)
-        original = torch.stack(list(original), dim=0)
-        masked = torch.stack(list(masked), dim=0)
-        recon = torch.stack(list(recon), dim=0)
-        mae_masks = torch.stack(list(mae_mask_stack), dim=0)
-        invalid_masks = torch.stack(list(invalid_mask_stack), dim=0)
+        if preview_samples > 0 and preview_dir is not None and sample_cache:
+            sample_shapes = (
+                sample_cache[0][0].shape,
+                sample_cache[0][1].shape,
+                sample_cache[0][2].shape,
+            )
+            print("             [dev] CHECK", *sample_shapes)
+            epoch_prefix = f"epoch_{ep:03d}_ssl_sample"
+            _save_preview_samples(sample_cache, epoch_prefix)
 
-
-        # TODO: Debug this. Why I am getting all NaNs for original, masked and recon? Can I check the original values from the raster?
-        print("             [dev] CHECK", original.shape, masked.shape, recon.shape)
-
-        try:
-            orig_flat = original.detach().cpu().view(original.size(0), original.size(1), -1)
-            orig_min = orig_flat.min(dim=-1)[0]
-            orig_max = orig_flat.max(dim=-1)[0]
-            for sample_idx in range(min(3, orig_flat.size(0))):
-                channel_stats = []
-                for ch in range(orig_flat.size(1)):
-                    channel_stats.append(
-                        f"ch{ch}:min={orig_min[sample_idx, ch]:.4f},max={orig_max[sample_idx, ch]:.4f}"
-                    )
-                print(
-                    f"[debug] preview sample {sample_idx} value ranges -> " + ", ".join(channel_stats)
-                )
-        except Exception as exc:  # pragma: no cover - diagnostic helper
-            print(f"[debug] Failed to compute preview stats: {exc}")
-
-        _plot_samples(
-            original,
-            masked,
-            recon,
-            feature_names,
-            feature_metadata,
-            preview_dir,
-            prefix="ssl_sample",
-            mae_masks=mae_masks,
-            invalid_masks=invalid_masks,
-        )
-        msg = f"Saved {len(limited)} reconstruction previews to {preview_dir}"
-        _LOG.info(msg)
-        print(msg)
+        if checkpoint_callback is not None and ep in checkpoint_epoch_set:
+            checkpoint_callback(ep, model, history)
 
     return model, history
