@@ -14,8 +14,22 @@ def compute_embeddings(encoder, X, batch_size=1024, device='cuda'):
         Z.append(z)
     return torch.cat(Z).numpy()
 
-def pu_select_negatives(Z_all, pos_idx, unk_idx, filter_top_pct=0.1, negatives_per_pos=5, rng=None):
-    """Select negatives from unknowns, filtering the top‑similar percent to positives."""
+def pu_select_negatives(
+    Z_all,
+    pos_idx,
+    unk_idx,
+    filter_top_pct=0.1,
+    negatives_per_pos=5,
+    rng=None,
+    *,
+    return_info: bool = False,
+):
+    """Select negatives from unknowns, filtering the top-similar percent to positives.
+
+    When ``return_info`` is ``True`` an auxiliary dictionary containing the
+    distance-to-positive scores and masks used during filtering is returned
+    alongside the sampled negative indices.
+    """
     if rng is None:
         rng = np.random.default_rng(1337)
     Zp = Z_all[pos_idx]
@@ -32,11 +46,20 @@ def pu_select_negatives(Z_all, pos_idx, unk_idx, filter_top_pct=0.1, negatives_p
     # filter top‑similar (smallest distance)
     k = int(len(dmin) * filter_top_pct)
     keep_mask = np.ones_like(dmin, dtype=bool)
+    cutoff = None
     if k > 0:
-        cutoff = np.partition(dmin, k)[:k].max()
+        cutoff = float(np.partition(dmin, k)[:k].max())
         keep_mask &= dmin > cutoff
     kept_unk = np.array(unk_idx)[keep_mask]
     # sample negatives
     n_neg = min(len(pos_idx) * negatives_per_pos, len(kept_unk))
     neg_idx = rng.choice(kept_unk, size=n_neg, replace=False)
+    if return_info:
+        info = {
+            "distances": dmin,
+            "kept_unknown_indices": kept_unk,
+            "cutoff": cutoff,
+            "keep_mask": keep_mask,
+        }
+        return neg_idx, info
     return neg_idx

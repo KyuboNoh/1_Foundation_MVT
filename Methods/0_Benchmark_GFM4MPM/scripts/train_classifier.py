@@ -6,11 +6,11 @@ import torch
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
-from gfm4mpm.data.geo_stack import GeoStack
-from gfm4mpm.data.stac_table import StacTableStack
-from gfm4mpm.models.mae_vit import MAEViT
-from gfm4mpm.models.mlp_dropout import MLPDropout
-from gfm4mpm.training.train_cls import train_classifier
+from src.gfm4mpm.data.geo_stack import GeoStack
+from src.gfm4mpm.data.stac_table import StacTableStack
+from src.gfm4mpm.models.mae_vit import MAEViT
+from src.gfm4mpm.models.mlp_dropout import MLPDropout
+from src.gfm4mpm.training.train_cls import train_classifier
 
 class LabeledPatches(Dataset):
     def __init__(self, stack, coords, labels, patch=32):

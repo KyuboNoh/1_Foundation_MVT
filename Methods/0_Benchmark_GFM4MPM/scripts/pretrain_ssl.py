@@ -16,7 +16,13 @@ from torch.utils.data import Dataset, DataLoader
 from src.gfm4mpm.data.geo_stack import GeoStack
 from src.gfm4mpm.data.stac_table import StacTableStack
 from src.gfm4mpm.models.mae_vit import MAEViT
-from src.gfm4mpm.training.train_ssl import train_ssl
+from src.gfm4mpm.training.train_ssl import _collect_preview_samples, _plot_samples, train_ssl
+
+# Training
+# python -m scripts.pretrain_ssl --stac-root /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021 --lat-column Latitude_EPSG4326 --lon-column Longitude_EPSG4326 --mask-ratio 0.75 --encoder-depth 6 --decoder-depth 2 --preview-samples 2 --lr 2.5e-4 --epochs 50 --out ./work/test --check-feature Gravity_Bouguer_HGM_Worms_Proximity --check-image-preproc --patch 16 --window 224 
+
+# Load pretrained model and do Inference
+# python -m scripts.pretrain_ssl --stac-root /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021 --lat-column Latitude_EPSG4326 --lon-column Longitude_EPSG4326 --mask-ratio 0.75 --encoder-depth 6 --decoder-depth 2 --preview-samples 2                         --out ./work/test --patch 16 --window 224 --button-inference
 
 # TODO: How to deal with catergorical data? 1) Only use it for input, not for reconstruction 2) Use it for reconstruction, but use cross-entropy loss (how to deal with MSE?)
 
@@ -126,6 +132,390 @@ class SSLDataset(Dataset):
             )
         return self._pack_sample(last_patch, last_mask if last_mask is not None else np.zeros(last_patch.shape[-2:], dtype=bool))
 
+
+def _generate_preview_inference(
+    model: torch.nn.Module,
+    dataloader: DataLoader,
+    preview_samples: int,
+    preview_dir: Path,
+    feature_names: Optional[Iterable[str]],
+    feature_metadata: Optional[Iterable[Optional[Dict[str, Optional[str]]]]],
+    mask_scope: str,
+) -> None:
+    if preview_samples <= 0:
+        print('[info] button-inference requested but preview_samples=0; skipping preview generation.')
+        return
+    preview_dir.mkdir(parents=True, exist_ok=True)
+
+    device = next(model.parameters()).device if any(p.requires_grad for p in model.parameters()) else torch.device('cpu')
+    model.eval()
+    sample_cache: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            if isinstance(batch, dict):
+                x = batch.get('image')
+                if x is None:
+                    raise ValueError("Batch dictionary missing 'image' key")
+                mask_no_feature = batch.get('mask_pixel_no_feature')
+            else:
+                x = batch
+                mask_no_feature = None
+
+            x = x.to(device)
+
+            mask_no_feature_tensor: Optional[torch.Tensor] = None
+            if mask_no_feature is not None:
+                mask_no_feature_tensor = mask_no_feature.to(device=device)
+                if mask_no_feature_tensor.dtype != torch.bool:
+                    mask_no_feature_tensor = mask_no_feature_tensor.bool()
+                if mask_no_feature_tensor.dim() == 2:
+                    mask_no_feature_tensor = mask_no_feature_tensor.unsqueeze(0).unsqueeze(0)
+                elif mask_no_feature_tensor.dim() == 3:
+                    mask_no_feature_tensor = mask_no_feature_tensor.unsqueeze(1)
+                elif mask_no_feature_tensor.dim() == 4 and mask_no_feature_tensor.size(1) != 1:
+                    mask_no_feature_tensor = mask_no_feature_tensor.any(dim=1, keepdim=True)
+
+            expected_size = getattr(model, 'image_size', None)
+            if expected_size is not None:
+                if isinstance(expected_size, int):
+                    expected_size = (expected_size, expected_size)
+                if x.dim() == 4 and (x.shape[-2], x.shape[-1]) != expected_size:
+                    x = torch.nn.functional.interpolate(x, size=expected_size, mode='nearest')
+                    if mask_no_feature_tensor is not None:
+                        mask_no_feature_tensor = torch.nn.functional.interpolate(
+                            mask_no_feature_tensor.float(), size=expected_size, mode='nearest'
+                        ) >= 0.5
+            elif x.dim() == 4 and x.shape[-2] == 1 and x.shape[-1] == 1:
+                target_hw = max(16, getattr(model, 'patch_size', 16))
+                x = torch.nn.functional.interpolate(x, size=(target_hw, target_hw), mode='nearest')
+                if mask_no_feature_tensor is not None:
+                    mask_no_feature_tensor = torch.nn.functional.interpolate(
+                        mask_no_feature_tensor.float(), size=(target_hw, target_hw), mode='nearest'
+                    ) >= 0.5
+
+            if mask_no_feature_tensor is not None:
+                mask_no_feature_tensor = mask_no_feature_tensor.bool()
+
+            pred, mae_mask_tokens = model(x)
+
+            patch_size = getattr(model, 'patch_size', None)
+            pixel_mae_mask: Optional[torch.Tensor] = None
+            if (
+                isinstance(patch_size, int)
+                and pred.dim() == 4
+                and mae_mask_tokens is not None
+            ):
+                H, W = pred.shape[-2], pred.shape[-1]
+                if H % patch_size == 0 and W % patch_size == 0:
+                    grid_h, grid_w = H // patch_size, W // patch_size
+                    if mae_mask_tokens.numel() == pred.size(0) * grid_h * grid_w:
+                        mask_grid = mae_mask_tokens.view(pred.size(0), grid_h, grid_w)
+                        pixel_mae_mask = mask_grid.unsqueeze(1)
+                        pixel_mae_mask = pixel_mae_mask.repeat_interleave(patch_size, dim=2)
+                        pixel_mae_mask = pixel_mae_mask.repeat_interleave(patch_size, dim=3)
+                        pixel_mae_mask = pixel_mae_mask.to(device=pred.device, dtype=pred.dtype)
+
+            if pixel_mae_mask is None:
+                pixel_mae_mask = torch.ones(
+                    (pred.size(0), 1, pred.shape[-2], pred.shape[-1]),
+                    device=pred.device,
+                    dtype=pred.dtype,
+                )
+
+            pixel_invalid_mask: Optional[torch.Tensor] = None
+            if mask_no_feature_tensor is not None:
+                pixel_invalid_mask = mask_no_feature_tensor.to(device=pred.device)
+
+            new_samples = _collect_preview_samples(
+                x,
+                pred,
+                pixel_mae_mask,
+                pixel_invalid_mask,
+                mask_scope=mask_scope,
+                mask_ratio=float(getattr(model, 'mask_ratio', 0.0)),
+            )
+            for entry in new_samples:
+                sample_cache.append(entry)
+                if len(sample_cache) >= preview_samples:
+                    break
+            if len(sample_cache) >= preview_samples:
+                break
+
+    if not sample_cache:
+        print('[warn] Unable to collect preview samples during button-inference run.')
+        return
+
+    limited = sample_cache[:preview_samples]
+    stacked = [torch.stack(list(seq), dim=0) for seq in zip(*limited)]
+    original_t, masked_t, recon_t, mae_masks, invalid_masks = stacked
+
+    _plot_samples(
+        original_t,
+        masked_t,
+        recon_t,
+        feature_names,
+        feature_metadata,
+        preview_dir,
+        prefix='button_inference',
+        mae_masks=mae_masks,
+        invalid_masks=invalid_masks,
+    )
+    print(f"[info] Generated {len(limited)} preview sample(s) in {preview_dir}")
+
+
+def _shared_minmax_np(arrays: Iterable[np.ndarray]) -> Tuple[float, float]:
+    vmin = None
+    vmax = None
+    for arr in arrays:
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            continue
+        mn = float(finite.min())
+        mx = float(finite.max())
+        vmin = mn if vmin is None else min(vmin, mn)
+        vmax = mx if vmax is None else max(vmax, mx)
+    if vmin is None or vmax is None:
+        return 0.0, 1.0
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+        eps = max(abs(vmin), abs(vmax), 1.0) * 0.01 + 1e-6
+        return vmin - eps, vmax + eps
+    return vmin, vmax
+
+
+def _write_region_maps(
+    region_name: str,
+    feature_names: Sequence[str],
+    original_map: np.ndarray,
+    masked_map: np.ndarray,
+    overlay_map: np.ndarray,
+    ssl_mask_map: np.ndarray,
+    out_dir: Path,
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import ListedColormap
+    except Exception as exc:
+        print(f"[warn] Skipping stitched map plotting for {region_name}; matplotlib unavailable: {exc}")
+        return
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    C = original_map.shape[0]
+    fig, axes = plt.subplots(C, 3, figsize=(9, 3 * C), constrained_layout=True)
+    if C == 1:
+        axes = np.expand_dims(axes, axis=0)
+
+    for idx in range(C):
+        name = feature_names[idx] if idx < len(feature_names) else f"ch_{idx}"
+        originals = original_map[idx]
+        masked = masked_map[idx]
+        overlay = overlay_map[idx]
+        vmin, vmax = _shared_minmax_np([originals, masked, overlay])
+        row_axes = []
+        for ax, data, title in zip(
+            axes[idx],
+            (originals, masked, overlay),
+            ("original", "masked", "recon+orig"),
+        ):
+            cmap = plt.colormaps['viridis']
+            im = ax.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax)
+            if title == "masked":
+                ssl_mask = ssl_mask_map.astype(bool)
+                overlay_mask = np.where(ssl_mask, 1.0, np.nan)
+                ax.imshow(
+                    overlay_mask,
+                    cmap=ListedColormap(["black"]),
+                    vmin=0.0,
+                    vmax=1.0,
+                    alpha=0.6,
+                )
+            ax.set_title(f"{region_name}: {name} - {title}")
+            ax.axis('off')
+            row_axes.append(ax)
+        cbar = fig.colorbar(im, ax=row_axes, fraction=0.046, pad=0.08)
+        cbar.ax.tick_params(length=2)
+
+    safe_region = re.sub(r"[^A-Za-z0-9_.-]+", "_", region_name)
+    out_path = out_dir / f"{safe_region}_stitched.png"
+    fig.savefig(out_path, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    print(f"[info] Wrote stitched map for {region_name} to {out_path}")
+
+
+def _compute_patch_bounds(height: int, width: int, row: int, col: int, window: int) -> Tuple[int, int, int, int]:
+    half = window // 2
+    r0 = max(row - half, 0)
+    c0 = max(col - half, 0)
+    r1 = min(r0 + window, height)
+    c1 = min(c0 + window, width)
+    return r0, c0, r1, c1
+
+
+def _stitch_region_maps(
+    region_name: str,
+    stack: GeoStack,
+    model: torch.nn.Module,
+    window_size: int,
+    mask_scope: str,
+    mask_ratio: float,
+    batch_size: int,
+    feature_names: Optional[Sequence[str]],
+    out_dir: Path,
+) -> None:
+    device = next(model.parameters()).device
+    coords = stack.grid_centers(window_size)
+    if not coords:
+        print(f"[warn] No grid centers available for region {region_name}; skipping stitched map.")
+        return
+
+    height, width = stack.height, stack.width
+    channels = stack.count
+    original_sum = np.zeros((channels, height, width), dtype=np.float32)
+    overlay_sum = np.zeros_like(original_sum)
+    weight = np.zeros((height, width), dtype=np.float32)
+    mask_hits = np.zeros((height, width), dtype=np.float32)
+
+    batch_patches: List[np.ndarray] = []
+    batch_masks: List[np.ndarray] = []
+    batch_bounds: List[Tuple[int, int, int, int]] = []
+
+    def _process_batch() -> None:
+        if not batch_patches:
+            return
+        patch_tensor = torch.from_numpy(np.stack(batch_patches)).to(device)
+        invalid_tensor = torch.from_numpy(
+            np.stack(batch_masks)[:, None, :, :]
+        ).to(device=device)
+        with torch.no_grad():
+            preds, mae_mask = model(patch_tensor)
+        pixel_mae_mask: Optional[torch.Tensor] = None
+        patch_sz = getattr(model, 'patch_size', None)
+        if (
+            isinstance(patch_sz, int)
+            and preds.dim() == 4
+            and mae_mask is not None
+        ):
+            H, W = preds.shape[-2], preds.shape[-1]
+            if H % patch_sz == 0 and W % patch_sz == 0:
+                grid_h, grid_w = H // patch_sz, W // patch_sz
+                if mae_mask.numel() == preds.size(0) * grid_h * grid_w:
+                    mask_grid = mae_mask.view(preds.size(0), grid_h, grid_w)
+                    pixel_mae_mask = mask_grid.unsqueeze(1)
+                    pixel_mae_mask = pixel_mae_mask.repeat_interleave(patch_sz, dim=2)
+                    pixel_mae_mask = pixel_mae_mask.repeat_interleave(patch_sz, dim=3)
+                    pixel_mae_mask = pixel_mae_mask.to(device=preds.device, dtype=preds.dtype)
+        if pixel_mae_mask is None:
+            pixel_mae_mask = torch.ones(
+                (preds.size(0), 1, preds.shape[-2], preds.shape[-1]),
+                device=preds.device,
+                dtype=preds.dtype,
+            )
+
+        samples = _collect_preview_samples(
+            patch_tensor,
+            preds,
+            pixel_mae_mask,
+            invalid_tensor,
+            mask_scope=mask_scope,
+            mask_ratio=mask_ratio,
+        )
+
+        for sample, bounds in zip(samples, batch_bounds):
+            r0, c0, r1, c1 = bounds
+            h = r1 - r0
+            w = c1 - c0
+            orig_np = sample[0].numpy()[:, :h, :w]
+            recon_np = sample[2].numpy()[:, :h, :w]
+            mae_np = sample[3].numpy()[:h, :w]
+            invalid_np = sample[4].numpy()[:h, :w]
+            overlay_np = recon_np.copy()
+            overlay_np[:, ~mae_np.astype(bool)] = orig_np[:, ~mae_np.astype(bool)]
+            valid = (~invalid_np).astype(np.float32)
+            valid_expand = valid[np.newaxis, :, :]
+            original_sum[:, r0:r1, c0:c1] += orig_np * valid_expand
+            overlay_sum[:, r0:r1, c0:c1] += overlay_np * valid_expand
+            weight[r0:r1, c0:c1] += valid
+            mask_hits[r0:r1, c0:c1] += mae_np.astype(np.float32) * valid
+
+        batch_patches.clear()
+        batch_masks.clear()
+        batch_bounds.clear()
+
+    for row, col in coords:
+        patch, mask_no_feature = stack.read_patch_with_mask(row, col, window_size)
+        batch_patches.append(patch)
+        batch_masks.append(mask_no_feature)
+        batch_bounds.append(_compute_patch_bounds(height, width, row, col, window_size))
+        if len(batch_patches) >= batch_size:
+            _process_batch()
+
+    _process_batch()
+
+    nonzero = weight > 0
+    if not nonzero.any():
+        print(f"[warn] No valid pixels accumulated for region {region_name}; skipping stitched map.")
+        return
+
+    original_map = np.zeros_like(original_sum)
+    overlay_map = np.zeros_like(overlay_sum)
+    for ch in range(channels):
+        np.divide(original_sum[ch], weight, out=original_map[ch], where=nonzero)
+        np.divide(overlay_sum[ch], weight, out=overlay_map[ch], where=nonzero)
+    original_map[:, ~nonzero] = np.nan
+    overlay_map[:, ~nonzero] = np.nan
+    ssl_mask_map = mask_hits > 0
+    masked_map = original_map.copy()
+    masked_map[:, ssl_mask_map] = np.nan
+
+    feature_labels = (
+        list(feature_names)
+        if feature_names is not None and len(feature_names) >= channels
+        else [f"ch_{i}" for i in range(channels)]
+    )
+    ssl_mask_map = mask_hits > 0
+    _write_region_maps(region_name, feature_labels, original_map, masked_map, overlay_map, ssl_mask_map, out_dir)
+
+
+def _generate_stitched_maps(
+    model: torch.nn.Module,
+    stack,
+    window_size: int,
+    mask_scope: str,
+    mask_ratio: float,
+    batch_size: int,
+    preview_dir: Path,
+) -> None:
+    if mask_scope not in {"patch", "pixel"}:
+        print('[warn] Unsupported mask_scope for stitched maps; skipping.')
+        return
+
+    regions: List[Tuple[str, GeoStack]] = []
+    if isinstance(stack, MultiRegionStack):
+        for region_name, region_stack in stack.iter_region_stacks():
+            if getattr(region_stack, 'kind', None) == 'raster':
+                regions.append((region_name, region_stack))
+    elif getattr(stack, 'kind', None) == 'raster':
+        regions.append(('region', stack))
+
+    if not regions:
+        print('[warn] No raster regions available for stitched map generation.')
+        return
+
+    selected = regions[:2]
+    stitched_dir = preview_dir / 'stitched'
+    for region_name, region_stack in selected:
+        names = getattr(region_stack, 'feature_columns', None)
+        _stitch_region_maps(
+            region_name,
+            region_stack,
+            model,
+            window_size,
+            mask_scope,
+            mask_ratio,
+            batch_size,
+            names,
+            stitched_dir,
+        )
 
 class MultiRegionStack:
     """Round-robin sampler that stitches multiple regional GeoStacks."""
@@ -793,6 +1183,8 @@ if __name__ == '__main__':
     ap.set_defaults(norm_per_patch=True, use_ssim=False)
     ap.add_argument('--skip-nan-attempts', type=int, default=64,
                     help='Maximum resampling attempts when skipping NaN-containing patches')
+    ap.add_argument('--button-inference', action='store_true',
+                    help='Skip training and generate previews from existing checkpoints')
     args = ap.parse_args()
 
     modes = [bool(args.bands), bool(args.stac_root), bool(args.stac_table)]
@@ -1015,7 +1407,13 @@ if __name__ == '__main__':
     worker_count = 8
     if getattr(stack, "kind", None) == "raster":
         worker_count = 0
-    dl = DataLoader(ds, batch_size=args.batch, shuffle=True, num_workers=worker_count, pin_memory=True)
+    dl = DataLoader(
+        ds,
+        batch_size=args.batch,
+        shuffle=not args.button_inference,
+        num_workers=worker_count,
+        pin_memory=True,
+    )
 
     model = MAEViT(
         in_chans=stack.count,
@@ -1035,41 +1433,95 @@ if __name__ == '__main__':
     history_path = output_dir / 'ssl_history.json'
     checkpoint_path = output_dir / 'mae_encoder.pth'
 
-    checkpoint_percentages = (0.25, 0.5, 0.75, 1.0)
-    checkpoint_epochs = sorted(
-        {
-            min(args.epochs, max(1, math.ceil(args.epochs * pct)))
-            for pct in checkpoint_percentages
-        }
-    )
+    if not args.button_inference:
+        args_snapshot = {}
+        for key, value in vars(args).items():
+            if isinstance(value, Path):
+                args_snapshot[key] = str(value)
+            elif isinstance(value, (list, tuple)):
+                args_snapshot[key] = [str(item) if isinstance(item, Path) else item for item in value]
+            else:
+                args_snapshot[key] = value
+        args_path = output_dir / 'training_args.json'
+        args_path.write_text(json.dumps(args_snapshot, indent=2), encoding='utf-8')
 
-    def _save_checkpoint(epoch: int, current_model: torch.nn.Module, history_entries: List[Dict[str, float]]):
-        if checkpoint_path.exists():
-            checkpoint_path.unlink()
-        torch.save(current_model.state_dict(), checkpoint_path)
-        if history_path.exists():
-            history_path.unlink()
-        history_path.write_text(json.dumps(history_entries, indent=2), encoding='utf-8')
-        print(
-            f"[info] Saved checkpoint artifacts at epoch {epoch} to {checkpoint_path.parent}"
+        checkpoint_percentages = (0.25, 0.5, 0.75, 1.0)
+        checkpoint_epochs = sorted(
+            {
+                min(args.epochs, max(1, math.ceil(args.epochs * pct)))
+                for pct in checkpoint_percentages
+            }
         )
 
-    model, history = train_ssl(
-        model,
-        dl,
-        epochs=args.epochs,
-        lr=args.lr,
-        optimizer=args.optimizer,
-        preview_samples=args.preview_samples,
-        preview_dir=preview_dir if args.preview_samples > 0 else None,
-        feature_names=getattr(stack, 'feature_columns', None),
-        feature_metadata=getattr(stack, 'feature_metadata', None),
-        mask_scope=args.mask_scope,
-        norm_per_patch=args.norm_per_patch,
-        use_ssim=args.use_ssim,
-        checkpoint_epochs=checkpoint_epochs,
-        checkpoint_callback=_save_checkpoint,
-    )
-    if args.epochs not in checkpoint_epochs:
-        _save_checkpoint(args.epochs, model, history)
-    print(f"Training history available at {history_path}")
+        def _save_checkpoint(epoch: int, current_model: torch.nn.Module, history_entries: List[Dict[str, float]]):
+            if checkpoint_path.exists():
+                checkpoint_path.unlink()
+            torch.save(current_model.state_dict(), checkpoint_path)
+            if history_path.exists():
+                history_path.unlink()
+            history_path.write_text(json.dumps(history_entries, indent=2), encoding='utf-8')
+            print(
+                f"[info] Saved checkpoint artifacts at epoch {epoch} to {checkpoint_path.parent}"
+            )
+
+        model, history = train_ssl(
+            model,
+            dl,
+            epochs=args.epochs,
+            lr=args.lr,
+            optimizer=args.optimizer,
+            preview_samples=args.preview_samples,
+            preview_dir=preview_dir if args.preview_samples > 0 else None,
+            feature_names=getattr(stack, 'feature_columns', None),
+            feature_metadata=getattr(stack, 'feature_metadata', None),
+            mask_scope=args.mask_scope,
+            norm_per_patch=args.norm_per_patch,
+            use_ssim=args.use_ssim,
+            checkpoint_epochs=checkpoint_epochs,
+            checkpoint_callback=_save_checkpoint,
+        )
+        if args.epochs not in checkpoint_epochs:
+            _save_checkpoint(args.epochs, model, history)
+        print(f"Training history available at {history_path}")
+    else:
+        state_source: Optional[Path] = None
+        if checkpoint_path.exists():
+            state_source = checkpoint_path
+        elif Path(args.encoder).exists():
+            state_source = Path(args.encoder)
+        if state_source is None or not state_source.exists():
+            raise FileNotFoundError(
+                "button-inference requested but no checkpoint found at output directory "
+                f"({checkpoint_path}) or encoder path ({args.encoder})."
+            )
+        model.load_state_dict(torch.load(state_source, map_location='cpu'))
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        model.to(device)
+        _generate_preview_inference(
+            model,
+            dl,
+            args.preview_samples,
+            preview_dir,
+            getattr(stack, 'feature_columns', None),
+            getattr(stack, 'feature_metadata', None),
+            args.mask_scope,
+        )
+        stitch_mask_ratio = float(getattr(model, 'mask_ratio', args.mask_ratio))
+        _generate_stitched_maps(
+            model,
+            stack,
+            window_size,
+            args.mask_scope,
+            stitch_mask_ratio,
+            max(1, args.batch),
+            preview_dir,
+        )
+        if history_path.exists():
+            try:
+                history = json.loads(history_path.read_text(encoding='utf-8'))
+                if history:
+                    print(
+                        f"[info] Loaded existing training history with {len(history)} entries from {history_path}"
+                    )
+            except Exception as exc:
+                print(f"[warn] Failed to read existing history at {history_path}: {exc}")

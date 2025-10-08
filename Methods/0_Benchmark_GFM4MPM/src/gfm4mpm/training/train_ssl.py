@@ -192,6 +192,49 @@ def _select_optimizer(name: str, params, lr: float):
     raise ValueError(f"Unknown optimizer '{name}'")
 
 
+def _collect_preview_samples(
+    inputs: torch.Tensor,
+    preds: torch.Tensor,
+    pixel_mae_mask: torch.Tensor,
+    pixel_invalid_mask: Optional[torch.Tensor],
+    *,
+    mask_scope: str,
+    mask_ratio: float,
+) -> List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    if mask_scope == "patch" and pixel_mae_mask is not None:
+        patch_mask_bool = pixel_mae_mask[:, :1] > 0.5
+    else:
+        rand = torch.rand(
+            (inputs.size(0), 1, inputs.size(-2), inputs.size(-1)),
+            device=inputs.device,
+            dtype=inputs.dtype,
+        )
+        patch_mask_bool = rand < mask_ratio
+
+    masked = inputs.clone()
+    preview_mask = patch_mask_bool.expand(-1, inputs.size(1), -1, -1)
+    masked[preview_mask] = 0.0
+
+    mae_mask_bool = (pixel_mae_mask[:, :1] > 0.5).detach()
+    if pixel_invalid_mask is not None:
+        invalid_mask_bool = pixel_invalid_mask.detach().bool()
+    else:
+        invalid_mask_bool = torch.zeros_like(mae_mask_bool, dtype=torch.bool)
+
+    samples: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    for sample_idx in range(inputs.size(0)):
+        samples.append(
+            (
+                inputs[sample_idx].detach().cpu(),
+                masked[sample_idx].detach().cpu(),
+                preds[sample_idx].detach().cpu(),
+                mae_mask_bool[sample_idx, 0].detach().cpu(),
+                invalid_mask_bool[sample_idx, 0].detach().cpu(),
+            )
+        )
+    return samples
+
+
 def _plot_samples(
     inputs: torch.Tensor,
     masked: torch.Tensor,
@@ -214,8 +257,9 @@ def _plot_samples(
     meta = list(feature_metadata) if feature_metadata is not None else [None] * C
     is_scalar = H == 1 and W == 1
 
-    base_cmap = plt.cm.get_cmap("viridis")
-    masked_cmap = base_cmap.with_extremes(bad="black")
+    base_cmap = plt.colormaps['viridis']
+    masked_cmap = base_cmap.copy()
+    masked_cmap.set_bad("black")
 
     def _shared_minmax(tensors: Iterable[torch.Tensor | np.ndarray]) -> tuple[float, float]:
         vmin: Optional[float] = None
@@ -283,22 +327,42 @@ def _plot_samples(
             _render(numeric_idx, "numeric", "#1f77b4")
             _render(categorical_idx, "categorical", "#ff7f0e")
         else:
-            fig, axes = plt.subplots(C, 3, figsize=(9, 3 * C))
+            num_cols = 4
+            fig, axes = plt.subplots(C, num_cols, figsize=(3 * num_cols, 3 * C), constrained_layout=True)
+            if C == 1:
+                axes = np.expand_dims(axes, axis=0)
             for c in range(C):
                 name = feat_names[c] if c < len(feat_names) else f"ch_{c}"
-                channel_views = [inputs[idx, c], masked[idx, c], recon[idx, c]]
+                original_tensor = inputs[idx, c]
+                masked_tensor = masked[idx, c]
+                recon_tensor = recon[idx, c]
+                overlay_tensor = recon_tensor.detach().cpu().clone()
+                mae_bool = None
+                if mae_slice is not None:
+                    mae_bool = mae_slice.astype(bool)
+                if mae_bool is not None:
+                    overlay_np = overlay_tensor.numpy()
+                    overlay_np[~mae_bool] = original_tensor.detach().cpu().numpy()[~mae_bool]
+                    overlay_tensor = torch.from_numpy(overlay_np)
+                channel_views = [
+                    original_tensor,
+                    masked_tensor,
+                    recon_tensor,
+                    overlay_tensor,
+                ]
                 vmin, vmax = _shared_minmax(channel_views)
+                row_axes = []
                 for ax, data, title in zip(
-                    (axes[c, j] if C > 1 else axes[j] for j in range(3)),
+                    axes[c],
                     channel_views,
-                    ("original", "masked", "recon"),
+                    ("original", "masked", "recon", "recon+orig"),
                 ):
                     array = data.detach().cpu().numpy()
                     cmap = base_cmap
                     mask_to_apply: Optional[np.ndarray] = None
                     if invalid_slice is not None:
                         mask_to_apply = invalid_slice
-                    if title != "original" and mae_slice is not None:
+                    if title == "masked" and mae_slice is not None:
                         mask_to_apply = mae_slice if mask_to_apply is None else (mask_to_apply | mae_slice)
                     if mask_to_apply is not None:
                         masked_array = np.array(array, copy=True)
@@ -308,8 +372,9 @@ def _plot_samples(
                     im = ax.imshow(array, cmap=cmap, vmin=vmin, vmax=vmax)
                     ax.set_title(f"{name} - {title}")
                     ax.axis("off")
-                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-            fig.tight_layout()
+                    row_axes.append(ax)
+                cbar = fig.colorbar(im, ax=row_axes, fraction=0.046, pad=0.08)
+                cbar.ax.tick_params(length=2)
             fig.savefig(out_dir / f"{prefix}_{idx:03d}.png", dpi=150)
             plt.close(fig)
 
@@ -317,24 +382,44 @@ def _plot_samples(
         for feat_idx in range(C):
             name = feat_names[feat_idx] if feat_idx < len(feat_names) else f"ch_{feat_idx}"
             safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
-            fig, axes = plt.subplots(1, 3, figsize=(9, 3))
-            channel_views = [inputs[idx, feat_idx], masked[idx, feat_idx], recon[idx, feat_idx]]
+            num_cols = 4
+            fig, axes = plt.subplots(1, num_cols, figsize=(3 * num_cols, 3), constrained_layout=True)
+            original_tensor = inputs[idx, feat_idx]
+            masked_tensor = masked[idx, feat_idx]
+            recon_tensor = recon[idx, feat_idx]
+            overlay_tensor = recon_tensor.detach().cpu().clone()
+            mae_bool = None
+            if mae_slice is not None:
+                mae_bool = mae_slice.astype(bool)
+            if mae_bool is not None:
+                overlay_np = overlay_tensor.numpy()
+                overlay_np[~mae_bool] = original_tensor.detach().cpu().numpy()[~mae_bool]
+                overlay_tensor = torch.from_numpy(overlay_np)
+            channel_views = [
+                original_tensor,
+                masked_tensor,
+                recon_tensor,
+                overlay_tensor,
+            ]
             vmin, vmax = _shared_minmax(channel_views)
-            for ax, data, title in zip(axes, channel_views, ("original", "masked", "recon")):
+            im = None
+            for ax, data, title in zip(axes, channel_views, ("original", "masked", "recon", "recon+orig")):
                 array = data.detach().cpu().numpy()
                 cmap = base_cmap
                 mask_to_apply = invalid_slice
-                if title != "original" and mae_slice is not None:
+                if title == "masked" and mae_slice is not None:
                     mask_to_apply = mae_slice if mask_to_apply is None else (mask_to_apply | mae_slice)
                 if mask_to_apply is not None:
                     masked_array = np.array(array, copy=True)
                     masked_array[mask_to_apply] = np.nan
                     array = masked_array
                     cmap = masked_cmap
-                ax.imshow(array, cmap=cmap, interpolation="nearest", vmin=vmin, vmax=vmax)
+                im = ax.imshow(array, cmap=cmap, interpolation="nearest", vmin=vmin, vmax=vmax)
                 ax.set_title(f"{name} - {title}")
                 ax.axis("off")
-            fig.tight_layout()
+            if im is not None:
+                cbar = fig.colorbar(im, ax=list(np.atleast_1d(axes)), fraction=0.046, pad=0.08)
+                cbar.ax.tick_params(length=2)
             fig.savefig(out_dir / f"{prefix}_patch_{idx:03d}_{safe_name}.png", dpi=150)
             plt.close(fig)
 
@@ -576,35 +661,16 @@ def train_ssl(
                         skipped_ssim_small_window = True
 
             if preview_samples > 0 and len(sample_cache) < preview_samples:
-                if mask_scope == "patch" and pixel_mae_mask is not None:
-                    pixel_mask_bool = pixel_mae_mask[:, :1] > 0.5
-                else:
-                    ratio = float(getattr(model, "mask_ratio", 0.0))
-                    rand = torch.rand(
-                        (x.size(0), 1, x.size(-2), x.size(-1)), device=x.device, dtype=x.dtype
-                    )
-                    pixel_mask_bool = (rand < ratio)
-
-                masked_img = x.clone()
-                preview_mask = pixel_mask_bool.expand(-1, x.size(1), -1, -1)
-                masked_img[preview_mask] = 0.0
-
-                mae_mask_bool = (pixel_mae_mask[:, :1] > 0.5).detach()
-                if pixel_invalid_mask is not None:
-                    invalid_mask_bool = pixel_invalid_mask.detach().bool()
-                else:
-                    invalid_mask_bool = torch.zeros_like(mae_mask_bool, dtype=torch.bool)
-
-                for sample_idx in range(x.size(0)):
-                    sample_cache.append(
-                        (
-                            x[sample_idx].detach().cpu(),
-                            masked_img[sample_idx].detach().cpu(),
-                            pred[sample_idx].detach().cpu(),
-                            mae_mask_bool[sample_idx, 0].detach().cpu(),
-                            invalid_mask_bool[sample_idx, 0].detach().cpu(),
-                        )
-                    )
+                new_samples = _collect_preview_samples(
+                    x,
+                    pred,
+                    pixel_mae_mask,
+                    pixel_invalid_mask,
+                    mask_scope=mask_scope,
+                    mask_ratio=float(getattr(model, "mask_ratio", 0.0)),
+                )
+                for entry in new_samples:
+                    sample_cache.append(entry)
                     if len(sample_cache) >= preview_samples:
                         break
 
