@@ -18,9 +18,20 @@ pip install -r requirements.txt
 # --- Run your code below ---
 DATA_DIR="/home/kyubonoh/scratch/Data/1_Foundation_MVT_Result/gsc-2021"
 
+# Methods/0_Benchmark_GFM4MPM - 1) Pretrain SSL
 cd Methods/0_Benchmark_GFM4MPM
 srun python -m scripts.pretrain_ssl   --stac-root "${DATA_DIR}" \
 --lat-column Latitude_EPSG4326   --lon-column Longitude_EPSG4326       \
 --mask-ratio 0.75  --patch 16   --window 224 --lr 2.5e-4  \
 --preview-samples 5   --out ./Default   --epochs 40
+
+# Methods/0_Benchmark_GFM4MPM - 2) Build splits
+python -m scripts.build_splits \
+  --stac-root /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021 \
+  --label-column Training_MVT_Deposit \
+  --encoder ./work/test/mae_encoder.pth \
+  --out ./work/test \
+  --filter_top_pct 0.10 \
+  --negs_per_pos 5 \
+  --validation
 

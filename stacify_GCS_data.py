@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# python stacify_GCS_data.py   --csv /home/qubuntu25/Desktop/Data/GSC/2021_Table04_Datacube_temp.csv   --out /home/qubuntu25/Desktop/GitHub/1_Foundation_MVT_Result/   --collection-id gsc-2021_temp   --title "GSC 2021 Table"   --description "GSC 2021 Datacube Table"   --license "CC-BY-4.0"   --keywords GSC Datacube 2021 --validate --check-raster --check-raster-features Magnetic_HGM
-# python stacify_GCS_data.py   --csv /home/qubuntu25/Desktop/Data/GSC/2021_Table04_Datacube.csv   --out /home/qubuntu25/Desktop/GitHub/1_Foundation_MVT_Result/   --collection-id gsc-2021   --title "GSC 2021 Table"   --description "GSC 2021 Datacube Table"   --license "CC-BY-4.0"   --keywords GSC Datacube 2021 --validate   --check-raster --check-raster-features Magnetic_HGM
-
-# python stacify_GCS_data.py   --csv C:\Users\kyubo\Desktop\Research\Data\2021_Table04_Datacube_selected_Norm.csv   --out C:\Users\kyubo\Desktop\Research\Data\1_Stacify   --collection-id gsc-2021   --title "GSC 2021 Table"   --description "GSC 2021 Datacube Table"   --license "CC-BY-4.0"   --keywords GSC Datacube 2021 --validate   --check-raster --check-raster-features Magnetic_HGM
-
-# python stacify_GCS_data.py   --csv /home/qubuntu25/Desktop/Research/Data/2021_Table04_Datacube_selected_Norm.csv   --out /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/   --collection-id gsc-2021   --title "GSC 2021 Table"   --description "GSC 2021 Datacube Table"   --license "CC-BY-4.0"   --keywords GSC Datacube 2021 --validate --check-raster --check-raster-features Magnetic_HGM
 # python stacify_GCS_data.py   --csv /home/qubuntu25/Desktop/Research/Data/2021_Table04_Datacube_selected_Norm.csv   --out /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/   --collection-id gsc-2021   --title "GSC 2021 Table"   --description "GSC 2021 Datacube Table"   --license "CC-BY-4.0"   --keywords GSC Datacube 2021 --features Terrane_Proximity Geology_PassiveMargin_Proximity Geology_BlackShale_Proximity Geology_Fault_Proximity Geology_Paleolatitude_Period_Maximum Geology_Paleolatitude_Period_Minimum Seismic_LAB_Hoggard Seismic_Moho Gravity_GOCE_Differential Gravity_GOCE_MaximumCurve Gravity_GOCE_MinimumCurve Gravity_GOCE_MeanCurve Gravity_GOCE_ShapeIndex Gravity_Bouguer Gravity_Bouguer_HGM Gravity_Bouguer_HGM_Worms_Proximity Gravity_Bouguer_UpCont30km_HGM Gravity_Bouguer_UpCont30km_HGM_Worms_Proximity Magnetic_HGM Magnetic_HGM_Worms_Proximity Magnetic_LongWavelength_HGM Magnetic_LongWavelength_HGM_Worms_Proximity Geology_Period_Maximum_Majority Geology_Period_Minimum_Majority Geology_Lithology_Majority Geology_Lithology_Minority --label Training_MVT_Deposit --validate --check-raster --check-raster-features Magnetic_HGM Training_MVT_Deposit
 
 """
@@ -35,6 +29,7 @@ from pyproj import Transformer
 
 from unify.one_d import csv_to_parquet
 from Common.metadata_generation_training import generate_training_metadata
+from Common.metadata_generation_label_GeoJSON import generate_label_geojson
 from stacify_bc_data import (
     CHECKSUM_EXT,
     TABLE_EXT,
@@ -1006,6 +1001,7 @@ def _generate_raster_assets(
     column_cache: dict[str, np.ndarray] = {}
     raster_paths: List[Path] = []
     raster_details: dict[Path, dict] = {}
+    existing_products: List[Dict[str, Any]] = []
 
     for spec in grid_specs:
         region_mask = spec.frame_mask
@@ -1132,6 +1128,38 @@ def _generate_raster_assets(
             kind = spec.get("kind") or ("label" if is_label_feature else "numeric")
             is_categorical = kind == "categorical"
 
+            grid_suffix = f"{grid_width}x{grid_height}{region_tag}"
+            raw_filename = f"{parquet_path.stem}_{_slugify_column(feature_name)}_{grid_suffix}.tif"
+            out_path = raw_raster_dir / raw_filename
+            asset_filename = f"{parquet_path.stem}_{_slugify_column(feature_name)}_{grid_suffix}_cog.tif"
+            asset_path = target_asset_dir / asset_filename
+
+            if asset_path.exists():
+                print(
+                    f"[info] Skipping rasterization for {feature_name} [{region_name or 'GLOBAL'}]; "
+                    f"found existing asset {asset_path}."
+                )
+                product_stub: Dict[str, Any] = {
+                    "asset_path": asset_path,
+                    "source_path": asset_path,
+                    "feature": feature_name,
+                    "region": region_name,
+                    "is_label": bool(is_label_feature),
+                    "kind": kind,
+                    "band_display": list(band_labels_spec),
+                }
+                if categories:
+                    product_stub["categories"] = categories
+                metadata_path_existing = assetization_dir / f"{asset_path.stem}.json"
+                if metadata_path_existing.exists():
+                    product_stub["metadata_path"] = metadata_path_existing
+                if quicklook_dir is not None:
+                    quicklook_existing = quicklook_dir / f"{parquet_path.stem}_{_slugify_column(feature_name)}_{grid_suffix}.png"
+                    if quicklook_existing.exists():
+                        product_stub["quicklook_path"] = quicklook_existing
+                existing_products.append(product_stub)
+                continue
+
             band_grids: List[np.ndarray] = []
             band_display: List[str] = []
             band_categories: List[str] = [] if categories else []
@@ -1244,8 +1272,6 @@ def _generate_raster_assets(
                 slug = _slugify_column(feature_name)
                 quicklook_requested = key in feature_allow or slug in slug_allow
 
-            grid_suffix = f"{grid_width}x{grid_height}{region_tag}"
-            out_path = raw_raster_dir / f"{parquet_path.stem}_{_slugify_column(feature_name)}_{grid_suffix}.tif"
             profile = {
                 "driver": "GTiff",
                 "height": stack.shape[1],
@@ -1304,7 +1330,7 @@ def _generate_raster_assets(
         logging.info("No raster grids were generated; skipping asset registration.")
         return [], assetization_dir
 
-    products: List[Dict[str, Path]] = []
+    products: List[Dict[str, Any]] = []
     try:
         products = add_raster_assets(collection, raster_paths, target_asset_dir, cogify=True)
         for product in products:
@@ -1318,7 +1344,11 @@ def _generate_raster_assets(
             except Exception:
                 logging.debug("Failed to remove temporary raster %s", path)
 
-    return products, assetization_dir
+    combined_products: List[Dict[str, Any]] = []
+    combined_products.extend(existing_products)
+    combined_products.extend(products)
+
+    return combined_products, assetization_dir
 
 
 def build_table_item(collection, parquet_path: Path, columns: list[Dict[str, str]], collection_root: Path) -> None:
@@ -1465,6 +1495,23 @@ def main() -> None:
     parquet_path = tables_dir / (csv_path.stem + ".parquet")
     csv_to_parquet(csv_path, parquet_path, schema_hints=schema_hints)
 
+    label_geojson_paths: List[Path] = []
+    if args.label:
+        try:
+            label_geojson_paths = generate_label_geojson(
+                parquet_path,
+                assets_dir,
+                label_column=args.label,
+                lat_column=args.lat_column,
+                lon_column=args.lon_column,
+                geometry_column=args.geometry_column,
+            )
+        except Exception as exc:
+            logging.warning("Failed to generate label GeoJSON for %s: %s", args.label, exc)
+        else:
+            if label_geojson_paths:
+                logging.info("Label GeoJSON written: %s", ", ".join(str(p) for p in label_geojson_paths))
+
     columns = infer_columns(parquet_path)
     # logging.info("Inferred table columns: %s", [c.get("name") for c in columns])
 
@@ -1521,7 +1568,7 @@ def main() -> None:
         except Exception as exc:
             logging.warning("Failed to save table item %s: %s", table_item.id, exc)
 
-    raster_products: List[Dict[str, Path]] = []
+    raster_products: List[Dict[str, Any]] = []
     assetization_dir: Path
 
     if args.debug:

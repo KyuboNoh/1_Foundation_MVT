@@ -6,6 +6,12 @@ import torch
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
+# ensure repo-root execution can resolve the local src package
+import sys
+_THIS_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _THIS_DIR.parent  # points to Methods/0_Benchmark_GFM4MPM
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 from src.gfm4mpm.data.geo_stack import GeoStack
 from src.gfm4mpm.data.stac_table import StacTableStack
 from src.gfm4mpm.models.mae_vit import MAEViT

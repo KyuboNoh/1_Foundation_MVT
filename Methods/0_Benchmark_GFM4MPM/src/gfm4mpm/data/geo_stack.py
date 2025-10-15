@@ -215,4 +215,6 @@ def load_deposit_pixels(geojson_path: str, stack: GeoStack) -> List[Tuple[int,in
         row_, col_ = rowcol(stack.transform, x, y)
         if 0 <= row_ < stack.height and 0 <= col_ < stack.width:
             pts.append((int(row_), int(col_)))
+    
+    print(f'[info] Loaded {len(pts)} deposit points from {os.path.basename(geojson_path)}')
     return pts

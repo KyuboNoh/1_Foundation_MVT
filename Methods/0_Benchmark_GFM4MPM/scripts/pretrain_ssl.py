@@ -9,20 +9,24 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from datetime import datetime, timezone
+
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+
+# ensure repo-root execution can resolve the local src package
+import sys
+_THIS_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _THIS_DIR.parent  # points to Methods/0_Benchmark_GFM4MPM
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 from src.gfm4mpm.data.geo_stack import GeoStack
 from src.gfm4mpm.data.stac_table import StacTableStack
 from src.gfm4mpm.models.mae_vit import MAEViT
 from src.gfm4mpm.training.train_ssl import _collect_preview_samples, _plot_samples, train_ssl
 
-# Training
-# python -m scripts.pretrain_ssl --stac-root /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021 --lat-column Latitude_EPSG4326 --lon-column Longitude_EPSG4326 --mask-ratio 0.75 --encoder-depth 6 --decoder-depth 2 --preview-samples 2 --lr 2.5e-4 --epochs 50 --out ./work/test --check-feature Gravity_Bouguer_HGM_Worms_Proximity --check-image-preproc --patch 16 --window 224 
-
-# Load pretrained model and do Inference
-# python -m scripts.pretrain_ssl --stac-root /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021 --lat-column Latitude_EPSG4326 --lon-column Longitude_EPSG4326 --mask-ratio 0.75 --encoder-depth 6 --decoder-depth 2 --preview-samples 2                         --out ./work/test --patch 16 --window 224 --button-inference
 
 # TODO: How to deal with catergorical data? 1) Only use it for input, not for reconstruction 2) Use it for reconstruction, but use cross-entropy loss (how to deal with MSE?)
 
@@ -628,6 +632,72 @@ def _load_training_metadata(stac_root: Path) -> Optional[Dict[str, Any]]:
                 except json.JSONDecodeError as exc:
                     raise ValueError(f"Failed to parse training metadata JSON at {candidate}: {exc}") from exc
     return None
+
+
+def _persist_training_args_to_metadata(
+    stac_root: Optional[Path],
+    args_snapshot: Dict[str, Any],
+    output_dir: Path,
+) -> None:
+    if stac_root is None:
+        return
+
+    candidates = [
+        stac_root / "training_metadata.json",
+        stac_root / "assetization" / "training_metadata.json",
+    ]
+    metadata_path = None
+    for candidate in candidates:
+        if candidate.exists():
+            metadata_path = candidate
+            break
+    if metadata_path is None:
+        metadata_path = stac_root / "training_metadata.json"
+
+    try:
+        if metadata_path.exists():
+            data = json.loads(metadata_path.read_text(encoding="utf-8"))
+        else:
+            data = {}
+    except Exception as exc:
+        print(f"[warn] Unable to load training metadata at {metadata_path}: {exc}")
+        data = {}
+
+    pretraining_entry = data.get("pretraining")
+    if not isinstance(pretraining_entry, dict):
+        pretraining_entry = {}
+        data["pretraining"] = pretraining_entry
+
+    pretraining_entry["args"] = args_snapshot
+    pretraining_entry["output_dir"] = str(output_dir.resolve())
+    pretraining_entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    feature_section = data.get("features")
+    if not isinstance(feature_section, dict):
+        feature_section = {"entries": {}, "total_features": 0}
+        data["features"] = feature_section
+    feature_entries = feature_section.setdefault("entries", {})
+    arg_features = args_snapshot.get("features")
+    if isinstance(arg_features, list) and not feature_entries:
+        for feat in arg_features:
+            feature_entries.setdefault(feat, {"num_tifs": 0, "tifs": []})
+    feature_section["total_features"] = len(feature_entries)
+
+    label_section = data.get("labels")
+    if not isinstance(label_section, dict):
+        label_section = {"entries": {}, "total_labels": 0}
+        data["labels"] = label_section
+    label_entries = label_section.setdefault("entries", {})
+    label_column = args_snapshot.get("label_column")
+    if isinstance(label_column, str) and label_column and label_column not in label_entries:
+        label_entries[label_column] = {"num_tifs": 0, "tifs": []}
+    label_section["total_labels"] = len(label_entries)
+
+    try:
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        metadata_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception as exc:
+        print(f"[warn] Failed to persist training args to {metadata_path}: {exc}")
 
 
 def _find_feature_entry(entries: Dict[str, Any], feature_name: str) -> Optional[Tuple[str, Dict[str, Any]]]:
@@ -1442,8 +1512,10 @@ if __name__ == '__main__':
                 args_snapshot[key] = [str(item) if isinstance(item, Path) else item for item in value]
             else:
                 args_snapshot[key] = value
-        args_path = output_dir / 'training_args.json'
+        args_path = output_dir / 'training_args_1_pretrain.json'
         args_path.write_text(json.dumps(args_snapshot, indent=2), encoding='utf-8')
+        if stac_root_path is not None:
+            _persist_training_args_to_metadata(stac_root_path, args_snapshot, output_dir)
 
         checkpoint_percentages = (0.25, 0.5, 0.75, 1.0)
         checkpoint_epochs = sorted(
