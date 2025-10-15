@@ -638,6 +638,7 @@ def _persist_training_args_to_metadata(
     stac_root: Optional[Path],
     args_snapshot: Dict[str, Any],
     output_dir: Path,
+    used_features: Optional[Sequence[str]] = None,
 ) -> None:
     if stac_root is None:
         return
@@ -671,6 +672,15 @@ def _persist_training_args_to_metadata(
     pretraining_entry["args"] = args_snapshot
     pretraining_entry["output_dir"] = str(output_dir.resolve())
     pretraining_entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+    features_to_record: Optional[List[str]] = None
+    if used_features is not None:
+        features_to_record = list(dict.fromkeys(str(feat) for feat in used_features))
+    else:
+        arg_features = args_snapshot.get("features")
+        if isinstance(arg_features, list):
+            features_to_record = list(dict.fromkeys(str(feat) for feat in arg_features))
+    if features_to_record is not None:
+        pretraining_entry["features"] = features_to_record
 
     feature_section = data.get("features")
     if not isinstance(feature_section, dict):
@@ -678,7 +688,7 @@ def _persist_training_args_to_metadata(
         data["features"] = feature_section
     feature_entries = feature_section.setdefault("entries", {})
     arg_features = args_snapshot.get("features")
-    if isinstance(arg_features, list) and not feature_entries:
+    if isinstance(arg_features, list):
         for feat in arg_features:
             feature_entries.setdefault(feat, {"num_tifs": 0, "tifs": []})
     feature_section["total_features"] = len(feature_entries)
@@ -1218,14 +1228,14 @@ if __name__ == '__main__':
     ap.add_argument('--mask-ratio', type=float, default=0.75, help='Fraction of patches masked during MAE pretraining')
     ap.add_argument('--encoder-dim', type=int, default=768, help='Embedding dimension for MAE encoder tokens')
     ap.add_argument('--decoder-dim', type=int, default=512, help='Embedding dimension for MAE decoder tokens')
-    ap.add_argument('--encoder-num-heads', type=int, default=12, help='Number of attention heads in encoders of MAE transformer blocks')
-    ap.add_argument('--decoder-num-heads', type=int, default=16, help='Number of attention heads in decoders of MAE transformer blocks')
+    ap.add_argument('--encoder-num-heads', type=int, default=6, help='Number of attention heads in encoders of MAE transformer blocks')
+    ap.add_argument('--decoder-num-heads', type=int, default=8, help='Number of attention heads in decoders of MAE transformer blocks')
     
-    ap.add_argument('--encoder-depth', type=int, default=12, help='Number of transformer blocks in the encoder')
-    ap.add_argument('--decoder-depth', type=int, default=8, help='Number of transformer blocks in the decoder')
+    ap.add_argument('--encoder-depth', type=int, default=6, help='Number of transformer blocks in the encoder')
+    ap.add_argument('--decoder-depth', type=int, default=3, help='Number of transformer blocks in the decoder')
 
     ap.add_argument('--mlp-ratio', type=float, default=4.0, help='Expansion ratio for MLP layers in encoder')
-    ap.add_argument('--mlp-ratio-decoder', type=float, default=2.0, help='Expansion ratio for MLP layers in decoder')
+    ap.add_argument('--mlp-ratio-decoder', type=float, default=4.0, help='Expansion ratio for MLP layers in decoder')
 
     ap.add_argument('--mask-scope', choices=['pixel', 'patch'], default='patch', help='Choose masking granularity for debug previews (pixel zeros individual pixels, patch zeros whole patches)')
     ap.add_argument('--no-norm-per-patch', dest='norm_per_patch', action='store_false',
@@ -1264,6 +1274,7 @@ if __name__ == '__main__':
     metadata: Optional[Dict[str, Any]] = None
     feature_entries: Optional[Dict[str, Any]] = None
     stac_root_path: Optional[Path] = None
+    used_feature_list: List[str] = []
 
     if args.stac_table:
         stac_path = Path(args.stac_table)
@@ -1313,6 +1324,7 @@ if __name__ == '__main__':
                         f"[IMPORTANT] Using NUMERIC features only TEMPORARILY; dropped {len(dropped_names)} categorical channel(s)."
                     )
                     print("[info] Dropped categorical features:", ", ".join(dropped_names))
+        used_feature_list = list(getattr(stack, "feature_columns", []) or [])
     elif args.stac_root:
         stac_root_path = Path(args.stac_root).resolve()
         (
@@ -1384,9 +1396,24 @@ if __name__ == '__main__':
             for _, region_stack in stack.iter_region_stacks():
                 _filter_numeric_stack(region_stack)
         window_size = args.window
+        used_feature_list = list(getattr(stack, "feature_columns", []) or [])
     else:
         stack = GeoStack(sorted(glob.glob(args.bands)))
         window_size = args.window
+        if getattr(stack, "band_paths", None):
+            used_feature_list = [Path(p).stem for p in stack.band_paths]
+        else:
+            used_feature_list = []
+
+    if not used_feature_list:
+        feature_candidates = getattr(stack, "feature_columns", None)
+        if feature_candidates:
+            used_feature_list = list(feature_candidates)
+        elif getattr(stack, "band_paths", None):
+            used_feature_list = [Path(p).stem for p in stack.band_paths]
+        else:
+            used_feature_list = []
+    used_feature_list = list(dict.fromkeys(str(name) for name in used_feature_list))
 
     requested_out = Path(args.out)
     if stac_root_path is not None:
@@ -1512,10 +1539,11 @@ if __name__ == '__main__':
                 args_snapshot[key] = [str(item) if isinstance(item, Path) else item for item in value]
             else:
                 args_snapshot[key] = value
+        args_snapshot["features"] = list(used_feature_list)
         args_path = output_dir / 'training_args_1_pretrain.json'
         args_path.write_text(json.dumps(args_snapshot, indent=2), encoding='utf-8')
         if stac_root_path is not None:
-            _persist_training_args_to_metadata(stac_root_path, args_snapshot, output_dir)
+            _persist_training_args_to_metadata(stac_root_path, args_snapshot, output_dir, used_feature_list)
 
         checkpoint_percentages = (0.25, 0.5, 0.75, 1.0)
         checkpoint_epochs = sorted(

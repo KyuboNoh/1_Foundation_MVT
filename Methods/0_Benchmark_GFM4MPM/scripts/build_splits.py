@@ -52,14 +52,41 @@ def _load_training_args(stack_root: Optional[Path], encoder_path: Path) -> Tuple
                 if isinstance(pretraining_entry, dict):
                     args_data = pretraining_entry.get('args')
                     if isinstance(args_data, dict):
-                        return args_data, resolved_meta
+                        merged_args = dict(args_data)
+                        features_override = pretraining_entry.get('features')
+                        if isinstance(features_override, list):
+                            merged_args['features'] = list(dict.fromkeys(str(f) for f in features_override))
+                        output_dir_val = pretraining_entry.get('output_dir')
+                        if output_dir_val:
+                            try:
+                                out_path = Path(output_dir_val)
+                                if not out_path.is_absolute():
+                                    out_path = (resolved_meta.parent / out_path).resolve()
+                                ta_candidate = out_path / 'training_args_1_pretrain.json'
+                                if ta_candidate.exists():
+                                    with ta_candidate.open('r', encoding='utf-8') as ta_fh:
+                                        ta_data = json.load(ta_fh)
+                                    if isinstance(ta_data, dict):
+                                        merged_args.update(
+                                            {k: v for k, v in ta_data.items() if k not in merged_args or k == 'features'}
+                                        )
+                                        features_ta = ta_data.get('features')
+                                        if isinstance(features_ta, list):
+                                            merged_args['features'] = list(dict.fromkeys(str(f) for f in features_ta))
+                            except Exception as exc:
+                                print(f"[warn] Failed to read training_args_1_pretrain.json from metadata output_dir: {exc}")
+                        return merged_args, resolved_meta
             except Exception as exc:
                 print(f"[warn] Failed to read pretraining args from {resolved_meta}: {exc}")
         
         direct = root / 'training_args.json'
+        direct_pretrain = root / 'training_args_1_pretrain.json'
         candidates.append(direct)
+        candidates.append(direct_pretrain)
         try:
             for candidate in root.rglob('training_args.json'):
+                candidates.append(candidate)
+            for candidate in root.rglob('training_args_1_pretrain.json'):
                 candidates.append(candidate)
         except Exception:
             pass
