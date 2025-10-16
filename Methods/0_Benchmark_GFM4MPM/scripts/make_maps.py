@@ -5,11 +5,18 @@ import glob
 from pathlib import Path
 import torch
 
-from gfm4mpm.data.geo_stack import GeoStack
-from gfm4mpm.data.stac_table import StacTableStack
-from gfm4mpm.models.mae_vit import MAEViT
-from gfm4mpm.models.mlp_dropout import MLPDropout
-from gfm4mpm.infer.infer_maps import mc_predict_map, save_geotiff
+# ensure repo-root execution can resolve the local src package
+import sys
+_THIS_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _THIS_DIR.parent  # points to Methods/0_Benchmark_GFM4MPM
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from src.gfm4mpm.data.geo_stack import GeoStack
+from src.gfm4mpm.data.stac_table import StacTableStack
+from src.gfm4mpm.models.mae_vit import MAEViT
+from src.gfm4mpm.models.mlp_dropout import MLPDropout
+from src.gfm4mpm.infer.infer_maps import mc_predict_map, save_geotiff
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()

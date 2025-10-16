@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional, Tuple, List, Sequence
 import numpy as np
 import torch
 import rasterio
+from tqdm import tqdm
 
 # ensure repo-root execution can resolve the local src package
 import sys
@@ -17,6 +18,13 @@ _PROJECT_ROOT = _THIS_DIR.parent  # points to Methods/0_Benchmark_GFM4MPM
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from Common.data_utils import (
+    SplitDataLoad,
+    clamp_coords_to_window,
+    load_split_stack,
+    normalize_region_coord,
+    region_coord_to_dict,
+)
 from src.gfm4mpm.data.geo_stack import GeoStack, load_deposit_pixels
 from src.gfm4mpm.data.stac_table import StacTableStack
 from src.gfm4mpm.models.mae_vit import MAEViT
@@ -34,64 +42,67 @@ def _load_training_args(stack_root: Optional[Path], encoder_path: Path) -> Tuple
     candidates = []
     root = _resolve_search_root(stack_root)
     if root is not None:
-        metadata_candidates = [
-            root / 'training_metadata.json',
-            root / 'assetization' / 'training_metadata.json',
-        ]
-        for meta_candidate in metadata_candidates:
-            try:
-                resolved_meta = meta_candidate.resolve()
-            except Exception:
-                continue
-            if not resolved_meta.exists():
-                continue
-            try:
-                with resolved_meta.open('r', encoding='utf-8') as fh:
-                    meta_data = json.load(fh)
-                pretraining_entry = meta_data.get('pretraining')
-                if isinstance(pretraining_entry, dict):
-                    args_data = pretraining_entry.get('args')
-                    if isinstance(args_data, dict):
-                        merged_args = dict(args_data)
-                        features_override = pretraining_entry.get('features')
-                        if isinstance(features_override, list):
-                            merged_args['features'] = list(dict.fromkeys(str(f) for f in features_override))
-                        output_dir_val = pretraining_entry.get('output_dir')
-                        if output_dir_val:
-                            try:
-                                out_path = Path(output_dir_val)
-                                if not out_path.is_absolute():
-                                    out_path = (resolved_meta.parent / out_path).resolve()
-                                ta_candidate = out_path / 'training_args_1_pretrain.json'
-                                if ta_candidate.exists():
-                                    with ta_candidate.open('r', encoding='utf-8') as ta_fh:
-                                        ta_data = json.load(ta_fh)
-                                    if isinstance(ta_data, dict):
-                                        merged_args.update(
-                                            {k: v for k, v in ta_data.items() if k not in merged_args or k == 'features'}
-                                        )
-                                        features_ta = ta_data.get('features')
-                                        if isinstance(features_ta, list):
-                                            merged_args['features'] = list(dict.fromkeys(str(f) for f in features_ta))
-                            except Exception as exc:
-                                print(f"[warn] Failed to read training_args_1_pretrain.json from metadata output_dir: {exc}")
-                        return merged_args, resolved_meta
-            except Exception as exc:
-                print(f"[warn] Failed to read pretraining args from {resolved_meta}: {exc}")
-        
-        direct = root / 'training_args.json'
+        search_dirs = [root] + list(root.parents)
+        for base in search_dirs:
+            metadata_candidates = [
+                base / 'training_metadata.json',
+                base / 'assetization' / 'training_metadata.json',
+            ]
+            for meta_candidate in metadata_candidates:
+                try:
+                    resolved_meta = meta_candidate.resolve()
+                except Exception:
+                    continue
+                if not resolved_meta.exists():
+                    continue
+                try:
+                    with resolved_meta.open('r', encoding='utf-8') as fh:
+                        meta_data = json.load(fh)
+                    pretraining_entry = meta_data.get('pretraining')
+                    if isinstance(pretraining_entry, dict):
+                        args_data = pretraining_entry.get('args')
+                        if isinstance(args_data, dict):
+                            merged_args = dict(args_data)
+                            features_override = pretraining_entry.get('features')
+                            if isinstance(features_override, list):
+                                merged_args['features'] = list(dict.fromkeys(str(f) for f in features_override))
+                            output_dir_val = pretraining_entry.get('output_dir')
+                            if output_dir_val:
+                                try:
+                                    out_path = Path(output_dir_val)
+                                    if not out_path.is_absolute():
+                                        out_path = (resolved_meta.parent / out_path).resolve()
+                                    ta_candidate = out_path / 'training_args_1_pretrain.json'
+                                    if ta_candidate.exists():
+                                        with ta_candidate.open('r', encoding='utf-8') as ta_fh:
+                                            ta_data = json.load(ta_fh)
+                                        if isinstance(ta_data, dict):
+                                            merged_args.update(
+                                                {k: v for k, v in ta_data.items() if k not in merged_args or k == 'features'}
+                                            )
+                                            features_ta = ta_data.get('features')
+                                            if isinstance(features_ta, list):
+                                                merged_args['features'] = list(dict.fromkeys(str(f) for f in features_ta))
+                                except Exception as exc:
+                                    print(f"[warn] Failed to read training_args_1_pretrain.json from metadata output_dir: {exc}")
+                            return merged_args, resolved_meta
+                except Exception as exc:
+                    print(f"[warn] Failed to read pretraining args from {resolved_meta}: {exc}")
+
         direct_pretrain = root / 'training_args_1_pretrain.json'
-        candidates.append(direct)
+        direct_standard = root / 'training_args.json'
         candidates.append(direct_pretrain)
+        candidates.append(direct_standard)
         try:
-            for candidate in root.rglob('training_args.json'):
-                candidates.append(candidate)
             for candidate in root.rglob('training_args_1_pretrain.json'):
+                candidates.append(candidate)
+            for candidate in root.rglob('training_args.json'):
                 candidates.append(candidate)
         except Exception:
             pass
 
     encoder_dir = encoder_path.resolve().parent
+    candidates.append(encoder_dir / 'training_args_1_pretrain.json')
     candidates.append(encoder_dir / 'training_args.json')
 
     seen = set()
@@ -116,16 +127,18 @@ def _load_training_metadata(stack_root: Optional[Path], encoder_path: Path) -> T
     candidates: List[Path] = []
     root = _resolve_search_root(stack_root)
     if root is not None:
-        for candidate in [
-            root / 'training_metadata.json',
-            root / 'assetization' / 'training_metadata.json',
-        ]:
-            candidates.append(candidate)
-        try:
-            for candidate in root.rglob('training_metadata.json'):
+        search_dirs = [root] + list(root.parents)
+        for base in search_dirs:
+            for candidate in [
+                base / 'training_metadata.json',
+                base / 'assetization' / 'training_metadata.json',
+            ]:
                 candidates.append(candidate)
-        except Exception:
-            pass
+            try:
+                for candidate in base.rglob('training_metadata.json'):
+                    candidates.append(candidate)
+            except Exception:
+                pass
 
     encoder_dir = encoder_path.resolve().parent
     candidates.append(encoder_dir / 'training_metadata.json')
@@ -274,29 +287,43 @@ def _save_validation_plot(
 
     if len(distances):
         bins = max(20, int(np.sqrt(len(distances))))
+        distances_arr = np.asarray(distances, dtype=float)
+        bin_edges = np.histogram_bin_edges(distances_arr, bins=bins)
+        kept_counts, _ = np.histogram(distances[keep_mask], bins=bin_edges)
         ax_hist.hist(
             distances[keep_mask],
-            bins=bins,
+            bins=bin_edges,
             color='#1f77b4',
             alpha=0.6,
             label='Distances (kept)',
         )
-        ax_hist.hist(
-            distances[~keep_mask],
-            bins=bins,
-            color='grey',
-            alpha=0.4,
-            label='Distances (filtered)',
-        )
+        filtered_counts: Optional[np.ndarray] = None
+        if (~keep_mask).any():
+            filtered_counts, _ = np.histogram(distances[~keep_mask], bins=bin_edges)
+            ax_hist.hist(
+                distances[~keep_mask],
+                bins=bin_edges,
+                color='grey',
+                alpha=0.4,
+                label='Distances (filtered)',
+            )
         if cutoff is not None:
             ax_hist.axvline(cutoff, color='#d62728', linestyle='--', linewidth=1.5, label=f'Cutoff ({filter_top_pct*100:.1f}%)')
+
+        # max_count = float(kept_counts.max()) if kept_counts.size else 0.0
+        # if filtered_counts is not None and filtered_counts.size:
+        #     max_count = max(max_count, float(filtered_counts.max()))
+        max_count = float(filtered_counts.max())
+
         ax_hist.set_xlabel('Min distance to positives')
         ax_hist.set_ylabel('Count')
         ax_hist.set_title('Distance distribution')
+        if max_count > 0:
+            ax_hist.set_ylim(0, max(max_count, 1.0))
         ax_hist.legend(loc='best')
 
     fig.tight_layout()
-    out_path = out_dir / 'validation_embeddings.png'
+    out_path = out_dir / 'embeddings_labeling.png'
     fig.savefig(out_path, dpi=200, bbox_inches='tight')
     plt.close(fig)
     print(f"[info] Wrote validation plot to {out_path}")
@@ -320,12 +347,17 @@ def _resolve_pretraining_patch(args_dict: Optional[Dict], fallback: int) -> int:
 
 def _infer_region_from_name(path: Path) -> Optional[str]:
     stem_parts = path.stem.split('_')
+    priority_codes = {'NA', 'AU', 'SA', 'EU', 'AS', 'AF', 'OC', 'GL', 'CA', 'US'}
     for token in reversed(stem_parts):
-        token = token.upper()
-        if token in {'GLOBAL', 'WORLD'}:
+        up = token.upper()
+        if up in priority_codes:
+            return up
+    for token in reversed(stem_parts):
+        up = token.upper()
+        if up in {'GLOBAL', 'WORLD'}:
             return 'GLOBAL'
-        if token.isalpha() and 1 <= len(token) <= 4:
-            return token
+        if up.isalpha() and 1 <= len(up) <= 4:
+            return up
     return None
 
 
@@ -398,7 +430,7 @@ def _collect_feature_rasters(
     else:
         ordered_features = sorted(entries.keys(), key=str.lower)
 
-    region_map: Dict[str, Dict[str, Path]] = {}
+    region_map: Dict[str, Dict[str, List[Path]]] = {}
     for feature_name in ordered_features:
         match = _lookup(feature_name)
         if match is None:
@@ -424,36 +456,81 @@ def _collect_feature_rasters(
                 continue
             region = record.get('region')
             region_key = str(region or _infer_region_from_name(tif_path) or 'GLOBAL').upper()
-            region_map.setdefault(region_key, {})[canonical_name] = tif_path
+            region_map.setdefault(region_key, {}).setdefault(canonical_name, []).append(tif_path)
 
     usable: Dict[str, List[Path]] = {}
     for region, feature_map in region_map.items():
         missing = [name for name in ordered_features if name not in feature_map]
         if missing:
             continue
-        usable[region] = [feature_map[name] for name in ordered_features]
+        ordered_paths: List[Path] = []
+        for name in ordered_features:
+            paths = feature_map.get(name)
+            if not paths:
+                break
+            ordered_paths.extend(sorted(paths, key=lambda p: p.name))
+        if len(ordered_paths) == sum(len(feature_map[name]) for name in ordered_features if name in feature_map):
+            usable[region] = ordered_paths
     return usable
 
 
-def _load_label_pixels(raster_paths: Sequence[Path]) -> List[Tuple[int, int]]:
-    coords: List[Tuple[int, int]] = []
-    for path in raster_paths:
-        try:
-            with rasterio.open(path) as src:
-                data = src.read(1, masked=True)
-        except Exception as exc:
-            print(f"[warn] Failed to read label raster {path}: {exc}")
-            continue
-        if np.ma.isMaskedArray(data):
-            mask = (~data.mask) & (data.data > 0.5)
-        else:
-            valid = np.isfinite(data)
-            mask = valid & (data > 0.5)
-        if not mask.any():
-            continue
-        rows, cols = np.where(mask)
-        coords.extend(zip(rows.tolist(), cols.tolist()))
-    return coords
+def _read_stack_patch(stack: Any, coord: Any, window: int) -> np.ndarray:
+    if hasattr(stack, "resolve_region_stack"):
+        default_region = getattr(stack, "default_region", None)
+        if default_region is None:
+            regions = getattr(stack, "regions", [])
+            default_region = regions[0] if regions else "GLOBAL"
+        region, row, col = normalize_region_coord(coord, default_region=default_region)
+        region_stack = stack.resolve_region_stack(region)
+        return region_stack.read_patch(row, col, window)
+
+    if isinstance(coord, dict):
+        row = coord.get("row")
+        col = coord.get("col")
+        if row is None or col is None:
+            raise ValueError(f"Coordinate dictionary missing row/col: {coord}")
+        return stack.read_patch(int(row), int(col), window)
+
+    if isinstance(coord, (tuple, list)) and len(coord) == 3:
+        _, row, col = coord
+        return stack.read_patch(int(row), int(col), window)
+
+    row, col = coord
+    return stack.read_patch(int(row), int(col), window)
+
+
+def _load_label_pixels(raster_paths: Dict[str, Sequence[Path]]) -> List[Tuple[str, int, int]]:
+    regional_coords: List[Tuple[str, int, int]] = []
+    for region, paths in raster_paths.items():
+        for path in paths:
+            try:
+                with rasterio.open(path) as src:
+                    data = src.read(1, masked=True)
+            except Exception as exc:
+                print(f"[warn] Failed to read label raster {path}: {exc}")
+                continue
+            if np.ma.isMaskedArray(data):
+                mask = (~data.mask) & (data.data > 0.5)
+            else:
+                valid = np.isfinite(data)
+                mask = valid & (data > 0.5)
+            if not mask.any():
+                continue
+            rows, cols = np.where(mask)
+            regional_coords.extend((region, int(r), int(c)) for r, c in zip(rows.tolist(), cols.tolist()))
+    return regional_coords
+
+
+def _load_deposit_pixels_with_regions(geojson_path: str, stack: Any) -> List[Tuple[str, int, int]]:
+    if hasattr(stack, "resolve_region_stack"):
+        coords: List[Tuple[str, int, int]] = []
+        for region_name, region_stack in stack.iter_region_stacks():
+            region_coords = load_deposit_pixels(geojson_path, region_stack)
+            coords.extend((region_name, int(r), int(c)) for r, c in region_coords)
+        return coords
+
+    coords = load_deposit_pixels(geojson_path, stack)
+    return [("GLOBAL", int(r), int(c)) for r, c in coords]
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
@@ -463,8 +540,9 @@ if __name__ == '__main__':
     ap.add_argument('--pos_geojson', help='positive deposits (GeoJSON) when using rasters')
     ap.add_argument('--encoder', required=True)
     ap.add_argument('--out', required=True)
-    ap.add_argument('--filter_top_pct', type=float, default=0.10)
+    ap.add_argument('--filter_top_pct', type=float, default=0.50)
     ap.add_argument('--negs_per_pos', type=int, default=5)
+    ap.add_argument('--readembedding', action='store_true', help='Load embeddings from cached embeddings.npy in the output directory')
     ap.add_argument('--validation', action='store_true', help='Generate diagnostic plots for PU negative selection')
     args = ap.parse_args()
 
@@ -475,146 +553,85 @@ if __name__ == '__main__':
     stack_root_path: Optional[Path] = None
     training_args_data: Optional[Dict] = None
     training_args_path: Optional[Path] = None
-    training_metadata: Optional[Dict] = None
-    training_metadata_path: Optional[Path] = None
     encoder_path = Path(args.encoder).resolve()
 
     label_column = 'Training_MVT_Deposit'
+    feature_columns: Optional[List[str]] = None
 
-    if args.stac_root or args.stac_table:
-        stack_source = Path(args.stac_table or args.stac_root).resolve()
-        stack_root_path = stack_source.parent if stack_source.is_file() else stack_source
-        training_args_data, training_args_path = _load_training_args(stack_root_path, encoder_path)
-        training_metadata, training_metadata_path = _load_training_metadata(stack_root_path, encoder_path)
-        feature_columns = None
-        lat_column = None
-        lon_column = None
-        if training_args_data:
-            feature_columns = training_args_data.get('features')
-            lat_column = training_args_data.get('lat_column')
-            lon_column = training_args_data.get('lon_column')
-            label_column = training_args_data.get('label_column', label_column)
+    load_result = load_split_stack(
+        args.stac_root,
+        args.stac_table,
+        args.bands,
+        encoder_path,
+        label_column,
+        _load_training_args,
+        _load_training_metadata,
+        _resolve_label_rasters,
+        _collect_feature_rasters,
+        _infer_region_from_name,
+    )
 
-        # print("feature_columns", feature_columns); 
-        # print(training_args_data)
-        # exit()
+    stack = load_result.stack
+    stack_root_path = load_result.stack_root
+    label_column = load_result.label_column
+    feature_columns = load_result.feature_columns
+    training_args_data = load_result.training_args
+    training_args_path = load_result.training_args_path
 
-        stack = StacTableStack(
-            stack_source,
-            label_columns=[label_column],
-            feature_columns=feature_columns,
-            latitude_column=lat_column,
-            longitude_column=lon_column,
-        )
+    if load_result.mode == 'table':
+        patch = _resolve_pretraining_patch(training_args_data, 1)
         labels = stack.label_array(label_column)
         pos_indices = np.where(labels == 1)[0]
         unk_indices = np.where(labels == 0)[0]
         pos = [stack.index_to_coord(int(i)) for i in pos_indices]
         unk = [stack.index_to_coord(int(i)) for i in unk_indices]
-        patch = _resolve_pretraining_patch(training_args_data, 1)
-        if feature_columns:
-            print(f"[info] Using {len(stack.feature_columns)} feature columns from STAC table")
     else:
-        band_paths_glob = sorted(glob.glob(args.bands))
-        if not band_paths_glob:
-            raise RuntimeError(f"No raster bands matched pattern {args.bands}")
-        try:
-            common = os.path.commonpath(band_paths_glob)
-            stack_root_path = Path(common)
-        except ValueError:
-            stack_root_path = Path(band_paths_glob[0]).resolve().parent
-
-        training_args_data, training_args_path = _load_training_args(stack_root_path, encoder_path)
-        training_metadata, training_metadata_path = _load_training_metadata(stack_root_path, encoder_path)
-        feature_columns = None
-        if training_args_data:
-            feature_columns = training_args_data.get('features')
-            label_column = training_args_data.get('label_column', label_column)
-
-        label_records = _resolve_label_rasters(training_metadata, training_metadata_path, label_column)
-        label_by_region: Dict[str, List[Dict[str, Any]]] = {}
-        for record in label_records:
-            region_key = str(record.get('region') or 'GLOBAL').upper()
-            label_by_region.setdefault(region_key, []).append(record)
-
-        if not label_by_region and stack_root_path:
-            search_dir = stack_root_path if stack_root_path.is_dir() else stack_root_path.parent
-            fallback_paths = sorted(Path(search_dir).glob(f"*{label_column.lower()}*.tif"))
-            if fallback_paths:
-                for path in fallback_paths:
-                    region_hint = _infer_region_from_name(path) or 'GLOBAL'
-                    label_by_region.setdefault(region_hint.upper(), []).append({"path": path.resolve(), "region": region_hint})
-                print(f"[info] Using fallback label raster discovery for '{label_column}'.")
-
-        selected_region: Optional[str] = None
-        if label_by_region:
-            selected_region = max(label_by_region.items(), key=lambda kv: len(kv[1]))[0]
-            if len(label_by_region) > 1:
-                detail = ", ".join(f"{key}:{len(val)}" for key, val in label_by_region.items())
-                print(f"[info] Multiple label regions detected ({detail}); using region '{selected_region}'.")
-            else:
-                print(f"[info] Label rasters located for region '{selected_region}'.")
-
-        feature_regions = _collect_feature_rasters(training_metadata, training_metadata_path, feature_columns)
-
-        band_paths: List[str] = []
-        if feature_regions:
-            candidate_region = selected_region
-            if candidate_region and candidate_region in feature_regions:
-                selected_feature_paths = feature_regions[candidate_region]
-            elif 'GLOBAL' in feature_regions:
-                candidate_region = 'GLOBAL'
-                selected_feature_paths = feature_regions['GLOBAL']
-            else:
-                candidate_region, selected_feature_paths = next(iter(feature_regions.items()))
-            if candidate_region:
-                print(f"[info] Using feature rasters for region '{candidate_region}'.")
-            band_paths: List[str] = [str(path) for path in selected_feature_paths]
-        else:
-            label_slug = label_column.lower()
-            filtered_band_paths: List[str] = []
-            for p in band_paths_glob:
-                name = Path(p).name.lower()
-                if label_slug in name:
-                    continue
-                region_hint = _infer_region_from_name(Path(p)) if selected_region else None
-                if selected_region and region_hint and region_hint != selected_region:
-                    continue
-                filtered_band_paths.append(p)
-            if not filtered_band_paths:
-                raise RuntimeError(f"No feature rasters remain after filtering label column '{label_column}'")
-            removed = len(band_paths_glob) - len(filtered_band_paths)
-            if removed:
-                print(f"[info] Removed {removed} label or mismatched region raster(s) from band list.")
-            band_paths = filtered_band_paths
-
-        if feature_columns and band_paths and len(band_paths) != len(feature_columns):
-            print(
-                f"[warn] Feature raster count ({len(band_paths)}) does not match training feature list "
-                f"({len(feature_columns)}); verify assetization outputs."
-            )
-
-        stack = GeoStack(band_paths)
         patch = _resolve_pretraining_patch(training_args_data, 32)
-
-        pos: List[Tuple[int, int]] = []
-        if label_by_region and selected_region:
-            label_paths_selected = [record["path"] for record in label_by_region[selected_region]]
-            pos = _load_label_pixels(label_paths_selected)
-            if pos:
-                print(f"[info] Loaded {len(pos)} positive samples from label rasters.")
-
-        if not pos:
+        pos_raw: List[Tuple[str, int, int]] = []
+        if load_result.label_paths:
+            pos_raw = _load_label_pixels(load_result.label_paths)
+            if pos_raw:
+                print(f"[info] Loaded {len(pos_raw)} positive samples from label rasters.")
+        if not pos_raw:
             if args.pos_geojson:
-                pos = load_deposit_pixels(args.pos_geojson, stack)
+                pos_raw = _load_deposit_pixels_with_regions(args.pos_geojson, stack)
             else:
                 raise RuntimeError('No label rasters found in training_metadata.json and --pos_geojson not provided')
 
-        if pos:
-            pos = list(dict.fromkeys((int(r), int(c)) for r, c in pos))
-        grid = set(stack.grid_centers(stride=patch))
+        pos_raw = list(dict.fromkeys(pos_raw))
+        pos_clamped, clamp_count_pos = clamp_coords_to_window(pos_raw, stack, patch)
+        if clamp_count_pos:
+            print(f"[info] Adjusted {clamp_count_pos} positive coordinate(s) to stay within window bounds")
+
+        default_region = getattr(stack, "default_region", None)
+        if default_region is None:
+            default_region = "GLOBAL"
+            if hasattr(stack, "resolve_region_stack"):
+                regions = getattr(stack, "regions", [])
+                if regions:
+                    default_region = regions[0]
+
+        pos = [
+            normalize_region_coord(coord, default_region=default_region)
+            for coord in pos_clamped
+        ]
+        pos = list(dict.fromkeys(pos))
+
+        grid_coords = [
+            normalize_region_coord(coord, default_region=default_region)
+            for coord in stack.grid_centers(stride=patch)
+        ]
+        grid_set = set(grid_coords)
         pos_set = set(pos)
-        unk = list(grid - pos_set)
+        unk_raw = list(grid_set - pos_set)
+        unk_clamped, clamp_count_unk = clamp_coords_to_window(unk_raw, stack, patch)
+        if clamp_count_unk:
+            print(f"[info] Adjusted {clamp_count_unk} unlabeled coordinate(s) to stay within window bounds")
+        unk = [
+            normalize_region_coord(coord, default_region=default_region)
+            for coord in unk_clamped
+        ]
+        unk = list(dict.fromkeys(unk))
 
     coords_all = pos + unk
     if not coords_all:
@@ -622,19 +639,42 @@ if __name__ == '__main__':
     if not pos:
         raise RuntimeError('No positive samples found; check label column or source data')
 
+    if hasattr(stack, "resolve_region_stack"):
+        serialize_default_region = getattr(stack, "default_region", None)
+        if serialize_default_region is None:
+            regions = getattr(stack, "regions", [])
+            serialize_default_region = regions[0] if regions else "GLOBAL"
+    else:
+        serialize_default_region = "GLOBAL"
+
+    def _serialize_coord_entry(coord: Any) -> Dict[str, int]:
+        region, row, col = normalize_region_coord(coord, default_region=serialize_default_region)
+        return region_coord_to_dict((region, row, col))
+
+    state_dict = torch.load(encoder_path, map_location='cpu')
+    expected_channels: Optional[int] = None
+    patch_proj_weight = state_dict.get('patch.proj.weight')
+    if isinstance(patch_proj_weight, torch.Tensor):
+        expected_channels = patch_proj_weight.shape[1]
+    if expected_channels is not None and stack.count != expected_channels:
+        raise RuntimeError(
+            f"MAE encoder expects {expected_channels} input channel(s) but raster stack provides {stack.count}; "
+            "verify feature selection and metadata alignment."
+        )
+
     mae_init_kwargs: Dict = {}
     if training_args_data:
         mae_init_kwargs = _mae_kwargs_from_training_args(training_args_data)
         if training_args_path:
-            print(f"[info] Loaded training_args.json from {training_args_path}")
+            print(f"[info] Loaded training_args_1_pretrain.json for feature selection from {training_args_path}")
     else:
-        print('[warn] training_args.json not found; falling back to default MAE configuration')
+        print('[warn] training_args_1_pretrain.json not found; falling back to default MAE configuration')
 
     if getattr(stack, 'kind', None) == 'table' and hasattr(stack, '_normalized'):
         mae_init_kwargs.setdefault('patch_size', 1)
         patch_size = 1
         normalized = stack._normalized.astype(np.float32)
-        def _patch_batches(batch_coords: list[Tuple[int, int]], batch_size: int = 2048) -> np.ndarray:
+        def _patch_batches(batch_coords: list[Tuple[int, int]], batch_size: int = 256) -> np.ndarray:
             indices = [coord[0] for coord in batch_coords]
             batch = normalized[indices]
             return batch[:, :, None, None]
@@ -642,21 +682,81 @@ if __name__ == '__main__':
         default_patch = _resolve_pretraining_patch(training_args_data, patch)
         mae_init_kwargs.setdefault('patch_size', default_patch)
         patch_size = default_patch
-        def _patch_batches(batch_coords: list[Tuple[int, int]], batch_size: int = 256) -> np.ndarray:
-            patches = [stack.read_patch(r, c, patch_size) for r, c in batch_coords]
+        mae_window = mae_init_kwargs.get('image_size')
+        if isinstance(mae_window, (tuple, list)):
+            mae_window = int(mae_window[0])
+        elif mae_window is not None:
+            mae_window = int(mae_window)
+        else:
+            mae_window = patch_size
+        def _patch_batches(batch_coords: List[Any], batch_size: int = 256) -> np.ndarray:
+            patches = [_read_stack_patch(stack, coord, mae_window) for coord in batch_coords]
             return np.stack(patches, axis=0)
 
     encoder = MAEViT(in_chans=stack.count, **mae_init_kwargs)
-    encoder.load_state_dict(torch.load(encoder_path, map_location='cpu'))
+    encoder.load_state_dict(state_dict)
 
-    batch_size = 2048 if getattr(stack, 'kind', None) == 'table' else 256
-    embedding_chunks: list[np.ndarray] = []
-    for start in range(0, len(coords_all), batch_size):
-        chunk_coords = coords_all[start:start + batch_size]
-        batch_array = _patch_batches(chunk_coords)
-        embeddings = compute_embeddings(encoder, batch_array)
-        embedding_chunks.append(embeddings)
-    Z_all = np.concatenate(embedding_chunks, axis=0)
+    # default_batch_size = 256
+    # batch_size = default_batch_size
+    if training_args_data:
+        for batch_key in (
+            'batch',
+        ):
+            candidate = training_args_data.get(batch_key)
+            if candidate is None:
+                continue
+            try:
+                resolved_size = int(candidate)
+            except (TypeError, ValueError):
+                try:
+                    resolved_size = int(float(candidate))
+                except (TypeError, ValueError):
+                    continue
+            if resolved_size > 0:
+                batch_size = resolved_size
+                break
+    # if batch_size != default_batch_size:
+    print(f"[info] Using batch size {batch_size} from training_args_1_pretrain.json")
+    
+    out_dir = Path(args.out)
+    embedding_cache_path = out_dir / 'embeddings.npy'
+
+    if not args.readembedding:
+        embedding_chunks: list[np.ndarray] = []
+        total_batches = (len(coords_all) + batch_size - 1) // batch_size
+        batch_iter = tqdm(
+            range(0, len(coords_all), batch_size),
+            total=total_batches,
+            desc="Embedding patches",
+        )
+        for start in batch_iter:
+            chunk_coords = coords_all[start:start + batch_size]
+            batch_array = _patch_batches(chunk_coords)
+            embeddings = compute_embeddings(encoder, batch_array)
+            embedding_chunks.append(embeddings)
+
+        if not embedding_chunks:
+            raise RuntimeError('No coordinates collected to compute embeddings')
+        Z_all = np.concatenate(embedding_chunks, axis=0)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            np.save(embedding_cache_path, Z_all)
+            print(f"[info] Saved embeddings to {embedding_cache_path}")
+        except Exception as exc:
+            print(f"[warn] Failed to save embeddings cache to {embedding_cache_path}: {exc}")
+    else:
+        if not embedding_cache_path.exists():
+            raise FileNotFoundError(
+                f"Cached embeddings not found at {embedding_cache_path}; "
+                "run without --readembedding to generate them."
+            )
+        Z_all = np.load(embedding_cache_path)
+        if Z_all.shape[0] != len(coords_all):
+            raise ValueError(
+                f"Cached embeddings at {embedding_cache_path} have {Z_all.shape[0]} rows; "
+                f"expected {len(coords_all)} based on coordinates."
+            )
+        print(f"[info] Loaded embeddings from {embedding_cache_path}")
 
     pos_idx = np.arange(0, len(pos))
     unk_idx = np.arange(len(pos), len(coords_all))
@@ -681,12 +781,12 @@ if __name__ == '__main__':
         debug_info = None
 
     splits = {
-        'pos': [list(map(int, rc)) for rc in pos],
-        'neg': [list(map(int, coords_all[i])) for i in neg_idx.tolist()]
+        'pos': [_serialize_coord_entry(rc) for rc in pos],
+        'neg': [_serialize_coord_entry(coords_all[i]) for i in neg_idx.tolist()],
     }
-    os.makedirs(args.out, exist_ok=True)
-    out_path = Path(args.out) / 'splits.json'
-    with open(out_path, 'w') as f:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / 'splits.json'
+    with out_path.open('w') as f:
         json.dump(splits, f, indent=2)
     print(f"Wrote {len(splits['pos'])} positives and {len(splits['neg'])} negatives to {out_path}")
 

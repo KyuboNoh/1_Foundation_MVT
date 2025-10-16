@@ -39,7 +39,7 @@ python -m scripts.inspect_labels \
 
 1) **Pretrain SSL encoder** (masked autoencoder):
 ```bash
-python -m Methods.0_Benchmark_GFM4MPM.scripts.pretrain_ssl --stac-root /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021 --lat-column Latitude_EPSG4326 --lon-column Longitude_EPSG4326 --features Dict_Sedimentary Dict_Igneous Dict_Metamorphic Terrane_Proximity Geology_PassiveMargin_Proximity Geology_BlackShale_Proximity Geology_Fault_Proximity Geology_Paleolatitude_Period_Maximum Geology_Paleolatitude_Period_Minimum Gravity_GOCE_Differential Gravity_GOCE_MaximumCurve Gravity_GOCE_MinimumCurve Gravity_GOCE_MeanCurve Gravity_GOCE_ShapeIndex Seismic_LAB_Hoggard Seismic_Moho Gravity_Bouguer Gravity_Bouguer_HGM_Worms_Proximity Gravity_Bouguer_UpCont30km_HGM_Worms_Proximity Magnetic_HGM_Worms_Proximity Magnetic_LongWavelength_HGM_Worms_Proximity --mask-ratio 0.75 --preview-samples 2 --lr 2.5e-4 --epochs 30 --out ./f21_Geol_9_GOCE_5_Seis_2_Grav_3_Mag_2 --check-feature Gravity_Bouguer_HGM_Worms_Proximity --patch 16 --window 224
+python -m Methods.0_Benchmark_GFM4MPM.scripts.pretrain_ssl --stac-root /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021 --lat-column Latitude_EPSG4326 --lon-column Longitude_EPSG4326 --features Dict_Sedimentary Dict_Igneous Dict_Metamorphic Terrane_Proximity Geology_PassiveMargin_Proximity Geology_BlackShale_Proximity Geology_Fault_Proximity Geology_Paleolatitude_Period_Maximum Geology_Paleolatitude_Period_Minimum Gravity_GOCE_Differential Gravity_GOCE_MaximumCurve Gravity_GOCE_MinimumCurve Gravity_GOCE_MeanCurve Gravity_GOCE_ShapeIndex Seismic_LAB_Hoggard Seismic_Moho Gravity_Bouguer Gravity_Bouguer_HGM_Worms_Proximity Gravity_Bouguer_UpCont30km_HGM_Worms_Proximity Magnetic_HGM_Worms_Proximity Magnetic_LongWavelength_HGM_Worms_Proximity --mask-ratio 0.75 --preview-samples 2 --lr 5.0e-4 --epochs 30 --out ./f21_Geol_9_GOCE_5_Seis_2_Grav_3_Mag_2 --check-feature Gravity_Bouguer_HGM_Worms_Proximity --patch 12 --window 144
 ```
 
 2) **Load pretrained model and do only Inference** (masked autoencoder):
@@ -49,27 +49,30 @@ python -m scripts.pretrain_ssl --stac-root /home/qubuntu25/Desktop/Research/Data
 
 3) **Build PU splits**:
 ```bash
-python -m Methods.0_Benchmark_GFM4MPM.scripts.build_splits   --bands "/home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/assets/rasters/2021_Table04_Datacube_selected_Norm_*.tif"   --pos_geojson /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/assets/Training_MVT_Deposit_NA.geojson   --encoder /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/work/f21_Geol_9_GOCE_5_Seis_2_Grav_3_Mag_2/mae_encoder.pth   --out ./work/splits_raster_na   --filter_top_pct 0.10   --negs_per_pos 5   --validation
+python -m Methods.0_Benchmark_GFM4MPM.scripts.build_splits   --bands "/home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/assets/rasters/2021_Table04_Datacube_selected_Norm_*.tif"    --encoder /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/work/f21_Geol_9_GOCE_5_Seis_2_Grav_3_Mag_2/mae_encoder.pth   --out /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/work/f21_Geol_9_GOCE_5_Seis_2_Grav_3_Mag_2/2_Labeling   --filter_top_pct 0.50   --negs_per_pos 5   --validation
+
+python -m Methods.0_Benchmark_GFM4MPM.scripts.build_splits   --bands "/home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/assets/rasters/2021_Table04_Datacube_selected_Norm_*.tif"    --encoder /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/work/f21_Geol_9_GOCE_5_Seis_2_Grav_3_Mag_2/mae_encoder.pth   --out /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/work/f21_Geol_9_GOCE_5_Seis_2_Grav_3_Mag_2/2_Labeling   --filter_top_pct 0.50   --negs_per_pos 5   --validation --readembedding
 ```
 
 ##################################################################################################################################################
 
 3) **Train classifier**:
 ```bash
-python -m scripts.train_classifier \
-    --bands "/data/rasters/*.tif" \
-    --splits ./work/splits/splits.json \
-    --encoder ./work/ssl/mae_encoder.pth \
-    --epochs 60
+python -m Methods.0_Benchmark_GFM4MPM.scripts.train_classifier   \
+    --bands "/home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/assets/rasters/2021_Table04_Datacube_selected_Norm_*.tif" \
+    --splits /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/work/f21_Geol_9_GOCE_5_Seis_2_Grav_3_Mag_2/2_Labeling/splits.json \
+    --encoder /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/work/f21_Geol_9_GOCE_5_Seis_2_Grav_3_Mag_2/mae_encoder.pth \
+    --out /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/work/f21_Geol_9_GOCE_5_Seis_2_Grav_3_Mag_2/
+    --epochs 2
 ```
 
 4) **Maps & Uncertainty (MC‑Dropout)**:
 ```bash
-python -m scripts.make_maps \
-    --bands "/data/rasters/*.tif" \
-    --encoder ./work/ssl/mae_encoder.pth \
-    --mlp mlp_classifier.pth \
-    --out ./work/prospectivity \
+python -m Methods.0_Benchmark_GFM4MPM.scripts.make_maps \
+    --bands "/home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/assets/rasters/2021_Table04_Datacube_selected_Norm_*.tif" \
+    --encoder /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/work/f21_Geol_9_GOCE_5_Seis_2_Grav_3_Mag_2/mae_encoder.pth \
+    --mlp /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/work/f21_Geol_9_GOCE_5_Seis_2_Grav_3_Mag_2/3_Classifier/mlp_classifier.pth \
+    --out /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/work/f21_Geol_9_GOCE_5_Seis_2_Grav_3_Mag_2/3_Classifier/work/prospectivity \
     --patch 32 \
     --stride 16 \
     --passes 30

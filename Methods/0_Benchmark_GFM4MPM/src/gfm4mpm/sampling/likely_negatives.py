@@ -5,10 +5,13 @@ from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
 @torch.no_grad()
-def compute_embeddings(encoder, X, batch_size=1024, device='cuda'):
+def compute_embeddings(encoder, X, batch_size=1024, device='cuda', show_progress=False):
     encoder.eval().to(device)
     Z = []
-    for i in tqdm(range(0, len(X), batch_size), desc="Embeddings"):
+    iterator = range(0, len(X), batch_size)
+    if show_progress:
+        iterator = tqdm(iterator, desc="Embeddings")
+    for i in iterator:
         x = torch.from_numpy(X[i:i+batch_size]).to(device)
         z = encoder.encode(x).cpu()
         Z.append(z)
@@ -18,7 +21,7 @@ def pu_select_negatives(
     Z_all,
     pos_idx,
     unk_idx,
-    filter_top_pct=0.1,
+    filter_top_pct=0.5,
     negatives_per_pos=5,
     rng=None,
     *,
@@ -30,10 +33,12 @@ def pu_select_negatives(
     distance-to-positive scores and masks used during filtering is returned
     alongside the sampled negative indices.
     """
+
     if rng is None:
         rng = np.random.default_rng(1337)
     Zp = Z_all[pos_idx]
     Zu = Z_all[unk_idx]
+
     # Compute min distance to any positive for each unknown
     dists = []
     step = 4096
@@ -43,6 +48,7 @@ def pu_select_negatives(
         dmin = dm.min(axis=1)
         dists.append(dmin)
     dmin = np.concatenate(dists)
+
     # filter top‑similar (smallest distance)
     k = int(len(dmin) * filter_top_pct)
     keep_mask = np.ones_like(dmin, dtype=bool)
@@ -51,6 +57,7 @@ def pu_select_negatives(
         cutoff = float(np.partition(dmin, k)[:k].max())
         keep_mask &= dmin > cutoff
     kept_unk = np.array(unk_idx)[keep_mask]
+
     # sample negatives
     n_neg = min(len(pos_idx) * negatives_per_pos, len(kept_unk))
     neg_idx = rng.choice(kept_unk, size=n_neg, replace=False)

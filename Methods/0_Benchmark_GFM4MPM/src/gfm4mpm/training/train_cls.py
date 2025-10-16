@@ -8,7 +8,7 @@ from tqdm import tqdm
 def train_classifier(encoder, mlp, train_loader, val_loader, epochs=50, lr=1e-3, device=None):
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    encoder.eval().to(device)
+    encoder.eval().to(device)       # IMPORTANT: freeze encoder
     mlp.to(device)
     opt = torch.optim.AdamW(mlp.parameters(), lr=lr)
     bce = torch.nn.BCELoss()

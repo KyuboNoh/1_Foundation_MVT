@@ -5,7 +5,6 @@ import json
 import math
 import os
 import re
-from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -22,6 +21,7 @@ _PROJECT_ROOT = _THIS_DIR.parent  # points to Methods/0_Benchmark_GFM4MPM
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from Common.data_utils import clamp_coords_to_window, load_stac_rasters, MultiRegionStack
 from src.gfm4mpm.data.geo_stack import GeoStack
 from src.gfm4mpm.data.stac_table import StacTableStack
 from src.gfm4mpm.models.mae_vit import MAEViT
@@ -110,6 +110,8 @@ class SSLDataset(Dataset):
                 max_col = max(half + 1, self.stack.width - half)
                 r = int(self.rng.integers(half, max_row))
                 c = int(self.rng.integers(half, max_col))
+                (clamped_coord, _) = clamp_coords_to_window([(r, c)], self.stack, self.window)
+                r, c = clamped_coord[0]
             if hasattr(self.stack, "read_patch_with_mask"):
                 x, mask = self.stack.read_patch_with_mask(r, c, self.window)
             else:
@@ -521,119 +523,6 @@ def _generate_stitched_maps(
             stitched_dir,
         )
 
-class MultiRegionStack:
-    """Round-robin sampler that stitches multiple regional GeoStacks."""
-
-    def __init__(self, feature_names: Sequence[str], region_to_paths: Dict[str, Sequence[str]]):
-        if not region_to_paths:
-            raise ValueError("region_to_paths must not be empty")
-
-        self.feature_columns: List[str] = list(feature_names)
-        self._regions: List[Tuple[str, GeoStack]] = []
-        for region, paths in region_to_paths.items():
-            path_list = list(paths)
-            if len(path_list) != len(self.feature_columns):
-                raise ValueError(
-                    f"Region '{region}' expected {len(self.feature_columns)} feature rasters, "
-                    f"found {len(path_list)}."
-                )
-            stack = GeoStack(path_list)
-            self._regions.append((region, stack))
-            print(f"[info] Region '{region}' prepared with {len(path_list)} feature map(s).")
-
-        if not self._regions:
-            raise ValueError("No usable regional stacks were created.")
-
-        self.count = self._regions[0][1].count
-        self.kind = "raster"
-        self.is_table = False
-        self.feature_metadata = [
-            {"regions": [region for region, _ in self._regions]}
-            for _ in self.feature_columns
-        ]
-        self._cycle_index = int(np.random.default_rng().integers(0, len(self._regions)))
-
-    @property
-    def regions(self) -> List[str]:
-        return [region for region, _ in self._regions]
-
-    def iter_region_stacks(self) -> Iterable[Tuple[str, GeoStack]]:
-        return tuple(self._regions)
-
-    def sample_patch(
-        self,
-        window: int,
-        rng: np.random.Generator,
-        *,
-        skip_nan: bool = True,
-        max_attempts: int = 32,
-    ) -> np.ndarray:
-        attempts = max(1, int(max_attempts))
-        last_patch: Optional[np.ndarray] = None
-        last_mask: Optional[np.ndarray] = None
-        for _ in range(attempts):
-            region_idx = self._cycle_index
-            self._cycle_index = (self._cycle_index + 1) % len(self._regions)
-            region_name, region_stack = self._regions[region_idx]
-            r, c = region_stack.random_coord(window, rng)
-            if hasattr(region_stack, "read_patch_with_mask"):
-                patch, mask = region_stack.read_patch_with_mask(r, c, window)
-                mask_no_feature = mask.astype(bool, copy=False)
-            else:
-                patch = region_stack.read_patch(r, c, window)
-                mask_valid = np.isfinite(patch)
-                if mask_valid.ndim == 3:
-                    mask_no_feature = ~mask_valid.any(axis=0)
-                else:
-                    mask_no_feature = ~mask_valid.astype(bool)
-
-            if mask_no_feature.all() or np.allclose(patch, 0.0):
-                continue
-            if skip_nan and not np.isfinite(patch).all():
-                continue
-            last_patch = patch
-            last_mask = mask_no_feature
-            return patch, mask_no_feature
-
-        if skip_nan:
-            raise RuntimeError(
-                "Failed to sample a finite patch from any regional raster; "
-                "consider disabling --skip-nan or inspecting raster coverage."
-            )
-
-        if last_patch is not None:
-            fallback_mask = last_mask if last_mask is not None else np.zeros(last_patch.shape[-2:], dtype=bool)
-            return last_patch, fallback_mask
-
-        raise RuntimeError(
-            "Unable to sample a patch from regional rasters; verify raster coverage and metadata."
-        )
-
-        raise RuntimeError(
-            "sample_patch could not retrieve any data; check raster inputs and metadata."
-        )
-
-
-def _slugify(name: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_").lower()
-    return slug or "feature"
-
-
-def _load_training_metadata(stac_root: Path) -> Optional[Dict[str, Any]]:
-    candidates = [
-        stac_root / "training_metadata.json",
-        stac_root / "assetization" / "training_metadata.json",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            with open(candidate, "r", encoding="utf-8") as fh:
-                try:
-                    return json.load(fh)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(f"Failed to parse training metadata JSON at {candidate}: {exc}") from exc
-    return None
-
-
 def _persist_training_args_to_metadata(
     stac_root: Optional[Path],
     args_snapshot: Dict[str, Any],
@@ -708,129 +597,6 @@ def _persist_training_args_to_metadata(
         metadata_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     except Exception as exc:
         print(f"[warn] Failed to persist training args to {metadata_path}: {exc}")
-
-
-def _find_feature_entry(entries: Dict[str, Any], feature_name: str) -> Optional[Tuple[str, Dict[str, Any]]]:
-    if feature_name in entries:
-        return feature_name, entries[feature_name]
-    lowered = feature_name.lower()
-    for key, value in entries.items():
-        if key.lower() == lowered:
-            return key, value
-    return None
-
-
-def _collect_stac_raster_paths(
-    stac_root: Path,
-    features: Optional[Sequence[str]],
-) -> Tuple[List[str], Dict[str, List[str]], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    metadata = _load_training_metadata(stac_root)
-    if metadata:
-        features_section = metadata.get("features", {})
-        entries: Dict[str, Any] = features_section.get("entries", {})
-        total_features = features_section.get("total_features", len(entries))
-        print(f"[info] training_metadata.json reports {total_features} feature(s).")
-
-        if entries:
-            selected_pairs: List[Tuple[str, Dict[str, Any]]] = []
-            if features:
-                for feature in features:
-                    lookup = _find_feature_entry(entries, feature)
-                    if lookup is None:
-                        raise FileNotFoundError(
-                            f"Feature '{feature}' not present in training_metadata.json; available keys: {', '.join(entries.keys())}"
-                        )
-                    selected_pairs.append(lookup)
-            else:
-                selected_pairs = sorted(entries.items(), key=lambda kv: kv[0].lower())
-                summary_names = ", ".join(name for name, _ in selected_pairs)
-                print(
-                    f"[info] No explicit --features provided; using all {len(selected_pairs)} features"
-                    f" from metadata: {summary_names}"
-                )
-
-            feature_names = [name for name, _ in selected_pairs]
-            region_to_feature_paths: Dict[str, Dict[str, str]] = defaultdict(dict)
-
-            for feature_name, entry in selected_pairs:
-                tif_records = entry.get("tifs", [])
-                if not tif_records:
-                    raise FileNotFoundError(
-                        f"No TIFF records listed for feature '{feature_name}' in training_metadata.json"
-                    )
-
-                print(f"[info] Feature '{feature_name}' has {len(tif_records)} map(s):")
-                for record in tif_records:
-                    rel_path = record.get("path")
-                    if not rel_path:
-                        continue
-                    region = str(record.get("region") or "GLOBAL").upper()
-                    tif_path = (stac_root / rel_path).resolve()
-                    region_to_feature_paths[region][feature_name] = str(tif_path)
-                    print(f"        - {tif_path} (region={region})")
-
-            usable_regions: Dict[str, List[str]] = {}
-            for region, feature_path_map in region_to_feature_paths.items():
-                missing = [name for name in feature_names if name not in feature_path_map]
-                if missing:
-                    print(
-                        f"[warn] Region '{region}' is missing {len(missing)} feature(s) ({', '.join(missing)}); skipping this region."
-                    )
-                    continue
-                ordered_paths = [feature_path_map[name] for name in feature_names]
-                usable_regions[region] = ordered_paths
-
-            if not usable_regions:
-                raise FileNotFoundError(
-                    "No regions contained complete raster coverage for the requested features."
-                )
-
-            selected_entries = {name: entry for name, entry in selected_pairs}
-            return feature_names, usable_regions, metadata, selected_entries
-
-        print("[warn] training_metadata.json contained no feature entries; falling back to filesystem scan.")
-        metadata = None
-
-    # Fallback: file system scan
-    assets_dir = (stac_root / "assets" / "rasters").resolve()
-    if not assets_dir.exists():
-        raise FileNotFoundError(f"No raster assets directory found at {assets_dir}")
-
-    candidates = [
-        path for path in assets_dir.rglob("*_cog.tif") if "thumbnails" not in {p.lower() for p in path.parts}
-    ]
-    if not candidates:
-        candidates = [
-            path for path in assets_dir.rglob("*.tif") if "thumbnails" not in {p.lower() for p in path.parts}
-        ]
-
-    if not candidates:
-        raise FileNotFoundError(f"No raster GeoTIFFs found under {assets_dir}")
-
-    if features:
-        ordered: list[Path] = []
-        remaining = candidates.copy()
-        for feature in features:
-            slug = _slugify(feature)
-            match = None
-            for path in remaining:
-                stem_lower = path.stem.lower()
-                stem_lower = stem_lower[:-4] if stem_lower.endswith("_cog") else stem_lower
-                if slug in stem_lower:
-                    match = path
-                    break
-            if match is None:
-                raise FileNotFoundError(f"No raster asset matching feature '{feature}' (slug '{slug}') under {assets_dir}")
-            ordered.append(match)
-            remaining.remove(match)
-        candidates = ordered
-        feature_names = list(features)
-    else:
-        candidates = sorted(candidates)
-        feature_names = [Path(p).stem for p in candidates]
-
-    region_paths = {"GLOBAL": [str(path.resolve()) for path in candidates]}
-    return feature_names, region_paths, metadata, None
 
 
 def _maybe_check_image_preproc(
@@ -1223,12 +989,12 @@ if __name__ == '__main__':
     ap.add_argument('--lat-column', type=str, help='Latitude column name for STAC tables')
     ap.add_argument('--lon-column', type=str, help='Longitude column name for STAC tables')
     ap.add_argument('--out', type=str, required=True)
-    ap.add_argument('--patch', type=int, default=224, help='Patch size for MAE patch embedding (must divide window)')
-    ap.add_argument('--window', type=int, default=16, help='Square crop size (pixels) for SSL inputs')
+    ap.add_argument('--patch', type=int, default=12, help='Patch size for MAE patch embedding (must divide window)')
+    ap.add_argument('--window', type=int, default=144, help='Square crop size (pixels) for SSL inputs')
     ap.add_argument('--mask-ratio', type=float, default=0.75, help='Fraction of patches masked during MAE pretraining')
-    ap.add_argument('--encoder-dim', type=int, default=768, help='Embedding dimension for MAE encoder tokens')
-    ap.add_argument('--decoder-dim', type=int, default=512, help='Embedding dimension for MAE decoder tokens')
-    ap.add_argument('--encoder-num-heads', type=int, default=6, help='Number of attention heads in encoders of MAE transformer blocks')
+    ap.add_argument('--encoder-dim', type=int, default=512, help='Embedding dimension for MAE encoder tokens')
+    ap.add_argument('--decoder-dim', type=int, default=384, help='Embedding dimension for MAE decoder tokens')
+    ap.add_argument('--encoder-num-heads', type=int, default=8, help='Number of attention heads in encoders of MAE transformer blocks')
     ap.add_argument('--decoder-num-heads', type=int, default=8, help='Number of attention heads in decoders of MAE transformer blocks')
     
     ap.add_argument('--encoder-depth', type=int, default=6, help='Number of transformer blocks in the encoder')
@@ -1288,18 +1054,17 @@ if __name__ == '__main__':
         if args.features:
             print(f"[info] Using {len(stack.feature_columns)} feature columns from STAC table")
 
-        # Temporarily restrict to numeric-only features to avoid categorical indicators
         if getattr(stack, "is_table", False):
             feature_meta = getattr(stack, "feature_metadata", None)
             if feature_meta:
-                numeric_idx: list[int] = []
-                dropped_names: list[str] = []
+                numeric_idx: List[int] = []
+                dropped_names: List[str] = []
                 for idx, meta in enumerate(feature_meta):
-                    category = None
-                    if isinstance(meta, dict):
-                        category = meta.get("category")
+                    category = meta.get("category") if isinstance(meta, dict) else None
                     if category:
-                        dropped_names.append(stack.feature_columns[idx] if idx < len(stack.feature_columns) else f"feature_{idx}")
+                        dropped_names.append(
+                            stack.feature_columns[idx] if idx < len(stack.feature_columns) else f"feature_{idx}"
+                        )
                     else:
                         numeric_idx.append(idx)
 
@@ -1327,14 +1092,8 @@ if __name__ == '__main__':
         used_feature_list = list(getattr(stack, "feature_columns", []) or [])
     elif args.stac_root:
         stac_root_path = Path(args.stac_root).resolve()
-        (
-            feature_names,
-            region_paths,
-            metadata,
-            feature_entries,
-        ) = _collect_stac_raster_paths(stac_root_path, args.features)
 
-        def _filter_numeric_stack(stack_obj):
+        def _filter_numeric_stack(stack_obj: GeoStack) -> GeoStack:
             feature_meta = getattr(stack_obj, "feature_metadata", None)
             feature_cols = getattr(stack_obj, "feature_columns", None)
             if not feature_meta or not feature_cols:
@@ -1342,9 +1101,7 @@ if __name__ == '__main__':
             numeric_idx: List[int] = []
             dropped_names: List[str] = []
             for idx, meta in enumerate(feature_meta):
-                category = None
-                if isinstance(meta, dict):
-                    category = meta.get("category")
+                category = meta.get("category") if isinstance(meta, dict) else None
                 if category:
                     dropped_names.append(feature_cols[idx] if idx < len(feature_cols) else f"feature_{idx}")
                 else:
@@ -1374,29 +1131,13 @@ if __name__ == '__main__':
 
             return stack_obj
 
-        if len(region_paths) == 1:
-            region_name, paths = next(iter(region_paths.items()))
-            print(
-                f"[info] Using {len(paths)} raster asset(s) from region '{region_name}' under {stac_root_path}"
-            )
-            stack = GeoStack(paths)
-            # Attach metadata so downstream preview uses canonical feature names.
-            stack.feature_columns = list(feature_names)
-            stack.feature_metadata = [
-                {"regions": [region_name]}
-                for _ in feature_names
-            ]
-            stack = _filter_numeric_stack(stack)
-        else:
-            print(
-                f"[info] Using {sum(len(v) for v in region_paths.values())} raster asset(s) "
-                f"across {len(region_paths)} regions under {stac_root_path}"
-            )
-            stack = MultiRegionStack(feature_names, region_paths)
-            for _, region_stack in stack.iter_region_stacks():
-                _filter_numeric_stack(region_stack)
+        stack, _, feature_names_resolved, metadata, feature_entries, _ = load_stac_rasters(
+            stac_root_path,
+            args.features,
+            numeric_filter=_filter_numeric_stack,
+        )
         window_size = args.window
-        used_feature_list = list(getattr(stack, "feature_columns", []) or [])
+        used_feature_list = list(feature_names_resolved or [])
     else:
         stack = GeoStack(sorted(glob.glob(args.bands)))
         window_size = args.window
@@ -1439,8 +1180,6 @@ if __name__ == '__main__':
 
     preview_dir = output_dir / 'previews'
 
-
-    # why new GeoStack is created here?
     if args.check_image_preproc:
         if metadata and feature_entries:
             if stac_root_path is None:
@@ -1481,24 +1220,6 @@ if __name__ == '__main__':
         skip_nan=args.skip_nan,
         max_resample_attempts=args.skip_nan_attempts,
     )
-
-    # print('[dev] stack:', stack)
-    # if hasattr(stack, '__len__'):
-    #     print('[dev] stack length:', len(stack))
-    # print('[dev] dataset:', ds)
-    # try:
-    #     first_item = ds[0]
-    #     print('[dev] first item type:', type(first_item))
-    #     if isinstance(first_item, dict):
-    #         for key, value in first_item.items():
-    #             value_info = getattr(value, 'shape', None) or getattr(value, 'size', None)
-    #             print(f"[dev] ds[0]['{key}'] ->", value_info if value_info is not None else type(value))
-    #     elif hasattr(first_item, 'shape'):
-    #         print('[dev] first item shape:', first_item.shape, first_item)
-    # except Exception as exc:
-    #     print('[dev] failed to inspect first item:', exc)
-    # exit()
-
 
     # TODO: Make it generalized for future development... How so?
     worker_count = 8
