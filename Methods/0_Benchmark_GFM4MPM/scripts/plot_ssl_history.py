@@ -3,7 +3,7 @@
 import argparse
 import json
 from pathlib import Path
-from typing import List, Dict
+from typing import Dict, List, Optional
 
 import matplotlib
 
@@ -21,35 +21,67 @@ def load_history(path: Path) -> List[Dict]:
 
 def plot_history(history: List[Dict], out_path: Path | None) -> None:
     epochs = [entry["epoch"] for entry in history]
-    recon = [entry.get("recon_loss") for entry in history]
-    mae = [entry.get("mae") for entry in history]
-    psnr = [entry.get("psnr") for entry in history]
-    ssim = [entry.get("ssim") for entry in history]
+
+    def extract_metric(entries: List[Dict], metric: str, split: str) -> List[Optional[float]]:
+        values: List[Optional[float]] = []
+        for entry in entries:
+            if split == "train":
+                train_data = entry.get("train")
+                if isinstance(train_data, dict):
+                    values.append(train_data.get(metric))
+                else:
+                    values.append(entry.get(metric))
+            else:
+                val_data = entry.get("val")
+                if isinstance(val_data, dict):
+                    values.append(val_data.get(metric))
+                else:
+                    values.append(entry.get(f"val_{metric}"))
+        return values
+
+    def to_plot(values: List[Optional[float]]) -> List[float]:
+        return [float("nan") if v is None else v for v in values]
+
+    train_recon = extract_metric(history, "recon_loss", "train")
+    val_recon = extract_metric(history, "recon_loss", "val")
+    train_mae = extract_metric(history, "mae", "train")
+    val_mae = extract_metric(history, "mae", "val")
+    train_psnr = extract_metric(history, "psnr", "train")
+    val_psnr = extract_metric(history, "psnr", "val")
+    train_ssim = extract_metric(history, "ssim", "train")
+    val_ssim = extract_metric(history, "ssim", "val")
 
     fig, axes = plt.subplots(2, 2, figsize=(10, 6), sharex=True)
-    ax = axes[0, 0]
-    ax.plot(epochs, recon, marker="o")
-    ax.set_title("Reconstruction Loss")
-    ax.set_ylabel("MSE")
 
-    ax = axes[0, 1]
-    ax.plot(epochs, mae, marker="o", color="tab:orange")
-    ax.set_title("Mean Absolute Error")
+    def plot_pair(ax, train_vals, val_vals, title, ylabel=None):
+        ax.plot(epochs, to_plot(train_vals), marker="o", label="train", color="tab:blue")
+        has_val = any(v is not None for v in val_vals)
+        if has_val:
+            ax.plot(epochs, to_plot(val_vals), marker="o", label="val", color="tab:orange")
+        ax.set_title(title)
+        if ylabel:
+            ax.set_ylabel(ylabel)
+        ax.set_xlabel("Epoch")
+        if has_val:
+            ax.legend()
 
-    ax = axes[1, 0]
-    ax.plot(epochs, psnr, marker="o", color="tab:green")
-    ax.set_title("PSNR")
-    ax.set_ylabel("dB")
-    ax.set_xlabel("Epoch")
+    plot_pair(axes[0, 0], train_recon, val_recon, "Reconstruction Loss", ylabel="MSE")
+    plot_pair(axes[0, 1], train_mae, val_mae, "Mean Absolute Error")
+    plot_pair(axes[1, 0], train_psnr, val_psnr, "PSNR", ylabel="dB")
 
-    # Filter out None values for SSIM
-    valid_pairs = [(e, v) for e, v in zip(epochs, ssim) if v is not None]
     ax = axes[1, 1]
-    if valid_pairs:
-        xs, ys = zip(*valid_pairs)
-        ax.plot(xs, ys, marker="o", color="tab:red")
-    else:
+    train_ssim_plot = to_plot(train_ssim)
+    val_ssim_plot = to_plot(val_ssim)
+    has_train_ssim = any(v is not None for v in train_ssim)
+    has_val_ssim = any(v is not None for v in val_ssim)
+    if has_train_ssim:
+        ax.plot(epochs, train_ssim_plot, marker="o", label="train", color="tab:red")
+    if has_val_ssim:
+        ax.plot(epochs, val_ssim_plot, marker="o", label="val", color="tab:purple")
+    if not (has_train_ssim or has_val_ssim):
         ax.text(0.5, 0.5, "SSIM unavailable", transform=ax.transAxes, ha="center", va="center")
+    else:
+        ax.legend()
     ax.set_title("SSIM")
     ax.set_xlabel("Epoch")
 

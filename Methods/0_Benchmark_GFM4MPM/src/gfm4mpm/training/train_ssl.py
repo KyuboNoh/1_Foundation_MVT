@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -440,8 +440,9 @@ def train_ssl(
     use_ssim: bool = False,
     checkpoint_epochs: Optional[Iterable[int]] = None,
     checkpoint_callback: Optional[
-        Callable[[int, torch.nn.Module, List[Dict[str, float]]], None]
+        Callable[[int, torch.nn.Module, List[Dict[str, Any]]], None]
     ] = None,
+    val_dataloader: Optional[DataLoader] = None,
 ) -> Tuple[torch.nn.Module, List[Dict[str, float]]]:
     if mask_scope not in {"pixel", "patch"}:
         raise ValueError(f"mask_scope must be 'pixel' or 'patch', received '{mask_scope}'")
@@ -456,7 +457,7 @@ def train_ssl(
     )
     model.train()
 
-    history: List[Dict[str, float]] = []
+    history: List[Dict[str, Any]] = []
     warned_ssim = False
     skipped_ssim_scalar = False
     skipped_ssim_small_window = False
@@ -513,67 +514,65 @@ def train_ssl(
         _LOG.info(msg)
         print(msg)
 
-    for ep in range(1, epochs + 1):
-        sample_cache: List[
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-        ] = []
-        running_loss = 0.0
-        running_mae = 0.0
-        running_psnr = 0.0
-        running_ssim = 0.0
-        count = 0
-        count_ssim = 0
+    def _process_single_batch(
+        batch,
+        train_mode: bool,
+        sample_cache: Optional[
+            List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]
+        ],
+    ) -> Tuple[float, float, float, Optional[float], int, int]:
+        nonlocal last_spatial_shape, skipped_ssim_scalar, skipped_ssim_small_window
 
-        for batch in tqdm(dataloader, desc=f"SSL epoch {ep}"):
-            if isinstance(batch, dict):
-                x = batch.get("image")
-                if x is None:
-                    raise ValueError("Batch dictionary missing 'image' key")
-                mask_no_feature = batch.get("mask_pixel_no_feature")
-            else:
-                x = batch
-                mask_no_feature = None
+        if isinstance(batch, dict):
+            x = batch.get("image")
+            if x is None:
+                raise ValueError("Batch dictionary missing 'image' key")
+            mask_no_feature = batch.get("mask_pixel_no_feature")
+        else:
+            x = batch
+            mask_no_feature = None
 
-            x = x.to(device)
+        x = x.to(device)
 
-            mask_no_feature_tensor: Optional[torch.Tensor] = None
-            if mask_no_feature is not None:
-                mask_no_feature_tensor = mask_no_feature.to(device=device)
-                if mask_no_feature_tensor.dtype != torch.bool:
-                    mask_no_feature_tensor = mask_no_feature_tensor.bool()
-                if mask_no_feature_tensor.dim() == 2:
-                    mask_no_feature_tensor = mask_no_feature_tensor.unsqueeze(0).unsqueeze(0)
-                elif mask_no_feature_tensor.dim() == 3:
-                    mask_no_feature_tensor = mask_no_feature_tensor.unsqueeze(1)
-                elif mask_no_feature_tensor.dim() == 4 and mask_no_feature_tensor.size(1) != 1:
-                    mask_no_feature_tensor = mask_no_feature_tensor.any(dim=1, keepdim=True)
+        mask_no_feature_tensor: Optional[torch.Tensor] = None
+        if mask_no_feature is not None:
+            mask_no_feature_tensor = mask_no_feature.to(device=device)
+            if mask_no_feature_tensor.dtype != torch.bool:
+                mask_no_feature_tensor = mask_no_feature_tensor.bool()
+            if mask_no_feature_tensor.dim() == 2:
+                mask_no_feature_tensor = mask_no_feature_tensor.unsqueeze(0).unsqueeze(0)
+            elif mask_no_feature_tensor.dim() == 3:
+                mask_no_feature_tensor = mask_no_feature_tensor.unsqueeze(1)
+            elif mask_no_feature_tensor.dim() == 4 and mask_no_feature_tensor.size(1) != 1:
+                mask_no_feature_tensor = mask_no_feature_tensor.any(dim=1, keepdim=True)
 
-            expected_size = getattr(model, "image_size", None)
-            if expected_size is not None:
-                if isinstance(expected_size, int):
-                    expected_size = (expected_size, expected_size)
-                if x.dim() == 4 and (x.shape[-2], x.shape[-1]) != expected_size:
-                    x = torch.nn.functional.interpolate(x, size=expected_size, mode="nearest")
-                    if mask_no_feature_tensor is not None:
-                        mask_no_feature_tensor = torch.nn.functional.interpolate(
-                            mask_no_feature_tensor.float(), size=expected_size, mode="nearest"
-                        ) >= 0.5
-            elif x.dim() == 4 and x.shape[-2] == 1 and x.shape[-1] == 1:
-                target_hw = max(16, getattr(model, "patch_size", 16))
-                x = torch.nn.functional.interpolate(x, size=(target_hw, target_hw), mode="nearest")
+        expected_size = getattr(model, "image_size", None)
+        if expected_size is not None:
+            if isinstance(expected_size, int):
+                expected_size = (expected_size, expected_size)
+            if x.dim() == 4 and (x.shape[-2], x.shape[-1]) != expected_size:
+                x = torch.nn.functional.interpolate(x, size=expected_size, mode="nearest")
                 if mask_no_feature_tensor is not None:
                     mask_no_feature_tensor = torch.nn.functional.interpolate(
-                        mask_no_feature_tensor.float(), size=(target_hw, target_hw), mode="nearest"
+                        mask_no_feature_tensor.float(), size=expected_size, mode="nearest"
                     ) >= 0.5
-
+        elif x.dim() == 4 and x.shape[-2] == 1 and x.shape[-1] == 1:
+            target_hw = max(16, getattr(model, "patch_size", 16))
+            x = torch.nn.functional.interpolate(x, size=(target_hw, target_hw), mode="nearest")
             if mask_no_feature_tensor is not None:
-                mask_no_feature_tensor = mask_no_feature_tensor.bool()
+                mask_no_feature_tensor = torch.nn.functional.interpolate(
+                    mask_no_feature_tensor.float(), size=(target_hw, target_hw), mode="nearest"
+                ) >= 0.5
 
-            if x.dim() >= 4:
-                last_spatial_shape = (x.shape[-2], x.shape[-1])
-            else:
-                last_spatial_shape = None
+        if mask_no_feature_tensor is not None:
+            mask_no_feature_tensor = mask_no_feature_tensor.bool()
 
+        if x.dim() >= 4:
+            last_spatial_shape = (x.shape[-2], x.shape[-1])
+        else:
+            last_spatial_shape = None
+
+        with torch.set_grad_enabled(train_mode):
             pred, mae_mask_tokens = model(x)
 
             patch_size = getattr(model, "patch_size", None)
@@ -612,76 +611,179 @@ def train_ssl(
                 mae_mask=pixel_mae_mask,
                 pixel_valid_mask=pixel_valid_mask_bool,
             )
+
+        loss_value = loss.item()
+        if train_mode:
             opt.zero_grad()
             loss.backward()
             opt.step()
 
-            batch_size = x.size(0)
-            running_loss += loss.item() * batch_size
+        supervision_mask = pixel_mae_mask
+        if pixel_valid_mask_bool is not None:
+            supervision_mask = supervision_mask * pixel_valid_mask_bool.to(dtype=pred.dtype)
+        mask_sum = supervision_mask.sum().clamp(min=1.0)
+        mae_val = ((pred - x).abs() * supervision_mask).sum() / mask_sum
+        mae_value = mae_val.detach().item()
 
-            supervision_mask = pixel_mae_mask
-            if pixel_valid_mask_bool is not None:
-                supervision_mask = supervision_mask * pixel_valid_mask_bool.to(dtype=pred.dtype)
-            mask_sum = supervision_mask.sum().clamp(min=1.0)
-            mae_val = ((pred - x).abs() * supervision_mask).sum() / mask_sum
-            running_mae += mae_val.detach().item() * batch_size
-
-            if pixel_valid_mask_bool is not None:
-                valid_expand = pixel_valid_mask_bool.expand_as(x)
-                invalid_expand = (~pixel_valid_mask_bool).expand_as(x)
-                pred_metrics = pred.clone()
-                target_metrics = x.clone()
-                pred_metrics[invalid_expand] = 0.0
-                target_metrics[invalid_expand] = 0.0
-                target_valid_vals = x[valid_expand]
-                if target_valid_vals.numel() > 0:
-                    data_range_val = (target_valid_vals.max() - target_valid_vals.min()).detach().cpu().item()
-                else:
-                    data_range_val = 1.0
+        if pixel_valid_mask_bool is not None:
+            valid_expand = pixel_valid_mask_bool.expand_as(x)
+            invalid_expand = (~pixel_valid_mask_bool).expand_as(x)
+            pred_metrics = pred.clone()
+            target_metrics = x.clone()
+            pred_metrics[invalid_expand] = 0.0
+            target_metrics[invalid_expand] = 0.0
+            target_valid_vals = x[valid_expand]
+            if target_valid_vals.numel() > 0:
+                data_range_val = (target_valid_vals.max() - target_valid_vals.min()).detach().cpu().item()
             else:
-                pred_metrics = pred
-                target_metrics = x
-                data_range_val = (target_metrics.max() - target_metrics.min()).detach().cpu().item()
-
-            if data_range_val <= 0:
                 data_range_val = 1.0
+        else:
+            pred_metrics = pred
+            target_metrics = x
+            data_range_val = (target_metrics.max() - target_metrics.min()).detach().cpu().item()
 
-            psnr_val = peak_signal_noise_ratio(pred_metrics, target_metrics, data_range=data_range_val)
-            running_psnr += psnr_val.item() * batch_size
+        if data_range_val <= 0:
+            data_range_val = 1.0
+
+        psnr_val = peak_signal_noise_ratio(pred_metrics, target_metrics, data_range=data_range_val)
+        psnr_value = psnr_val.item()
+
+        ssim_value: Optional[float] = None
+        ssim_count_increment = 0
+        if use_ssim:
             has_spatial = x.dim() >= 4
-            if use_ssim:
-                if has_spatial and x.shape[-1] > 1 and x.shape[-2] > 1 and min(x.shape[-2], x.shape[-1]) >= 11:
-                    ssim_val = structural_similarity_index_measure(pred_metrics, target_metrics, data_range=data_range_val)
-                    running_ssim += ssim_val.item() * batch_size
-                    count_ssim += batch_size
-                else:
+            if has_spatial and x.shape[-1] > 1 and x.shape[-2] > 1 and min(x.shape[-2], x.shape[-1]) >= 11:
+                ssim_val = structural_similarity_index_measure(
+                    pred_metrics,
+                    target_metrics,
+                    data_range=data_range_val,
+                )
+                ssim_value = ssim_val.item()
+                ssim_count_increment = x.size(0)
+            else:
+                if train_mode:
                     if not has_spatial or x.shape[-1] <= 1 or x.shape[-2] <= 1:
                         skipped_ssim_scalar = True
                     elif min(x.shape[-2], x.shape[-1]) < 11:
                         skipped_ssim_small_window = True
 
-            if preview_samples > 0 and len(sample_cache) < preview_samples:
-                new_samples = _collect_preview_samples(
-                    x,
-                    pred,
-                    pixel_mae_mask,
-                    pixel_invalid_mask,
-                    mask_scope=mask_scope,
-                    mask_ratio=float(getattr(model, "mask_ratio", 0.0)),
+        if (
+            sample_cache is not None
+            and preview_samples > 0
+            and len(sample_cache) < preview_samples
+        ):
+            new_samples = _collect_preview_samples(
+                x,
+                pred,
+                pixel_mae_mask,
+                pixel_invalid_mask,
+                mask_scope=mask_scope,
+                mask_ratio=float(getattr(model, "mask_ratio", 0.0)),
+            )
+            for entry in new_samples:
+                sample_cache.append(entry)
+                if len(sample_cache) >= preview_samples:
+                    break
+
+        return (
+            loss_value,
+            mae_value,
+            psnr_value,
+            ssim_value,
+            x.size(0),
+            ssim_count_increment,
+        )
+
+    def _process_epoch(
+        loader: Optional[DataLoader],
+        train_mode: bool,
+        collect_samples: bool,
+        epoch_idx: int,
+    ) -> Tuple[Optional[Dict[str, float]], List[
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ], int]:
+        if loader is None:
+            return None, [], 0
+
+        if train_mode:
+            model.train()
+        else:
+            model.eval()
+
+        sample_cache_local: List[
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = [] if collect_samples else []
+        totals = {
+            "loss": 0.0,
+            "mae": 0.0,
+            "psnr": 0.0,
+            "ssim": 0.0,
+            "count": 0,
+            "ssim_count": 0,
+        }
+
+        context = torch.enable_grad() if train_mode else torch.no_grad()
+        with context:
+            iterator = tqdm(
+                loader,
+                desc=f"SSL epoch {epoch_idx} ({'train' if train_mode else 'val'})",
+                leave=False,
+            )
+            for batch in iterator:
+                (
+                    loss_value,
+                    mae_value,
+                    psnr_value,
+                    ssim_value,
+                    batch_size,
+                    ssim_count_inc,
+                ) = _process_single_batch(
+                    batch,
+                    train_mode,
+                    sample_cache_local if collect_samples else None,
                 )
-                for entry in new_samples:
-                    sample_cache.append(entry)
-                    if len(sample_cache) >= preview_samples:
-                        break
+                totals["loss"] += loss_value * batch_size
+                totals["mae"] += mae_value * batch_size
+                totals["psnr"] += psnr_value * batch_size
+                totals["count"] += batch_size
+                if ssim_value is not None:
+                    totals["ssim"] += ssim_value * batch_size
+                    totals["ssim_count"] += ssim_count_inc
 
-            count += batch_size
+        if totals["count"] == 0:
+            metrics = {
+                "recon_loss": float("nan"),
+                "mae": float("nan"),
+                "psnr": float("nan"),
+                "ssim": None,
+            }
+        else:
+            denom = totals["count"]
+            metrics = {
+                "recon_loss": totals["loss"] / denom,
+                "mae": totals["mae"] / denom,
+                "psnr": totals["psnr"] / denom,
+                "ssim": (
+                    totals["ssim"] / totals["ssim_count"]
+                    if totals["ssim_count"] > 0
+                    else None
+                ),
+            }
 
-        epoch_loss = running_loss / max(1, count)
-        epoch_mae = running_mae / max(1, count)
-        epoch_psnr = running_psnr / max(1, count)
-        epoch_ssim = running_ssim / count_ssim if count_ssim else None
+        return metrics, sample_cache_local, totals["ssim_count"]
 
-        if use_ssim and epoch_ssim is None and not warned_ssim:
+    for ep in range(1, epochs + 1):
+        train_metrics, sample_cache, train_ssim_count = _process_epoch(
+            dataloader,
+            train_mode=True,
+            collect_samples=preview_samples > 0 and preview_dir is not None,
+            epoch_idx=ep,
+        )
+        if train_metrics is None:
+            raise RuntimeError("Training dataloader yielded no batches.")
+
+        train_ssim = train_metrics["ssim"]
+        if use_ssim and train_ssim is None and not warned_ssim:
             if skipped_ssim_small_window:
                 min_dim = None
                 if last_spatial_shape is not None:
@@ -708,21 +810,48 @@ def train_ssl(
                 )
             warned_ssim = True
 
-        ssim_str = f"{epoch_ssim:.4f}" if epoch_ssim is not None else "n/a"
-        print(
-            f"[SSL] epoch {ep} loss={epoch_loss:.4f} mae={epoch_mae:.4f} "
-            f"psnr={epoch_psnr:.2f} ssim={ssim_str}"
-        )
+        val_metrics: Optional[Dict[str, float]] = None
+        if val_dataloader is not None:
+            val_metrics, _, _ = _process_epoch(
+                val_dataloader,
+                train_mode=False,
+                collect_samples=False,
+                epoch_idx=ep,
+            )
 
-        history.append(
-            {
-                "epoch": ep,
-                "recon_loss": epoch_loss,
-                "mae": epoch_mae,
-                "psnr": epoch_psnr,
-                "ssim": epoch_ssim,
-            }
+        train_ssim_str = f"{train_metrics['ssim']:.4f}" if train_metrics["ssim"] is not None else "n/a"
+        log_msg = (
+            f"[SSL] epoch {ep} "
+            f"train_loss={train_metrics['recon_loss']:.4f} "
+            f"train_mae={train_metrics['mae']:.4f} "
+            f"train_psnr={train_metrics['psnr']:.2f} "
+            f"train_ssim={train_ssim_str}"
         )
+        if val_metrics is not None:
+            val_ssim_str = f"{val_metrics['ssim']:.4f}" if val_metrics["ssim"] is not None else "n/a"
+            log_msg += (
+                f" | val_loss={val_metrics['recon_loss']:.4f} "
+                f"val_mae={val_metrics['mae']:.4f} "
+                f"val_psnr={val_metrics['psnr']:.2f} "
+                f"val_ssim={val_ssim_str}"
+            )
+        print(log_msg)
+
+        history_entry: Dict[str, Any] = {
+            "epoch": ep,
+            "train": train_metrics,
+            "recon_loss": train_metrics["recon_loss"],
+            "mae": train_metrics["mae"],
+            "psnr": train_metrics["psnr"],
+            "ssim": train_metrics["ssim"],
+        }
+        if val_metrics is not None:
+            history_entry["val"] = val_metrics
+            history_entry["val_recon_loss"] = val_metrics["recon_loss"]
+            history_entry["val_mae"] = val_metrics["mae"]
+            history_entry["val_psnr"] = val_metrics["psnr"]
+            history_entry["val_ssim"] = val_metrics["ssim"]
+        history.append(history_entry)
 
         if preview_samples > 0 and preview_dir is not None and sample_cache:
             sample_shapes = (

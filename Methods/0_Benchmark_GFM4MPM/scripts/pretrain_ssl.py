@@ -1014,6 +1014,10 @@ if __name__ == '__main__':
                     help='Disable SSIM metric computation during training (default)')
     ap.add_argument('--epochs', type=int, default=30)
     ap.add_argument('--batch', type=int, default=128)
+    ap.add_argument('--val-batch', type=int, help='Batch size for validation loader (defaults to --batch)')
+    ap.add_argument('--train-samples', type=int, default=200000, help='Number of training samples per epoch')
+    ap.add_argument('--val-samples', type=int, default=8192, help='Number of validation samples per epoch (0 disables validation)')
+    ap.add_argument('--seed', type=int, default=1337, help='Random seed for SSL sampling')
     ap.add_argument('--optimizer', choices=['adamw', 'adam'], default='adamw')
     ap.add_argument('--lr', type=float, default=2.5e-4)
     ap.add_argument('--preview-samples', type=int, default=0, help='If >0, create reconstruction previews for this many samples')
@@ -1156,7 +1160,8 @@ if __name__ == '__main__':
             used_feature_list = []
     used_feature_list = list(dict.fromkeys(str(name) for name in used_feature_list))
 
-    requested_out = Path(args.out)
+    # TODO: check path?
+    requested_out = Path(args.out)/"1_SSL/"
     if stac_root_path is not None:
         output_base = (stac_root_path / "work").resolve()
         relative_part = requested_out
@@ -1214,9 +1219,11 @@ if __name__ == '__main__':
         else:
             _maybe_check_image_preproc(stack, args.check_feature, window_size, preview_dir)
 
-    ds = SSLDataset(
+    train_ds = SSLDataset(
         stack,
         window=window_size,
+        n_samples=args.train_samples,
+        seed=args.seed,
         skip_nan=args.skip_nan,
         max_resample_attempts=args.skip_nan_attempts,
     )
@@ -1225,13 +1232,32 @@ if __name__ == '__main__':
     worker_count = 8
     if getattr(stack, "kind", None) == "raster":
         worker_count = 0
-    dl = DataLoader(
-        ds,
+    train_dl = DataLoader(
+        train_ds,
         batch_size=args.batch,
         shuffle=not args.button_inference,
         num_workers=worker_count,
         pin_memory=True,
     )
+
+    val_dl: Optional[DataLoader] = None
+    if not args.button_inference and args.val_samples > 0:
+        val_ds = SSLDataset(
+            stack,
+            window=window_size,
+            n_samples=args.val_samples,
+            seed=args.seed + 1,
+            skip_nan=args.skip_nan,
+            max_resample_attempts=args.skip_nan_attempts,
+        )
+        val_batch = args.val_batch if args.val_batch and args.val_batch > 0 else args.batch
+        val_dl = DataLoader(
+            val_ds,
+            batch_size=val_batch,
+            shuffle=False,
+            num_workers=worker_count,
+            pin_memory=True,
+        )
 
     model = MAEViT(
         in_chans=stack.count,
@@ -1287,7 +1313,7 @@ if __name__ == '__main__':
 
         model, history = train_ssl(
             model,
-            dl,
+            train_dl,
             epochs=args.epochs,
             lr=args.lr,
             optimizer=args.optimizer,
@@ -1300,6 +1326,7 @@ if __name__ == '__main__':
             use_ssim=args.use_ssim,
             checkpoint_epochs=checkpoint_epochs,
             checkpoint_callback=_save_checkpoint,
+            val_dataloader=val_dl,
         )
         if args.epochs not in checkpoint_epochs:
             _save_checkpoint(args.epochs, model, history)
@@ -1320,7 +1347,7 @@ if __name__ == '__main__':
         model.to(device)
         _generate_preview_inference(
             model,
-            dl,
+            train_dl,
             args.preview_samples,
             preview_dir,
             getattr(stack, 'feature_columns', None),

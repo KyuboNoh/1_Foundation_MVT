@@ -266,6 +266,54 @@ def clamp_coords_to_window(
     return clamped_rows, clamp_count
 
 
+def filter_valid_raster_coords(
+    stack: Any,
+    coords: Sequence[RegionCoord],
+    window: int,
+    *,
+    min_valid_fraction: float = 0.0,
+) -> Tuple[List[RegionCoord], List[RegionCoord]]:
+    """Remove coordinates whose patches contain no valid data."""
+    valid: List[RegionCoord] = []
+    invalid: List[RegionCoord] = []
+    min_valid_fraction = max(0.0, min(1.0, float(min_valid_fraction)))
+
+    for coord in coords:
+        try:
+            if hasattr(stack, "resolve_region_stack"):
+                region, row, col = coord
+                region_stack = stack.resolve_region_stack(region)
+            else:
+                region_stack = stack
+                if isinstance(coord, (tuple, list)) and len(coord) == 3:
+                    _, row, col = coord
+                elif isinstance(coord, (tuple, list)) and len(coord) == 2:
+                    row, col = coord
+                else:
+                    raise ValueError(f"Unsupported coordinate for validation: {coord!r}")
+            patch, mask = region_stack.read_patch_with_mask(int(row), int(col), int(window))
+        except Exception:
+            invalid.append(coord)
+            continue
+
+        patch = np.asarray(patch)
+        if patch.size == 0 or not np.isfinite(patch).any():
+            invalid.append(coord)
+            continue
+
+        mask_bool = np.asarray(mask).astype(bool, copy=False)
+        if mask_bool.shape != patch.shape[-2:]:
+            mask_bool = np.broadcast_to(mask_bool, patch.shape[-2:])
+        valid_fraction = 1.0 - (mask_bool.sum() / mask_bool.size)
+        if mask_bool.all() or valid_fraction < min_valid_fraction:
+            invalid.append(coord)
+            continue
+
+        valid.append(coord)
+
+    return valid, invalid
+
+
 class MultiRegionStack:
     """Region-aware wrapper that round-robins across multiple GeoStacks."""
 
@@ -736,3 +784,338 @@ def normalize_region_coord(coord: CoordLike, *, default_region: Optional[str] = 
 def region_coord_to_dict(coord: RegionCoord) -> Dict[str, int]:
     region, row, col = coord
     return {"region": str(region), "row": int(row), "col": int(col)}
+
+
+
+
+def resolve_search_root(path: Optional[Path]) -> Optional[Path]:
+    if path is None:
+        return None
+    resolved = path.resolve()
+    if resolved.is_file():
+        return resolved.parent
+    return resolved
+
+
+def load_training_args(stack_root: Optional[Path], encoder_path: Path) -> Tuple[Optional[Dict], Optional[Path]]:
+    candidates: List[Path] = []
+    root = resolve_search_root(stack_root)
+    if root is not None:
+        search_dirs = [root] + list(root.parents)
+        for base in search_dirs:
+            metadata_candidates = [base / 'training_metadata.json', base / 'assetization' / 'training_metadata.json']
+            for meta_candidate in metadata_candidates:
+                try:
+                    resolved_meta = meta_candidate.resolve()
+                except Exception:
+                    continue
+                if not resolved_meta.exists():
+                    continue
+                try:
+                    with resolved_meta.open('r', encoding='utf-8') as fh:
+                        meta_data = json.load(fh)
+                    pretraining_entry = meta_data.get('pretraining')
+                    if isinstance(pretraining_entry, dict):
+                        args_data = pretraining_entry.get('args')
+                        if isinstance(args_data, dict):
+                            merged_args = dict(args_data)
+                            features_override = pretraining_entry.get('features')
+                            if isinstance(features_override, list):
+                                merged_args['features'] = list(dict.fromkeys(str(f) for f in features_override))
+                            output_dir_val = pretraining_entry.get('output_dir')
+                            if output_dir_val:
+                                try:
+                                    out_path = Path(output_dir_val)
+                                    if not out_path.is_absolute():
+                                        out_path = (resolved_meta.parent / out_path).resolve()
+                                    ta_candidate = out_path / 'training_args_1_pretrain.json'
+                                    if ta_candidate.exists():
+                                        with ta_candidate.open('r', encoding='utf-8') as ta_fh:
+                                            ta_data = json.load(ta_fh)
+                                        if isinstance(ta_data, dict):
+                                            merged_args.update(
+                                                {k: v for k, v in ta_data.items() if k not in merged_args or k == 'features'}
+                                            )
+                                            features_ta = ta_data.get('features')
+                                            if isinstance(features_ta, list):
+                                                merged_args['features'] = list(dict.fromkeys(str(f) for f in features_ta))
+                                except Exception as exc:
+                                    print(f"[warn] Failed to read training_args_1_pretrain.json from metadata output_dir: {exc}")
+                            return merged_args, resolved_meta
+                except Exception as exc:
+                    print(f"[warn] Failed to read pretraining args from {resolved_meta}: {exc}")
+
+        direct_pretrain = root / 'training_args_1_pretrain.json'
+        direct_standard = root / 'training_args.json'
+        candidates.extend([direct_pretrain, direct_standard])
+        try:
+            for candidate in root.rglob('training_args_1_pretrain.json'):
+                candidates.append(candidate)
+            for candidate in root.rglob('training_args.json'):
+                candidates.append(candidate)
+        except Exception:
+            pass
+
+    encoder_dir = encoder_path.resolve().parent
+    candidates.append(encoder_dir / 'training_args_1_pretrain.json')
+    candidates.append(encoder_dir / 'training_args.json')
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            continue
+        if resolved in seen or not resolved.exists():
+            continue
+        seen.add(resolved)
+        try:
+            with resolved.open('r', encoding='utf-8') as fh:
+                data = json.load(fh)
+            return data, resolved
+        except Exception as exc:
+            print(f"[warn] Failed to load training args from {resolved}: {exc}")
+    return None, None
+
+
+def load_training_metadata(stack_root: Optional[Path], encoder_path: Path) -> Tuple[Optional[Dict], Optional[Path]]:
+    candidates: List[Path] = []
+    root = resolve_search_root(stack_root)
+    if root is not None:
+        search_dirs = [root] + list(root.parents)
+        for base in search_dirs:
+            for candidate in [base / 'training_metadata.json', base / 'assetization' / 'training_metadata.json']:
+                candidates.append(candidate)
+            try:
+                for candidate in base.rglob('training_metadata.json'):
+                    candidates.append(candidate)
+            except Exception:
+                pass
+
+    encoder_dir = encoder_path.resolve().parent
+    candidates.append(encoder_dir / 'training_metadata.json')
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            continue
+        if resolved in seen or not resolved.exists():
+            continue
+        seen.add(resolved)
+        try:
+            with resolved.open('r', encoding='utf-8') as fh:
+                return json.load(fh), resolved
+        except Exception as exc:
+            print(f"[warn] Failed to load training metadata from {resolved}: {exc}")
+    return None, None
+
+
+def mae_kwargs_from_training_args(args_dict: Dict) -> Dict:
+    mapping = {
+        'encoder_dim': 'embed_dim',
+        'encoder_depth': 'depth',
+        'encoder_num_heads': 'encoder_num_heads',
+        'mlp_ratio': 'mlp_ratio',
+        'mlp_ratio_decoder': 'mlp_ratio_dec',
+        'decoder_dim': 'dec_dim',
+        'decoder_depth': 'dec_depth',
+        'decoder_num_heads': 'decoder_num_heads',
+        'mask_ratio': 'mask_ratio',
+        'patch': 'patch_size',
+    }
+    mae_kwargs: Dict = {}
+    for src_key, dest_key in mapping.items():
+        if src_key not in args_dict or args_dict[src_key] is None:
+            continue
+        value = args_dict[src_key]
+        if dest_key in {
+            'embed_dim',
+            'depth',
+            'encoder_num_heads',
+            'dec_dim',
+            'dec_depth',
+            'decoder_num_heads',
+            'patch_size',
+        }:
+            value = int(value)
+        elif dest_key in {'mlp_ratio', 'mlp_ratio_dec', 'mask_ratio'}:
+            value = float(value)
+        mae_kwargs[dest_key] = value
+    window = args_dict.get('window')
+    if window is not None:
+        mae_kwargs['image_size'] = int(window)
+    return mae_kwargs
+
+
+def resolve_pretraining_patch(args_dict: Optional[Dict], fallback: int) -> int:
+    if not args_dict:
+        return fallback
+    for key in ('patch', 'window'):
+        value = args_dict.get(key)
+        if value is None:
+            continue
+        try:
+            patch_val = int(value)
+        except (TypeError, ValueError):
+            continue
+        if patch_val > 0:
+            return patch_val
+    return fallback
+
+
+def infer_region_from_name(path: Path) -> Optional[str]:
+    stem_parts = path.stem.split('_')
+    priority_codes = {'NA', 'AU', 'SA', 'EU', 'AS', 'AF', 'OC', 'GL', 'CA', 'US'}
+    for token in reversed(stem_parts):
+        up = token.upper()
+        if up in priority_codes:
+            return up
+    for token in reversed(stem_parts):
+        up = token.upper()
+        if up in {'GLOBAL', 'WORLD'}:
+            return 'GLOBAL'
+        if up.isalpha() and 1 <= len(up) <= 4:
+            return up
+    return None
+
+
+def resolve_label_rasters(
+    metadata: Optional[Dict],
+    metadata_path: Optional[Path],
+    label_column: str,
+) -> List[Dict[str, Any]]:
+    if not metadata or not metadata_path:
+        return []
+    labels_section = metadata.get('labels')
+    if not isinstance(labels_section, dict):
+        return []
+    entries = labels_section.get('entries')
+    if not isinstance(entries, dict):
+        return []
+    entry = entries.get(label_column)
+    if not isinstance(entry, dict):
+        return []
+    tif_entries = entry.get('tifs')
+    if not isinstance(tif_entries, list):
+        return []
+    base_dir = metadata_path.parent
+    resolved: List[Dict[str, Any]] = []
+    for tif_info in tif_entries:
+        if not isinstance(tif_info, dict):
+            continue
+        path_value = tif_info.get('path') or tif_info.get('filename')
+        if not path_value:
+            continue
+        tif_path = Path(path_value)
+        if not tif_path.is_absolute():
+            tif_path = (base_dir / tif_path).resolve()
+        if not tif_path.exists():
+            print(f"[warn] Label raster not found: {tif_path}")
+            continue
+        region = tif_info.get('region')
+        region_key = str(region or _infer_region_from_name(tif_path) or 'GLOBAL').upper()
+        resolved.append({"path": tif_path, "region": region_key})
+    return resolved
+
+
+def collect_feature_rasters(
+    metadata: Optional[Dict],
+    metadata_path: Optional[Path],
+    feature_names: Optional[Sequence[str]],
+) -> Dict[str, List[Path]]:
+    if not metadata or not metadata_path:
+        return {}
+    features_section = metadata.get('features')
+    if not isinstance(features_section, dict):
+        return {}
+    entries = features_section.get('entries')
+    if not isinstance(entries, dict):
+        return {}
+    base_dir = metadata_path.parent
+
+    def _lookup(name: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+        if name in entries:
+            return name, entries[name]
+        lowered = name.lower()
+        for key, value in entries.items():
+            if key.lower() == lowered:
+                return key, value
+        return None
+
+    ordered_features: List[str]
+    if feature_names:
+        ordered_features = list(feature_names)
+    else:
+        ordered_features = sorted(entries.keys(), key=str.lower)
+
+    region_map: Dict[str, Dict[str, List[Path]]] = {}
+    for feature_name in ordered_features:
+        match = _lookup(feature_name)
+        if match is None:
+            print(f"[warn] Feature '{feature_name}' missing from training_metadata.json entries.")
+            continue
+        canonical_name, entry = match
+        tif_records = entry.get('tifs', [])
+        if not isinstance(tif_records, list):
+            continue
+        for record in tif_records:
+            if not isinstance(record, dict):
+                continue
+            path_value = record.get('path') or record.get('filename')
+            if not path_value:
+                continue
+            tif_path = Path(path_value)
+            if not tif_path.is_absolute():
+                tif_path = (base_dir / tif_path).resolve()
+            else:
+                tif_path = tif_path.resolve()
+            if not tif_path.exists():
+                print(f"[warn] Feature raster not found: {tif_path}")
+                continue
+            region = record.get('region')
+            region_key = str(region or _infer_region_from_name(tif_path) or 'GLOBAL').upper()
+            region_map.setdefault(region_key, {}).setdefault(canonical_name, []).append(tif_path)
+
+    usable: Dict[str, List[Path]] = {}
+    for region, feature_map in region_map.items():
+        missing = [name for name in ordered_features if name not in feature_map]
+        if missing:
+            continue
+        ordered_paths: List[Path] = []
+        for name in ordered_features:
+            paths = feature_map.get(name)
+            if not paths:
+                break
+            ordered_paths.extend(sorted(paths, key=lambda p: p.name))
+        if len(ordered_paths) == sum(len(feature_map[name]) for name in ordered_features if name in feature_map):
+            usable[region] = ordered_paths
+    return usable
+
+
+def read_stack_patch(stack: Any, coord: Any, window: int) -> np.ndarray:
+
+    if hasattr(stack, "resolve_region_stack"):
+        default_region = getattr(stack, "default_region", None)
+        if default_region is None:
+            regions = getattr(stack, "regions", [])
+            default_region = regions[0] if regions else "GLOBAL"
+        region, row, col = normalize_region_coord(coord, default_region=default_region)
+        region_stack = stack.resolve_region_stack(region)
+        return region_stack.read_patch(row, col, window)
+
+    if isinstance(coord, dict):
+        row = coord.get("row")
+        col = coord.get("col")
+        if row is None or col is None:
+            raise ValueError(f"Coordinate dictionary missing row/col: {coord}")
+        return stack.read_patch(int(row), int(col), window)
+
+    if isinstance(coord, (tuple, list)) and len(coord) == 3:
+        _, row, col = coord
+        return stack.read_patch(int(row), int(col), window)
+
+    row, col = coord
+    return stack.read_patch(int(row), int(col), window)
+
