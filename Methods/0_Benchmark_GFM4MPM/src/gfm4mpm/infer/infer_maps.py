@@ -309,6 +309,18 @@ def write_prediction_outputs(
             boundary_mask=boundary_mask,
             pos_coords=region_positions,
         )
+        save_png2(
+            summary_png, 
+            masked_mean,
+            std_png,
+            masked_std,
+            cmap1="blue_to_yellow",
+            cmap2="gray",
+            criteria=0.25,
+            valid_mask=valid_mask,
+            boundary_mask=boundary_mask,
+            pos_coords=region_positions,
+        )
         print(f"Wrote {mean_path}, {std_path}, summary PNG {summary_png}, and std PNG {std_png}")
 
 
@@ -426,3 +438,128 @@ def save_png(
     ax.set_aspect("equal")
     fig.savefig(path, bbox_inches="tight", pad_inches=0)
     plt.close(fig)
+
+
+def _resolve_cmap(name: Optional[str], fallback: str):
+    from matplotlib import pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap
+
+    if name is None:
+        return plt.get_cmap(fallback)
+
+    try:
+        return plt.get_cmap(name)
+    except ValueError:
+        alias: Dict[str, LinearSegmentedColormap] = {
+            "blue_to_yellow": LinearSegmentedColormap.from_list(
+                "blue_to_yellow",
+                ["#08306B", "#2879B9", "#4EB3D3", "#FFFFD9"],
+            ),
+            "blue-yellow": LinearSegmentedColormap.from_list(
+                "blue-yellow",
+                ["#08306B", "#2879B9", "#4EB3D3", "#FFFFD9"],
+            ),
+        }
+        cmap = alias.get(name.lower())
+        if cmap is not None:
+            return cmap
+        try:
+            return plt.get_cmap(fallback)
+        except ValueError:
+            return plt.get_cmap("viridis")
+
+
+def save_png2(
+    summary_path: Path,
+    summary_array: np.ndarray,
+    std_path: Path,
+    std_array: np.ndarray,
+    cmap1: str = "viridis",
+    cmap2: str = "gray",
+    vmin: Optional[float] = None,
+    vmax: float = 1.0,
+    criteria: Optional[float] = None,
+    valid_mask: np.ndarray = None,
+    boundary_mask: np.ndarray = None,
+    pos_coords: Sequence[Tuple[int, int]] = None,
+) -> None:
+    summary_path = Path(summary_path)
+    std_path = Path(std_path)
+
+    summary = np.asarray(summary_array, dtype=np.float32)
+    std = np.asarray(std_array, dtype=np.float32)
+
+    if valid_mask is not None and valid_mask.shape == summary.shape:
+        summary = np.where(valid_mask, summary, np.nan)
+        std = np.where(valid_mask, std, np.nan)
+
+    summary_raw = summary.copy()
+    threshold = criteria if criteria is not None else (vmin if vmin is not None else 0.0)
+    threshold = float(max(0.0, min(threshold, 1.0)))
+
+    summary_display = np.clip(summary.copy(), None, 1.0)
+    if threshold > 0.0:
+        mask_below = ~(np.isfinite(summary_display) & (summary_display >= threshold))
+        summary_display[mask_below] = np.nan
+
+    std_display = std.copy()
+    valid_summary = np.isfinite(summary_raw)
+    high_mask = valid_summary & (summary_raw >= threshold)
+    std_display[~valid_summary] = np.nan
+    std_display[high_mask] = np.nan
+
+    import matplotlib
+    if matplotlib.get_backend().lower() != "agg":
+        matplotlib.use("Agg", force=True)
+    from matplotlib import pyplot as plt
+
+    cmap_summary = _resolve_cmap(cmap1, "viridis")
+    cmap_std = _resolve_cmap(cmap2, "gray")
+
+    height, width = summary_display.shape
+    dpi = 100
+    fig_w = max(width / dpi, 1e-2)
+    fig_h = max(height / dpi, 1e-2)
+
+    def _plot(path_obj: Path, data: np.ndarray, cmap, vmin_local=None, vmax_local=None):
+        masked_data = np.ma.array(data, mask=~np.isfinite(data))
+        if vmin_local is None:
+            finite_vals = data[np.isfinite(data)]
+            vmin_local = float(finite_vals.min()) if finite_vals.size else None
+        if vmax_local is None:
+            finite_vals = data[np.isfinite(data)]
+            vmax_local = float(finite_vals.max()) if finite_vals.size else None
+
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
+        ax.axis("off")
+        ax.imshow(masked_data, cmap=cmap, vmin=vmin_local, vmax=vmax_local)
+        if boundary_mask is not None and boundary_mask.shape == data.shape and boundary_mask.any():
+            ax.contour(boundary_mask.astype(np.uint8), levels=[0.5], colors="white", linewidths=0.8)
+        if pos_coords:
+            coords_arr = np.asarray(pos_coords, dtype=np.float32)
+            if coords_arr.ndim == 2 and coords_arr.size:
+                ys = np.clip(coords_arr[:, 0] + 0.5, 0.0, height - 0.5)
+                xs = np.clip(coords_arr[:, 1] + 0.5, 0.0, width - 0.5)
+                ax.scatter(
+                    xs,
+                    ys,
+                    s=18,
+                    c="cyan",
+                    edgecolors="black",
+                    linewidths=0.4,
+                    marker="o",
+                    zorder=5,
+                )
+        ax.set_xlim(-0.5, width - 0.5)
+        ax.set_ylim(height - 0.5, -0.5)
+        ax.set_aspect("equal")
+        fig.savefig(path_obj, bbox_inches="tight", pad_inches=0)
+        plt.close(fig)
+
+    vmax_summary = min(1.0, vmax if vmax is not None else 1.0)
+    summary_vmin = threshold if threshold > 0.0 else vmin
+    _plot(summary_path, summary_display, cmap_summary, vmin_local=summary_vmin, vmax_local=vmax_summary)
+
+    std_finite = std_display[np.isfinite(std_display)]
+    std_vmax = float(std_finite.max()) if std_finite.size else None
+    _plot(std_path, std_display, cmap_std, vmin_local=0.0, vmax_local=std_vmax)

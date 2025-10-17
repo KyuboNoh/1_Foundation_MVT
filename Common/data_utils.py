@@ -13,7 +13,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 import numpy as np
 
 _THIS_DIR = Path(__file__).resolve().parent
-_PROJECT_ROOT = (_THIS_DIR / "Methods" / "0_Benchmark_GFM4MPM").resolve()
+_PROJECT_ROOT = (_THIS_DIR.parent / "Methods" / "0_Benchmark_GFM4MPM").resolve()
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
@@ -140,6 +140,196 @@ def load_split_stack(
         label_paths=label_paths_by_region,
         mode="raster",
     )
+
+
+def TwoD_data_TwoD_label_neighbor_stats(values: np.ndarray, valid_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Compute neighbour sums and counts for a 2D grid (8-connected)."""
+    padded_vals = np.pad(values, 1, mode="constant", constant_values=np.nan)
+    padded_valid = np.pad(valid_mask.astype(np.uint8), 1, mode="constant", constant_values=0)
+    sums = np.zeros_like(values, dtype=np.float64)
+    counts = np.zeros_like(values, dtype=np.int16)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dy == 0 and dx == 0:
+                continue
+            window_vals = padded_vals[1 + dy : 1 + dy + values.shape[0], 1 + dx : 1 + dx + values.shape[1]]
+            window_mask = padded_valid[1 + dy : 1 + dy + values.shape[0], 1 + dx : 1 + dx + values.shape[1]].astype(bool)
+            sums += np.where(window_mask, window_vals, 0.0)
+            counts += window_mask.astype(np.int16)
+    return sums, counts
+
+
+def TwoD_data_TwoD_label_infer_raster_kind(
+    values: np.ndarray,
+    *,
+    dtype: Optional[np.dtype] = None,
+    max_unique: int = 32,
+    integer_tolerance: float = 1e-6,
+) -> tuple[str, Optional[List[float]]]:
+    """Infer whether a raster should be treated as categorical or continuous."""
+    if values.size == 0:
+        return "empty", None
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return "empty", None
+    dtype = np.dtype(dtype) if dtype is not None else values.dtype
+    unique_values = np.unique(finite)
+    if unique_values.size <= max_unique:
+        if np.issubdtype(dtype, np.integer):
+            return "categorical", unique_values.astype(int).tolist()
+        rounded = np.round(unique_values)
+        if np.all(np.abs(unique_values - rounded) <= integer_tolerance):
+            return "categorical", rounded.astype(int).tolist()
+    return "continuous", None
+
+
+def TwoD_data_TwoD_label_fill_missing(
+    grid: np.ndarray,
+    *,
+    valid_mask: np.ndarray,
+    max_iterations: int = 6,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Impute missing cells using neighbour averages."""
+    filled = grid.copy()
+    valid = valid_mask.copy()
+    for _ in range(max_iterations):
+        if valid.all():
+            break
+        neighbour_sum, neighbour_count = TwoD_data_TwoD_label_neighbor_stats(filled, valid)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            neighbour_mean = np.divide(neighbour_sum, neighbour_count, where=neighbour_count > 0)
+        fill_mask = (~valid) & (neighbour_count > 0)
+        if not fill_mask.any():
+            break
+        filled[fill_mask] = neighbour_mean[fill_mask]
+        valid[fill_mask] = True
+    return filled, valid
+
+
+def TwoD_data_TwoD_label_smooth_grid(
+    grid: np.ndarray,
+    *,
+    iterations: int = 1,
+) -> np.ndarray:
+    """Apply simple neighbour smoothing to a 2D grid."""
+    smoothed = grid.copy()
+    for _ in range(max(iterations, 0)):
+        neighbour_sum, neighbour_count = TwoD_data_TwoD_label_neighbor_stats(smoothed, np.isfinite(smoothed))
+        total_sum = neighbour_sum + smoothed
+        total_count = neighbour_count + 1
+        with np.errstate(divide="ignore", invalid="ignore"):
+            smoothed = np.divide(total_sum, total_count, where=total_count > 0)
+    return smoothed
+
+
+def TwoD_data_TwoD_label_normalize_raster(
+    array: np.ndarray,
+    *,
+    nodata: Optional[float] = None,
+    dtype: Optional[np.dtype] = None,
+    fill_iterations: int = 6,
+    smoothing_iterations: int = 1,
+) -> tuple[np.ndarray, Dict[str, Any]]:
+    """Normalise a 2D raster band using outlier clipping, imputation, and scaling."""
+    if array.ndim != 2:
+        raise ValueError("TwoD_data_TwoD_label_normalize_raster expects a 2D array.")
+    original = np.array(array, copy=True)
+    dtype = np.dtype(dtype) if dtype is not None else original.dtype
+    mask = np.isfinite(original)
+    if nodata is not None:
+        mask &= original != nodata
+    finite_values = original[mask]
+    if finite_values.size == 0:
+        return original.astype(np.float32), {
+            "kind": "empty",
+            "dtype": str(dtype),
+            "nodata": float(nodata) if nodata is not None else None,
+            "scaling": None,
+            "categories": None,
+        }
+
+    kind, categories = TwoD_data_TwoD_label_infer_raster_kind(finite_values, dtype=dtype)
+    if kind == "categorical":
+        categorical = original.copy()
+        categorical[~mask] = nodata if nodata is not None else 0
+        info: Dict[str, Any] = {
+            "kind": "categorical",
+            "dtype": str(dtype),
+            "nodata": float(nodata) if nodata is not None else None,
+            "categories": categories or [],
+            "scaling": None,
+        }
+        return categorical.astype(dtype), info
+
+    working = original.astype(np.float64)
+    working[~mask] = np.nan
+
+    q1 = np.nanpercentile(working, 25)
+    q3 = np.nanpercentile(working, 75)
+    iqr = q3 - q1
+    if np.isfinite(iqr) and iqr > 0:
+        upper = q3 + 1.5 * iqr
+        p975 = np.nanpercentile(working, 97.5)
+        capped = np.clip(working, None, upper)
+        working = np.where(capped > upper, p975, capped)
+
+    filled, valid = TwoD_data_TwoD_label_fill_missing(working, valid_mask=np.isfinite(working), max_iterations=fill_iterations)
+    still_nan = np.isnan(filled)
+    if still_nan.any():
+        filled[still_nan] = np.nanmedian(filled)
+
+    if smoothing_iterations > 0:
+        filled = TwoD_data_TwoD_label_smooth_grid(filled, iterations=smoothing_iterations)
+
+    mean = float(np.nanmean(filled))
+    std = float(np.nanstd(filled))
+    if std <= 0 or not np.isfinite(std):
+        std = 1.0
+    normalized = (filled - mean) / std
+    normalized = normalized.astype(np.float32)
+
+    info = {
+        "kind": "continuous",
+        "dtype": "float32",
+        "nodata": None,
+        "categories": None,
+        "scaling": {"mean": mean, "std": std},
+        "filled_fraction": float(valid.sum()) / float(valid.size),
+    }
+    return normalized, info
+
+
+def TwoD_data_TwoD_label_rasterize_labels(
+    geometries: Iterable,
+    *,
+    template_profile: Dict[str, Any],
+    burn_value: float = 1.0,
+    dtype: str = "uint8",
+    fill_value: float = 0.0,
+    all_touched: bool = True,
+) -> np.ndarray:
+    """Rasterize vector geometries onto a template raster grid."""
+    from rasterio import features
+
+    height = template_profile.get("height")
+    width = template_profile.get("width")
+    transform = template_profile.get("transform")
+    if height is None or width is None or transform is None:
+        raise ValueError("Template profile must supply 'height', 'width', and 'transform'.")
+
+    shapes = [(geom, burn_value) for geom in geometries if geom is not None]
+    if not shapes:
+        return np.zeros((height, width), dtype=np.dtype(dtype))
+
+    raster = features.rasterize(
+        shapes,
+        out_shape=(int(height), int(width)),
+        transform=transform,
+        fill=fill_value,
+        dtype=dtype,
+        all_touched=all_touched,
+    )
+    return raster
 
 
 def clamp_coords_to_window(
@@ -1118,4 +1308,3 @@ def read_stack_patch(stack: Any, coord: Any, window: int) -> np.ndarray:
 
     row, col = coord
     return stack.read_patch(int(row), int(col), window)
-

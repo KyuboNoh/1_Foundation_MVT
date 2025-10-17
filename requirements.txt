@@ -29,6 +29,7 @@ zarr
 pystac[validation]
 datashader
 h3
+fiona
 
 # ---- Backbone (ML) ----
 torch

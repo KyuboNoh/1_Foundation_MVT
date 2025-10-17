@@ -1,16 +1,12 @@
 
 #!/usr/bin/env python3
 # stacify_bc.py
-# Robust utilities to convert BC raster/vector data into a STAC catalog.
-#
-# Requirements:
-#   pip install pystac rasterio rio-cogeo geopandas pyogrio shapely pyarrow
+# Robust utilities to convert raster/vector data into a STAC catalog.
 #
 # Example:
-#   python stacify_bc_data.py  --raw-dir /home/qubuntu25/Desktop/Data/BCGS/AppendixB/   --out /home/qubuntu25/Desktop/Data/BCGS/   --collection-id bc-raw   --license "CC-BY-4.0"   --keywords MVT SEDEX British_Columbia   --cogify   --target-crs EPSG:3005   --validate
-#   python stacify_bc_data.py  --raw-dir /home/qubuntu25/Desktop/Data/BCGS/AppendixB_light/   --out /home/qubuntu25/Desktop/Data/BCGS/   --collection-id bc-raw   --license "CC-BY-4.0"   --keywords MVT SEDEX British_Columbia   --cogify   --target-crs EPSG:3005   --validate
-# Author: ChatGPT
-# Date: 2025-09-22
+#   python stacify_bc_data.py  --raw-dir /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/bc-raw/raw/ --label /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/bc-raw/raw/NEBC_MVT_TP.shp  --out /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/   --collection-id bc-raw   --license "CC-BY-4.0"   --keywords MVT British_Columbia   --cogify   --validate 
+# Author: ChatGPT, Kyubo Noh
+# Date: 2025-09-22 (Updated on 2025-10-01)
 
 import argparse
 import os
@@ -23,6 +19,17 @@ from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone
 
 import numpy as np
+
+# Shared utilities for 2D raster/label pipelines.
+from Common.data_utils import (
+    TwoD_data_TwoD_label_normalize_raster,
+    TwoD_data_TwoD_label_rasterize_labels,
+)
+from Common.metadata_generation_label_GeoJSON import generate_label_geojson
+from Common.metadata_generation_training import generate_training_metadata
+
+# Ensure GDAL-based readers can rebuild missing shapefile .shx indices automatically.
+os.environ.setdefault("SHAPE_RESTORE_SHX", "YES")
 
 
 TABLE_EXT = "https://stac-extensions.github.io/table/v1.2.0/schema.json"
@@ -257,11 +264,27 @@ def raster_item_from_tif(tif_path: Path, item_id: Optional[str] = None, asset_hr
 
         return item
 
+def _read_vector_file(vector_path: Path):
+    gpd = _require_geopandas()
+    try:
+        return gpd.read_file(vector_path)
+    except Exception as exc:
+        # Restore missing .shx sidecars for shapefiles on the fly so GDAL can read them.
+        if vector_path.suffix.lower() == ".shp" and not vector_path.with_suffix(".shx").exists():
+            try:
+                import fiona
+                with fiona.Env(SHAPE_RESTORE_SHX="YES"):
+                    return gpd.read_file(vector_path)
+            except Exception:
+                pass
+        raise exc
+
+
 def vector_to_geoparquet(vector_path: Path, out_dir: Path, target_crs: Optional[str] = None) -> Path:
     gpd = _require_geopandas()
     ensure_dir(out_dir)
     gpq_path = out_dir / (vector_path.stem + ".parquet")
-    gdf = gpd.read_file(vector_path)
+    gdf = _read_vector_file(vector_path)
     if target_crs:
         try:
             gdf = gdf.to_crs(target_crs)
@@ -598,23 +621,95 @@ def build_collection(collection_id: str,
 def add_raster_assets(collection,
                       files: List[Path],
                       out_asset_dir: Path,
-                      cogify: bool = True) -> List[Dict[str, Path]]:
-
+                      cogify: bool = True,
+                      normalize: bool = False) -> List[Dict[str, Path]]:
     ensure_dir(out_asset_dir)
     thumb_dir = out_asset_dir / "thumbnails"
     mods = _require_pystac()
     Link = mods["Link"]
     Asset = mods["Asset"]
+    rasterio = _require_rasterio()
 
     products = []
     for tif in files:
         try:
             asset_path = out_asset_dir / (tif.stem + "_cog.tif") if cogify else out_asset_dir / tif.name
-            if cogify:
-                to_cog(tif, asset_path)
+            band_infos: List[Dict[str, object]] = []
+            profile_summary: Dict[str, object] = {}
+
+            if normalize:
+                with rasterio.open(tif) as src:
+                    profile = src.profile.copy()
+                    arrays: List[np.ndarray] = []
+                    for band_index in range(1, src.count + 1):
+                        band = src.read(band_index)
+                        band_nodata = None
+                        if src.nodatavals and band_index - 1 < len(src.nodatavals):
+                            band_nodata = src.nodatavals[band_index - 1]
+                        elif src.nodata is not None:
+                            band_nodata = src.nodata
+                        band_dtype = src.dtypes[band_index - 1] if src.dtypes else band.dtype
+                        normalized_band, info = TwoD_data_TwoD_label_normalize_raster(
+                            band,
+                            nodata=band_nodata,
+                            dtype=band_dtype,
+                        )
+                        arrays.append(normalized_band)
+                        band_infos.append(info)
+                    if not arrays:
+                        raise RuntimeError(f"No bands could be read from raster {tif}")
+
+                    output_dtype = arrays[0].dtype if arrays else profile.get("dtype", "float32")
+                    if isinstance(output_dtype, np.dtype):
+                        output_dtype = output_dtype.name
+                    profile.update(
+                        dtype=output_dtype,
+                        count=len(arrays),
+                        nodata=None if not band_infos else band_infos[0].get("nodata"),
+                    )
+                    tmp_path = asset_path.parent / f".tmp_{asset_path.name}"
+                    ensure_dir(tmp_path.parent)
+                    try:
+                        with rasterio.open(tmp_path, "w", **profile) as dst:
+                            data_stack = np.stack(arrays, axis=0)
+                            dst.write(data_stack)
+                        to_cog(tmp_path, asset_path)
+                    finally:
+                        try:
+                            tmp_path.unlink()
+                        except FileNotFoundError:
+                            pass
+                    profile_summary = {
+                        "width": profile.get("width"),
+                        "height": profile.get("height"),
+                        "transform": profile.get("transform"),
+                        "crs": profile.get("crs"),
+                        "dtype": profile.get("dtype"),
+                        "nodata": profile.get("nodata"),
+                    }
             else:
-                if tif.resolve() != asset_path.resolve():
-                    shutil.copy2(tif, asset_path)
+                if cogify:
+                    to_cog(tif, asset_path)
+                else:
+                    if tif.resolve() != asset_path.resolve():
+                        shutil.copy2(tif, asset_path)
+                with rasterio.open(asset_path) as asset_src:
+                    profile_summary = {
+                        "width": asset_src.width,
+                        "height": asset_src.height,
+                        "transform": asset_src.transform,
+                        "crs": asset_src.crs,
+                        "dtype": asset_src.dtypes[0] if asset_src.dtypes else asset_src.profile.get("dtype"),
+                        "nodata": asset_src.nodatavals[0] if asset_src.nodatavals else asset_src.nodata,
+                    }
+                    for band_index in range(1, asset_src.count + 1):
+                        band_infos.append({
+                            "kind": "continuous",
+                            "dtype": str(asset_src.dtypes[band_index - 1]) if asset_src.dtypes else str(asset_src.profile.get("dtype")),
+                            "nodata": asset_src.nodatavals[band_index - 1] if asset_src.nodatavals else asset_src.nodata,
+                            "categories": None,
+                            "scaling": None,
+                        })
 
             item = raster_item_from_tif(asset_path)
             item.add_link(Link(rel="derived_from", target=str(tif.resolve()), media_type=guess_mimetype(tif)))
@@ -631,15 +726,186 @@ def add_raster_assets(collection,
                 item.add_asset("thumbnail", thumb_asset)
 
             collection.add_item(item)
-            products.append({
+            product_entry: Dict[str, object] = {
                 "item": item,
                 "source_path": tif,
-                "asset_path": asset_path
-            })
+                "asset_path": asset_path,
+                "feature": tif.stem,
+                "band_details": band_infos,
+                "profile": profile_summary,
+            }
+            if band_infos:
+                primary = band_infos[0]
+                product_entry["kind"] = primary.get("kind", "continuous")
+                if primary.get("categories"):
+                    product_entry["categories"] = list(primary["categories"])  # type: ignore[index]
+                if primary.get("scaling"):
+                    product_entry["scaling"] = dict(primary["scaling"])  # type: ignore[arg-type]
+            if thumb:
+                product_entry["quicklook_path"] = Path(thumb)
+            product_entry.setdefault("is_label", False)
+            products.append(product_entry)
             logging.info(f"Added raster item: {item.id}")
         except Exception as e:
             logging.exception(f"Failed to add raster {tif}: {e}")
     return products
+
+
+def add_label_raster_assets(collection,
+                            label_paths: List[Path],
+                            out_asset_dir: Path,
+                            template_profile: Optional[Dict[str, object]]) -> List[Dict[str, object]]:
+    """Rasterize label shapefiles onto the feature grid and register them as STAC items."""
+    if not label_paths:
+        return []
+    if not template_profile:
+        logging.warning("No feature raster profile available; skipping label rasterization.")
+        return []
+
+    required_keys = {"width", "height", "transform", "crs"}
+    if any(template_profile.get(key) is None for key in required_keys):
+        logging.warning("Template profile missing required keys %s; skipping label rasters.", required_keys)
+        return []
+
+    ensure_dir(out_asset_dir)
+    thumb_dir = out_asset_dir / "thumbnails"
+    rasterio = _require_rasterio()
+    gpd = _require_geopandas()
+    mods = _require_pystac()
+    Link = mods["Link"]
+    Asset = mods["Asset"]
+
+    height = int(template_profile["height"])  # type: ignore[arg-type]
+    width = int(template_profile["width"])  # type: ignore[arg-type]
+    transform = template_profile["transform"]
+    crs = template_profile["crs"]
+
+    products: List[Dict[str, object]] = []
+    for label_path in label_paths:
+        try:
+            gdf = gpd.read_file(label_path)
+            if gdf.empty:
+                logging.warning("Label shapefile %s contains no features; skipping.", label_path)
+                continue
+            if crs is not None:
+                try:
+                    gdf = gdf.to_crs(crs)
+                except Exception as exc:
+                    logging.warning("Failed to reproject %s to feature CRS; using original geometry. %s", label_path, exc)
+
+            raster = TwoD_data_TwoD_label_rasterize_labels(
+                gdf.geometry,
+                template_profile={
+                    "height": height,
+                    "width": width,
+                    "transform": transform,
+                },
+                burn_value=1.0,
+                dtype="uint8",
+                fill_value=0.0,
+                all_touched=True,
+            )
+
+            label_stem = Path(label_path).stem
+            tmp_path = out_asset_dir / f".tmp_{label_stem}_labels.tif"
+            asset_path = out_asset_dir / f"{label_stem}_label_cog.tif"
+            profile = {
+                "driver": "GTiff",
+                "height": height,
+                "width": width,
+                "count": 1,
+                "dtype": "uint8",
+                "crs": crs,
+                "transform": transform,
+                "nodata": 0,
+            }
+            ensure_dir(tmp_path.parent)
+            try:
+                with rasterio.open(tmp_path, "w", **profile) as dst:
+                    dst.write(raster[np.newaxis, ...].astype("uint8"))
+                to_cog(tmp_path, asset_path)
+            finally:
+                try:
+                    tmp_path.unlink()
+                except FileNotFoundError:
+                    pass
+
+            item = raster_item_from_tif(asset_path)
+            item.add_link(Link(rel="derived_from", target=str(label_path.resolve()), media_type=guess_mimetype(label_path)))
+
+            thumb_path = thumb_dir / f"{asset_path.stem}.png"
+            thumb = generate_raster_thumbnail(asset_path, thumb_path)
+            if thumb:
+                thumb_asset = Asset(
+                    href=str(thumb),
+                    media_type="image/png",
+                    roles=["thumbnail"],
+                    title=f"Thumbnail for {item.id}"
+                )
+                item.add_asset("thumbnail", thumb_asset)
+
+            collection.add_item(item)
+            product_entry: Dict[str, object] = {
+                "item": item,
+                "source_path": Path(label_path),
+                "asset_path": asset_path,
+                "feature": label_stem,
+                "is_label": True,
+                "kind": "categorical",
+                "categories": [0, 1],
+                "profile": {
+                    "width": width,
+                    "height": height,
+                    "transform": transform,
+                    "crs": crs,
+                    "dtype": "uint8",
+                    "nodata": 0,
+                },
+            }
+            if thumb:
+                product_entry["quicklook_path"] = Path(thumb)
+            products.append(product_entry)
+            logging.info("Added label raster item: %s", item.id)
+        except Exception as exc:
+            logging.exception("Failed to rasterize label %s: %s", label_path, exc)
+    return products
+
+
+def _prepare_label_parquet(label_path: Path,
+                           out_dir: Path,
+                           label_column: Optional[str] = None) -> Optional[Tuple[Path, str, str, str]]:
+    """Convert a label shapefile into a Parquet table with latitude/longitude."""
+    gpd = _require_geopandas()
+    ensure_dir(out_dir)
+    try:
+        gdf = gpd.read_file(label_path)
+    except Exception as exc:
+        logging.warning("Failed to read label shapefile %s: %s", label_path, exc)
+        return None
+    if gdf.empty:
+        logging.warning("Label shapefile %s has no rows; skipping Parquet export.", label_path)
+        return None
+
+    try:
+        gdf_ll = gdf.to_crs(4326)
+    except Exception:
+        gdf_ll = gdf
+
+    column_name = label_column or "label_value"
+    lat_column = "Latitude"
+    lon_column = "Longitude"
+    gdf_ll[column_name] = 1.0
+    gdf_ll[lat_column] = gdf_ll.geometry.y
+    gdf_ll[lon_column] = gdf_ll.geometry.x
+
+    parquet_path = out_dir / f"{Path(label_path).stem}_labels.parquet"
+    try:
+        gdf_ll.to_parquet(parquet_path, index=False)
+    except Exception as exc:
+        logging.warning("Failed to write label Parquet %s: %s", parquet_path, exc)
+        return None
+    return parquet_path, column_name, lat_column, lon_column
+
 
 def add_vector_assets(collection,
                       vector_files: List[Path],
@@ -729,11 +995,13 @@ def main():
     parser.add_argument("--description", type=str, default="BC rasters and vectors registered in STAC.", help="Catalog description.")
     parser.add_argument("--license", type=str, default="proprietary", help="License string, e.g., CC-BY-4.0.")
     parser.add_argument("--keywords", type=str, nargs="*", default=[], help="Optional keywords for the collection.")
-    parser.add_argument("--cogify", action="store_true", help="Convert rasters to Cloud-Optimized GeoTIFFs.")
     parser.add_argument("--target-crs", type=str, default=None, help="Optional target CRS for vectors (e.g., EPSG:3005).")
+    parser.add_argument("--label", action="append", default=[], help="Path to a label shapefile (can be repeated).")
+    parser.add_argument("--label-column", type=str, default=None, help="Optional attribute name to treat as the label value when generating GeoJSON outputs.")
     parser.add_argument("--assets-subdir", type=str, default="assets", help="Subdirectory (under OUT) for asset files.")
     parser.add_argument("--validate", action="store_true", help="Run STAC validation before saving.")
     parser.add_argument("--source-url", type=str, default=None, help="Optional source data portal URL for lineage links.")
+    parser.add_argument("--cogify", action="store_true", help="Convert rasters to Cloud-Optimized GeoTIFFs.")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -782,17 +1050,74 @@ def main():
                 encoding="utf-8",
             )
 
-    ignore_roots = [asset_dir, collection_root]
+    # Only ignore generated asset outputs to avoid re-ingesting them;
+    # leave the broader collection root available so raw_dir can live inside it.
+    ignore_roots = [asset_dir]
     rasters, vector_sources = scan_files(raw_dir, ignore_roots=ignore_roots)
     logging.info(f"Found {len(rasters)} rasters and {len(vector_sources)} vector files in {raw_dir}")
 
-    raster_items = add_raster_assets(coll, rasters, asset_dir / "rasters", cogify=args.cogify)
+    label_paths: List[Path] = []
+    for label_arg in args.label or []:
+        candidate = Path(label_arg)
+        if candidate.exists():
+            label_paths.append(candidate)
+        else:
+            logging.warning("Label path %s not found; skipping.", candidate)
+
+    raster_items = add_raster_assets(
+        coll,
+        rasters,
+        asset_dir / "rasters",
+        cogify=args.cogify,
+        normalize=True,
+    )
+
+    template_profile: Optional[Dict[str, object]] = None
+    for product in raster_items:
+        profile_candidate = product.get("profile")
+        if isinstance(profile_candidate, dict) and all(
+            profile_candidate.get(key) is not None for key in ("width", "height", "transform")
+        ):
+            template_profile = profile_candidate
+            break
+
+    label_items = add_label_raster_assets(
+        coll,
+        label_paths,
+        asset_dir / "labels",
+        template_profile,
+    )
+
     vector_items = add_vector_assets(coll, vector_sources, asset_dir / "vectors", target_crs=args.target_crs)
 
-    update_collection_summaries(coll, raster_items + vector_items)
-    build_collection_level_assets(coll, raster_items, vector_items, asset_dir)
+    if label_paths:
+        parquet_dir = asset_dir / "labels" / "tables"
+        geojson_dir = asset_dir / "labels" / "geojson"
+        ensure_dir(parquet_dir)
+        ensure_dir(geojson_dir)
+        for label_path in label_paths:
+            parquet_info = _prepare_label_parquet(label_path, parquet_dir, label_column=args.label_column)
+            if parquet_info is None:
+                continue
+            parquet_path, label_col, lat_col, lon_col = parquet_info
+            try:
+                generate_label_geojson(
+                    parquet_path,
+                    geojson_dir,
+                    label_column=label_col,
+                    lat_column=lat_col,
+                    lon_column=lon_col,
+                )
+            except Exception as exc:
+                logging.warning("Failed to generate label GeoJSON for %s: %s", label_path, exc)
+
+    update_collection_summaries(coll, raster_items + label_items + vector_items)
+    build_collection_level_assets(coll, raster_items + label_items, vector_items, asset_dir)
 
     cat.add_child(coll)
+
+    # Populate hrefs before validation so schema checks see fully-qualified links.
+    coll.normalize_hrefs(str(collection_root))
 
     reset_io = None
     if args.validate:
@@ -809,8 +1134,36 @@ def main():
     if reset_io:
         reset_io()
 
-    catalog_href = out_dir / f"catalog_{args.collection_id}.json"
+    catalog_href = collection_root / f"catalog_{args.collection_id}.json"
     cat.normalize_hrefs(str(out_dir))
+
+    cog_items_root = collection_root / args.assets_subdir / "cog"
+    ensure_dir(cog_items_root)
+    product_lookup: Dict[str, Dict[str, object]] = {}
+    for product in raster_items + label_items:
+        item_obj = product.get("item")
+        if item_obj is None:
+            continue
+        item_id = getattr(item_obj, "id", None)
+        if item_id:
+            product_lookup[str(item_id)] = product
+    items_snapshot = list(coll.get_items())
+    for item in items_snapshot:
+        item_dir = cog_items_root / item.id
+        ensure_dir(item_dir)
+        item_href = item_dir / f"{item.id}.json"
+        item.set_self_href(str(item_href))
+        item.set_collection(coll)
+        product = product_lookup.get(item.id)
+        if product is not None:
+            product["metadata_path"] = item_href
+
+    training_metadata_path = generate_training_metadata(
+        collection_root,
+        raster_items + label_items,
+        debug=False,
+    )
+    logging.info("Training metadata summary written to %s", training_metadata_path)
     cat.set_self_href(str(catalog_href))
     cat.save(catalog_type=pystac.CatalogType.SELF_CONTAINED)
     print(f"STAC catalog written to: {out_dir}")

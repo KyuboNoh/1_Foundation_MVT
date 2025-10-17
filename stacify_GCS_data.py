@@ -1658,7 +1658,7 @@ def main() -> None:
     )
     logging.info("Training metadata summary written to %s", training_metadata_path)
 
-    catalog_href = out_dir / f"catalog_{args.collection_id}.json"
+    catalog_href = collection_root / f"catalog_{args.collection_id}.json"
     cat.set_self_href(str(catalog_href))
     cat.save(catalog_type=pystac.CatalogType.ABSOLUTE_PUBLISHED)
     print(f"STAC catalog written to: {out_dir}")

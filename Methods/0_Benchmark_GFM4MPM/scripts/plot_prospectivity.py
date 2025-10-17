@@ -205,15 +205,6 @@ if __name__ == '__main__':
     stack = load_result.stack
     training_args_data = load_result.training_args
 
-    # if load_result.mode == 'table':
-    #     default_patch = 1
-    # else:
-    #     default_patch = args.patch
-    # patch_size = _resolve_pretraining_patch(training_args_data, default_patch)
-    # if training_args_data and training_args_data.get('window'):
-    #     window_size = int(training_args_data['window'])
-    # else:
-    #     window_size = default_patch if load_result.mode == 'table' else args.patch
     patch_size = int(training_args_data['patch'])
     window_size = int(training_args_data['window'])
 
