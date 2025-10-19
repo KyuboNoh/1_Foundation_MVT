@@ -490,9 +490,9 @@ def train_ssl(
                     f"ch{ch}:min={orig_min[sample_idx, ch]:.4f},max={orig_max[sample_idx, ch]:.4f}"
                     for ch in range(orig_flat.size(1))
                 ]
-                print(
-                    f"[debug] preview sample {sample_idx} value ranges -> " + ", ".join(channel_stats)
-                )
+                # print(
+                #     f"[debug] preview sample {sample_idx} value ranges -> " + ", ".join(channel_stats)
+                # )
         except Exception as exc:  # pragma: no cover - diagnostic helper
             print(f"[debug] Failed to compute preview stats: {exc}")
 
@@ -652,7 +652,7 @@ def train_ssl(
         ssim_count_increment = 0
         if use_ssim:
             has_spatial = x.dim() >= 4
-            if has_spatial and x.shape[-1] > 1 and x.shape[-2] > 1 and min(x.shape[-2], x.shape[-1]) >= 11:
+            if has_spatial and x.shape[-1] > 1 and x.shape[-2] > 1 and min(x.shape[-2], x.shape[-1]) >= 5:
                 ssim_val = structural_similarity_index_measure(
                     pred_metrics,
                     target_metrics,
@@ -664,7 +664,7 @@ def train_ssl(
                 if train_mode:
                     if not has_spatial or x.shape[-1] <= 1 or x.shape[-2] <= 1:
                         skipped_ssim_scalar = True
-                    elif min(x.shape[-2], x.shape[-1]) < 11:
+                    elif min(x.shape[-2], x.shape[-1]) < 5:
                         skipped_ssim_small_window = True
 
         if (
@@ -797,17 +797,13 @@ def train_ssl(
                     patch_info = "current patch configuration"
                 dim_msg = f" (min spatial dim {min_dim})" if min_dim is not None else ""
                 print(
-                    f"[SSL] SSIM skipped because inputs are smaller than the 11x11 SSIM window{dim_msg}; "
+                    f"[SSL] SSIM skipped because inputs are smaller than the 5x5 SSIM window{dim_msg}; "
                     f"consider increasing {patch_info}."
                 )
             elif skipped_ssim_scalar:
-                print(
-                    "[SSL] SSIM unavailable because inputs collapse to 1x1 patches; values recorded as null."
-                )
+                print("[SSL] SSIM unavailable because inputs collapse to 1x1 patches; values recorded as null.")
             else:
-                print(
-                    "[SSL] SSIM unavailable (data range likely degenerate); values recorded as null."
-                )
+                print("[SSL] SSIM unavailable (data range likely degenerate); values recorded as null.")
             warned_ssim = True
 
         val_metrics: Optional[Dict[str, float]] = None
@@ -854,12 +850,12 @@ def train_ssl(
         history.append(history_entry)
 
         if preview_samples > 0 and preview_dir is not None and sample_cache:
-            sample_shapes = (
-                sample_cache[0][0].shape,
-                sample_cache[0][1].shape,
-                sample_cache[0][2].shape,
-            )
-            print("             [dev] CHECK", *sample_shapes)
+            # sample_shapes = (
+            #     sample_cache[0][0].shape,
+            #     sample_cache[0][1].shape,
+            #     sample_cache[0][2].shape,
+            # )
+            # print("             [dev] CHECK", *sample_shapes)
             epoch_prefix = f"epoch_{ep:03d}_ssl_sample"
             _save_preview_samples(sample_cache, epoch_prefix)
 

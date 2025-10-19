@@ -3,9 +3,14 @@
 # stacify_bc.py
 # Robust utilities to convert raster/vector data into a STAC catalog.
 #
+# Special handling
+# 1. Exclude data numbered as -99 or -999 or -9999 as nodata (Boundary). 
+# 2. Original data are either in 1) binary type (1 and 2) or 2) categorical type (multiple integers).
+# 3. For this specific data, we will treat binary data not as catergorical but as numeric type and no normalization.
+#
 # Example:
-#   python stacify_bc_data.py  --raw-dir /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/bc-raw/raw/ --label /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/bc-raw/raw/NEBC_MVT_TP.shp  --out /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/   --collection-id bc-raw   --license "CC-BY-4.0"   --keywords MVT British_Columbia   --cogify   --validate 
-# Author: ChatGPT, Kyubo Noh
+#   python stacify_bc_data.py  --raw-dir /home/qubuntu25/Desktop/Research/Data/BCGS_OF2024-11/Data_Binary/ --label /home/qubuntu25/Desktop/Research/Data/BCGS_OF2024-11/Data_Binary/NEBC_MVT_TP.shp  --out /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/   --collection-id Out_Data_Binary   --license "CC-BY-4.0"   --keywords MVT British_Columbia   --cogify   --validate 
+# Author: Kyubo Noh
 # Date: 2025-09-22 (Updated on 2025-10-01)
 
 import argparse
@@ -24,6 +29,7 @@ import numpy as np
 from Common.data_utils import (
     TwoD_data_TwoD_label_normalize_raster,
     TwoD_data_TwoD_label_rasterize_labels,
+    export_region_boundaries,
 )
 from Common.metadata_generation_label_GeoJSON import generate_label_geojson
 from Common.metadata_generation_training import generate_training_metadata
@@ -122,6 +128,7 @@ def sha256sum(path: Path, blocksize: int = 65536) -> str:
         for chunk in iter(lambda: f.read(blocksize), b""):
             h.update(chunk)
     return h.hexdigest()
+
 
 def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
@@ -636,10 +643,18 @@ def add_raster_assets(collection,
             asset_path = out_asset_dir / (tif.stem + "_cog.tif") if cogify else out_asset_dir / tif.name
             band_infos: List[Dict[str, object]] = []
             profile_summary: Dict[str, object] = {}
+            valid_pixel_count: Optional[int] = None
+            total_pixel_count: Optional[int] = None
+            valid_pixel_fraction: Optional[float] = None
+
+            binary_override = False
 
             if normalize:
                 with rasterio.open(tif) as src:
                     profile = src.profile.copy()
+                    vp, tp, vf = _dataset_valid_pixel_stats(src)
+                    if vp is not None:
+                        valid_pixel_count, total_pixel_count, valid_pixel_fraction = vp, tp, vf
                     arrays: List[np.ndarray] = []
                     for band_index in range(1, src.count + 1):
                         band = src.read(band_index)
@@ -648,14 +663,41 @@ def add_raster_assets(collection,
                             band_nodata = src.nodatavals[band_index - 1]
                         elif src.nodata is not None:
                             band_nodata = src.nodata
+                        band = band.astype(np.float64, copy=False)
+                        nodata_candidates = {-99.0, -999.0, -9999.0}
+                        if band_nodata is not None:
+                            nodata_candidates.add(float(band_nodata))
+                        nodata_mask = np.isin(band, list(nodata_candidates))
+                        if nodata_mask.any():
+                            band = band.copy()
+                            band[nodata_mask] = np.nan
+                        finite_vals = band[np.isfinite(band)]
+                        is_binary = False
+                        if finite_vals.size > 0:
+                            unique_vals = np.unique(finite_vals)
+                            if unique_vals.size <= 3 and set(unique_vals.tolist()).issubset({0.0, 1.0, 2.0}):
+                                is_binary = True
                         band_dtype = src.dtypes[band_index - 1] if src.dtypes else band.dtype
-                        normalized_band, info = TwoD_data_TwoD_label_normalize_raster(
-                            band,
-                            nodata=band_nodata,
-                            dtype=band_dtype,
-                        )
-                        arrays.append(normalized_band)
-                        band_infos.append(info)
+                        if is_binary:
+                            arr = np.where(np.isfinite(band), band, 0.0).astype(np.float32)
+                            info = {
+                                "kind": "numeric-binary",
+                                "treat_as_numeric": True,
+                                "nodata": None,
+                                "categories": [0, 1, 2],
+                                "scaling": None,
+                            }
+                            arrays.append(arr)
+                            band_infos.append(info)
+                            binary_override = True
+                        else:
+                            normalized_band, info = TwoD_data_TwoD_label_normalize_raster(
+                                band,
+                                nodata=None,
+                                dtype=band_dtype,
+                            )
+                            arrays.append(normalized_band)
+                            band_infos.append(info)
                     if not arrays:
                         raise RuntimeError(f"No bands could be read from raster {tif}")
 
@@ -687,6 +729,10 @@ def add_raster_assets(collection,
                         "dtype": profile.get("dtype"),
                         "nodata": profile.get("nodata"),
                     }
+                    if valid_pixel_count is not None:
+                        profile_summary["valid_pixels"] = valid_pixel_count
+                        profile_summary["total_pixels"] = total_pixel_count
+                        profile_summary["valid_fraction"] = valid_pixel_fraction
             else:
                 if cogify:
                     to_cog(tif, asset_path)
@@ -694,6 +740,9 @@ def add_raster_assets(collection,
                     if tif.resolve() != asset_path.resolve():
                         shutil.copy2(tif, asset_path)
                 with rasterio.open(asset_path) as asset_src:
+                    vp, tp, vf = _dataset_valid_pixel_stats(asset_src)
+                    if vp is not None:
+                        valid_pixel_count, total_pixel_count, valid_pixel_fraction = vp, tp, vf
                     profile_summary = {
                         "width": asset_src.width,
                         "height": asset_src.height,
@@ -702,6 +751,10 @@ def add_raster_assets(collection,
                         "dtype": asset_src.dtypes[0] if asset_src.dtypes else asset_src.profile.get("dtype"),
                         "nodata": asset_src.nodatavals[0] if asset_src.nodatavals else asset_src.nodata,
                     }
+                    if valid_pixel_count is not None:
+                        profile_summary["valid_pixels"] = valid_pixel_count
+                        profile_summary["total_pixels"] = total_pixel_count
+                        profile_summary["valid_fraction"] = valid_pixel_fraction
                     for band_index in range(1, asset_src.count + 1):
                         band_infos.append({
                             "kind": "continuous",
@@ -741,6 +794,16 @@ def add_raster_assets(collection,
                     product_entry["categories"] = list(primary["categories"])  # type: ignore[index]
                 if primary.get("scaling"):
                     product_entry["scaling"] = dict(primary["scaling"])  # type: ignore[arg-type]
+            if binary_override:
+                product_entry["treat_as_numeric"] = True
+                item.properties["gfm:treat_as_numeric"] = True
+            if valid_pixel_count is not None:
+                product_entry["valid_pixel_count"] = int(valid_pixel_count)
+                product_entry["total_pixel_count"] = int(total_pixel_count or 0)
+                product_entry["valid_pixel_fraction"] = float(valid_pixel_fraction or 0.0)
+                item.properties["gfm:valid_pixel_count"] = int(valid_pixel_count)
+                item.properties["gfm:total_pixel_count"] = int(total_pixel_count or 0)
+                item.properties["gfm:valid_pixel_fraction"] = float(valid_pixel_fraction or 0.0)
             if thumb:
                 product_entry["quicklook_path"] = Path(thumb)
             product_entry.setdefault("is_label", False)
@@ -805,6 +868,9 @@ def add_label_raster_assets(collection,
                 fill_value=0.0,
                 all_touched=True,
             )
+            valid_pixel_count = int(np.count_nonzero(raster))
+            total_pixel_count = int(raster.size)
+            valid_pixel_fraction = float(valid_pixel_count / total_pixel_count) if total_pixel_count else 0.0
 
             label_stem = Path(label_path).stem
             tmp_path = out_asset_dir / f".tmp_{label_stem}_labels.tif"
@@ -861,7 +927,13 @@ def add_label_raster_assets(collection,
                     "dtype": "uint8",
                     "nodata": 0,
                 },
+                "valid_pixel_count": valid_pixel_count,
+                "total_pixel_count": total_pixel_count,
+                "valid_pixel_fraction": valid_pixel_fraction,
             }
+            item.properties["gfm:valid_pixel_count"] = valid_pixel_count
+            item.properties["gfm:total_pixel_count"] = total_pixel_count
+            item.properties["gfm:valid_pixel_fraction"] = valid_pixel_fraction
             if thumb:
                 product_entry["quicklook_path"] = Path(thumb)
             products.append(product_entry)
@@ -954,6 +1026,22 @@ def _should_skip(path: Path, ignore_roots: List[Path]) -> bool:
     return False
 
 
+def _dataset_valid_pixel_stats(src) -> Tuple[Optional[int], Optional[int], Optional[float]]:
+    try:
+        mask = src.dataset_mask()
+    except Exception:
+        mask = None
+    if mask is None:
+        return None, None, None
+    arr = np.asarray(mask)
+    if arr.ndim == 3:
+        arr = arr[0]
+    total = int(arr.size)
+    valid = int(np.count_nonzero(arr))
+    fraction = (valid / total) if total else None
+    return valid, total, fraction
+
+
 def scan_files(raw_dir: Path, ignore_roots: Optional[List[Path]] = None) -> Tuple[List[Path], List[Path]]:
     rasters, vectors = [], []
     vector_exts = {".shp", ".gpkg", ".geojson", ".json"}
@@ -1037,6 +1125,25 @@ def main():
     asset_dir = collection_root / args.assets_subdir
     ensure_dir(asset_dir)
 
+    boundary_dir = collection_root / "boundaries"
+    raster_region_paths: Dict[str, List[Path]] = {}
+    for prod in raster_items:
+        asset_path = prod.get("asset_path") if isinstance(prod, dict) else None
+        if not asset_path:
+            continue
+        region = prod.get("region") if isinstance(prod, dict) else None
+        region_key = str(region or "GLOBAL")
+        raster_region_paths.setdefault(region_key, []).append(Path(asset_path))
+
+    boundary_results = export_region_boundaries(raster_region_paths, boundary_dir)
+    for region_key, geo_path in boundary_results.items():
+        try:
+            resolved_href = geo_path.resolve().as_uri()
+        except Exception:
+            resolved_href = str(geo_path)
+        title = "Dataset boundary" if region_key == "GLOBAL" else f"Boundary - {region_key}"
+        coll.add_link(Link(rel="derived_from", target=resolved_href, title=title))
+
     registry_dst = collection_root / "feature_registry.yaml"
     if not registry_dst.exists():
         registry_src = Path(__file__).resolve().parent / "unify" / "feature_registry.yaml"
@@ -1110,6 +1217,36 @@ def main():
                 )
             except Exception as exc:
                 logging.warning("Failed to generate label GeoJSON for %s: %s", label_path, exc)
+
+    def _coverage_totals(items: List[Dict[str, object]]) -> Tuple[int, int, Optional[float]]:
+        valid = 0
+        total = 0
+        for prod in items:
+            vp = prod.get("valid_pixel_count")
+            tp = prod.get("total_pixel_count")
+            if vp is None or tp is None:
+                continue
+            valid += int(vp)
+            total += int(tp)
+        fraction = (valid / total) if total else None
+        return valid, total, fraction
+
+    feature_valid, feature_total, feature_fraction = _coverage_totals([p for p in raster_items if not p.get("is_label")])
+    label_valid, label_total, label_fraction = _coverage_totals(label_items)
+    coverage_summary = {
+        "features": {
+            "valid_pixel_count": feature_valid,
+            "total_pixel_count": feature_total,
+            "valid_pixel_fraction": feature_fraction,
+        },
+        "labels": {
+            "valid_pixel_count": label_valid,
+            "total_pixel_count": label_total,
+            "valid_pixel_fraction": label_fraction,
+        },
+    }
+    coll.extra_fields = coll.extra_fields or {}
+    coll.extra_fields["gfm:coverage_summary"] = coverage_summary
 
     update_collection_summaries(coll, raster_items + label_items + vector_items)
     build_collection_level_assets(coll, raster_items + label_items, vector_items, asset_dir)

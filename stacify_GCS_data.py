@@ -31,6 +31,7 @@ from pyproj import Transformer
 from unify.one_d import csv_to_parquet
 from Common.metadata_generation_training import generate_training_metadata
 from Common.metadata_generation_label_GeoJSON import generate_label_geojson
+from Common.data_utils import export_region_boundaries
 from stacify_bc_data import (
     CHECKSUM_EXT,
     TABLE_EXT,
@@ -1635,6 +1636,26 @@ def main() -> None:
             item.save_object(include_self_link=False)
         except Exception as exc:
             logging.warning("Failed to save raster item %s: %s", item.id, exc)
+
+    if raster_products:
+        boundary_dir = collection_root / "boundaries"
+        region_paths: Dict[str, List[Path]] = {}
+        for prod in raster_products:
+            asset_path = prod.get("asset_path") if isinstance(prod, dict) else None
+            if not asset_path:
+                continue
+            region = prod.get("region") if isinstance(prod, dict) else None
+            region_key = str(region or "GLOBAL")
+            region_paths.setdefault(region_key, []).append(Path(asset_path))
+
+        boundary_map = export_region_boundaries(region_paths, boundary_dir)
+        for region_key, geo_path in boundary_map.items():
+            try:
+                resolved = geo_path.resolve().as_uri()
+            except Exception:
+                resolved = str(geo_path)
+            title = "Dataset boundary" if region_key == "GLOBAL" else f"Boundary - {region_key}"
+            coll.add_link(Link(rel="derived_from", target=resolved, title=title))
 
     reset_io = None
     if args.validate:

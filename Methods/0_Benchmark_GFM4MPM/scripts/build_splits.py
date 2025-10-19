@@ -24,6 +24,7 @@ from Common.data_utils import (
     filter_valid_raster_coords,
     load_split_stack,
     normalize_region_coord,
+    prefilter_valid_window_coords,
     region_coord_to_dict,
 )
 from Common.debug_visualization import visualize_debug_features
@@ -219,82 +220,6 @@ def _resolve_pretraining_patch(args_dict: Optional[Dict], fallback: int) -> int:
     return fallback
 
 
-
-
-# def _collect_feature_rasters(
-#     metadata: Optional[Dict],
-#     metadata_path: Optional[Path],
-#     feature_names: Optional[Sequence[str]],
-# ) -> Dict[str, List[Path]]:
-#     if not metadata or not metadata_path:
-#         return {}
-#     features_section = metadata.get('features')
-#     if not isinstance(features_section, dict):
-#         return {}
-#     entries = features_section.get('entries')
-#     if not isinstance(entries, dict):
-#         return {}
-#     base_dir = metadata_path.parent
-
-#     def _lookup(name: str) -> Optional[Tuple[str, Dict[str, Any]]]:
-#         if name in entries:
-#             return name, entries[name]
-#         lowered = name.lower()
-#         for key, value in entries.items():
-#             if key.lower() == lowered:
-#                 return key, value
-#         return None
-
-#     ordered_features: List[str]
-#     if feature_names:
-#         ordered_features = list(feature_names)
-#     else:
-#         ordered_features = sorted(entries.keys(), key=str.lower)
-
-#     region_map: Dict[str, Dict[str, List[Path]]] = {}
-#     for feature_name in ordered_features:
-#         match = _lookup(feature_name)
-#         if match is None:
-#             print(f"[warn] Feature '{feature_name}' missing from training_metadata.json entries.")
-#             continue
-#         canonical_name, entry = match
-#         tif_records = entry.get('tifs', [])
-#         if not isinstance(tif_records, list):
-#             continue
-#         for record in tif_records:
-#             if not isinstance(record, dict):
-#                 continue
-#             path_value = record.get('path') or record.get('filename')
-#             if not path_value:
-#                 continue
-#             tif_path = Path(path_value)
-#             if not tif_path.is_absolute():
-#                 tif_path = (base_dir / tif_path).resolve()
-#             else:
-#                 tif_path = tif_path.resolve()
-#             if not tif_path.exists():
-#                 print(f"[warn] Feature raster not found: {tif_path}")
-#                 continue
-#             region = record.get('region')
-#             region_key = str(region or _infer_region_from_name(tif_path) or 'GLOBAL').upper()
-#             region_map.setdefault(region_key, {}).setdefault(canonical_name, []).append(tif_path)
-
-#     usable: Dict[str, List[Path]] = {}
-#     for region, feature_map in region_map.items():
-#         missing = [name for name in ordered_features if name not in feature_map]
-#         if missing:
-#             continue
-#         ordered_paths: List[Path] = []
-#         for name in ordered_features:
-#             paths = feature_map.get(name)
-#             if not paths:
-#                 break
-#             ordered_paths.extend(sorted(paths, key=lambda p: p.name))
-#         if len(ordered_paths) == sum(len(feature_map[name]) for name in ordered_features if name in feature_map):
-#             usable[region] = ordered_paths
-#     return usable
-
-
 def _read_stack_patch(stack: Any, coord: Any, window: int) -> np.ndarray:
     if hasattr(stack, "resolve_region_stack"):
         default_region = getattr(stack, "default_region", None)
@@ -421,6 +346,7 @@ if __name__ == '__main__':
                 raise RuntimeError('No label rasters found in training_metadata.json and --pos_geojson not provided')
 
         pos_raw = list(dict.fromkeys(pos_raw))
+        print("[info] Clamping coordinates for positives to valid patch windows...")
         pos_clamped, clamp_count_pos = clamp_coords_to_window(pos_raw, stack, patch)
         if clamp_count_pos:
             print(f"[info] Adjusted {clamp_count_pos} positive coordinate(s) to stay within window bounds")
@@ -452,6 +378,7 @@ if __name__ == '__main__':
         grid_set = set(grid_coords)
         pos_set = set(pos)
         unk_raw = list(grid_set - pos_set)
+        print("[info] Clamping coordinates for unknowns to valid patch windows...")
         unk_clamped, clamp_count_unk = clamp_coords_to_window(unk_raw, stack, patch)
         if clamp_count_unk:
             print(f"[info] Adjusted {clamp_count_unk} unlabeled coordinate(s) to stay within window bounds")
@@ -461,7 +388,12 @@ if __name__ == '__main__':
         ]
         unk = list(dict.fromkeys(unk))
 
-        unk, dropped_unk = filter_valid_raster_coords(stack, unk, patch, min_valid_fraction=0.05)
+        prefiltered_unk = prefilter_valid_window_coords(stack, unk, patch)
+        dropped_prefilter = len(unk) - len(prefiltered_unk)
+        if dropped_prefilter:
+            print(f"[info] Prefiltered {dropped_prefilter} unlabeled coordinate(s) with insufficient window coverage")
+        print(f"[info] Filtering invalid raster coordinate(s) starts...")
+        unk, dropped_unk = filter_valid_raster_coords(stack, prefiltered_unk, patch, min_valid_fraction=0.05)
         if dropped_unk:
             print(f"[info] Dropped {len(dropped_unk)} candidate negative coordinate(s) lacking sufficient valid pixels")
 
@@ -556,8 +488,6 @@ if __name__ == '__main__':
     encoder = MAEViT(in_chans=stack.count, **mae_init_kwargs)
     encoder.load_state_dict(state_dict)
 
-    # default_batch_size = 256
-    # batch_size = default_batch_size
     if training_args_data:
         for batch_key in (
             'batch',
@@ -575,7 +505,6 @@ if __name__ == '__main__':
             if resolved_size > 0:
                 batch_size = resolved_size
                 break
-    # if batch_size != default_batch_size:
     print(f"[info] Using batch size {batch_size} from training_args_1_pretrain.json")
     
     out_dir = Path(args.out)

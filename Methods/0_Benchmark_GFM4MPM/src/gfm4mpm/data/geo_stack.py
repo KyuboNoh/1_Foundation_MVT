@@ -87,10 +87,10 @@ class GeoStack:
         for _, window in src.block_windows(1):
             band = src.read(1, window=window, masked=True)
             if np.ma.isMaskedArray(band):
+                band = band.astype(np.float64, copy=False)
                 arr = band.filled(np.nan)
             else:
-                arr = np.asarray(band)
-            arr = np.asarray(arr, dtype=np.float64)
+                arr = np.asarray(band, dtype=np.float64)
             mask = np.isfinite(arr)
             if not mask.any():
                 continue
@@ -127,8 +127,16 @@ class GeoStack:
         for src in self.srcs:
             band = src.read(1, window=window, masked=True)
             if np.ma.isMaskedArray(band):
-                arr = band.filled(np.nan).astype(np.float32)
-                mask = ~band.mask
+                band = band.astype(np.float32, copy=False)
+                arr = band.filled(np.nan)
+                raw_mask = band.mask
+                if raw_mask is np.ma.nomask:
+                    mask = np.ones_like(arr, dtype=bool)
+                else:
+                    mask = np.asarray(raw_mask, dtype=bool)
+                    if mask.shape != arr.shape:
+                        mask = np.broadcast_to(mask, arr.shape)
+                    mask = ~mask
             else:
                 arr = np.asarray(band, dtype=np.float32)
                 nodata = src.nodata

@@ -12,6 +12,25 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 import numpy as np
 
+try:  # Optional heavy imports; guard for environments without rasterio/shapely
+    import rasterio  # type: ignore
+    from rasterio.features import shapes as raster_shapes  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    rasterio = None  # type: ignore
+    raster_shapes = None  # type: ignore
+
+try:
+    from shapely.geometry import Polygon, MultiPolygon, shape, mapping  # type: ignore
+    from shapely.ops import unary_union  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    Polygon = MultiPolygon = shape = mapping = None  # type: ignore
+    unary_union = None  # type: ignore
+
+try:
+    from tqdm import tqdm  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    tqdm = None  # type: ignore
+
 _THIS_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = (_THIS_DIR.parent / "Methods" / "0_Benchmark_GFM4MPM").resolve()
 if str(_PROJECT_ROOT) not in sys.path:
@@ -337,6 +356,8 @@ def clamp_coords_to_window(
     stack: Any,
     window: int,
 ) -> Tuple[List[Union[Tuple[int, int], RegionCoord]], int]:
+
+    
     if not coords:
         return [], 0
 
@@ -464,11 +485,175 @@ def filter_valid_raster_coords(
     min_valid_fraction: float = 0.0,
 ) -> Tuple[List[RegionCoord], List[RegionCoord]]:
     """Remove coordinates whose patches contain no valid data."""
-    valid: List[RegionCoord] = []
-    invalid: List[RegionCoord] = []
+
+    coords_list = list(coords)
+    if not coords_list:
+        return [], []
+
     min_valid_fraction = max(0.0, min(1.0, float(min_valid_fraction)))
 
-    for coord in coords:
+    result = _filter_valid_raster_coords_integral(
+        stack,
+        coords_list,
+        int(window),
+        min_valid_fraction,
+    )
+    if result is not None:
+        return result
+
+    return _filter_valid_raster_coords_patch(
+        stack,
+        coords_list,
+        int(window),
+        min_valid_fraction,
+    )
+
+
+def _ensure_integral_mask(stack_obj: Any) -> Optional[Tuple[np.ndarray, Tuple[int, int]]]:
+    if rasterio is None:
+        return None
+    integral = getattr(stack_obj, "_valid_integral", None)
+    shape = getattr(stack_obj, "_valid_integral_shape", None)
+    if integral is not None and shape is not None:
+        return integral, shape
+
+    srcs = getattr(stack_obj, "srcs", None)
+    if not srcs:
+        return None
+    try:
+        mask_arr = srcs[0].dataset_mask()
+    except Exception:
+        return None
+    if mask_arr is None:
+        return None
+    mask_arr = np.asarray(mask_arr)
+    if mask_arr.ndim == 3:
+        mask_arr = mask_arr[0]
+    mask_bool = mask_arr != 0
+    if not mask_bool.any():
+        return None
+
+    valid = mask_bool.astype(np.int32, copy=False)
+    integral = valid.cumsum(axis=0).cumsum(axis=1)
+    stack_obj._valid_integral = integral
+    stack_obj._valid_integral_shape = (valid.shape[0], valid.shape[1])
+    return integral, (valid.shape[0], valid.shape[1])
+
+
+def _window_sum(integral: np.ndarray, r0: int, c0: int, r1: int, c1: int) -> int:
+    """Return sum of values in [r0, r1) x [c0, c1)."""
+    total = integral[r1 - 1, c1 - 1]
+    if r0 > 0:
+        total -= integral[r0 - 1, c1 - 1]
+    if c0 > 0:
+        total -= integral[r1 - 1, c0 - 1]
+    if r0 > 0 and c0 > 0:
+        total += integral[r0 - 1, c0 - 1]
+    return int(total)
+
+
+def _filter_valid_raster_coords_integral(
+    stack: Any,
+    coords_list: Sequence[RegionCoord],
+    window: int,
+    min_valid_fraction: float,
+) -> Optional[Tuple[List[RegionCoord], List[RegionCoord]]]:
+    if rasterio is None:
+        return None
+
+    half = window // 2
+    use_progress = tqdm is not None and len(coords_list) > 0
+    iterator = coords_list
+    if use_progress:
+        iterator = tqdm(coords_list, desc="Validate raster windows")
+
+    cache: Dict[Any, bool] = {}
+    valid: List[RegionCoord] = []
+    invalid: List[RegionCoord] = []
+
+    try:
+        for coord in iterator:
+            if hasattr(stack, "resolve_region_stack"):
+                region, row, col = coord
+                region_stack = stack.resolve_region_stack(region)
+                if region_stack is None:
+                    invalid.append(coord)
+                    continue
+            else:
+                region_stack = stack
+                if isinstance(coord, (tuple, list)):
+                    if len(coord) == 3:
+                        _, row, col = coord
+                    elif len(coord) == 2:
+                        row, col = coord
+                    else:
+                        invalid.append(coord)
+                        continue
+                else:
+                    invalid.append(coord)
+                    continue
+
+            row_int = int(row)
+            col_int = int(col)
+
+            key = (region, row_int, col_int) if hasattr(stack, "resolve_region_stack") else (row_int, col_int)
+            cached = cache.get(key)
+            if cached is not None:
+                (valid if cached else invalid).append(coord)
+                continue
+
+            integral_info = _ensure_integral_mask(region_stack)
+            if integral_info is None:
+                return None  # fallback to patch-based method
+            integral, (height, width) = integral_info
+
+            r0 = max(row_int - half, 0)
+            r1 = min(r0 + window, height)
+            if r1 <= r0:
+                cache[key] = False
+                invalid.append(coord)
+                continue
+            c0 = max(col_int - half, 0)
+            c1 = min(c0 + window, width)
+            if c1 <= c0:
+                cache[key] = False
+                invalid.append(coord)
+                continue
+
+            area = (r1 - r0) * (c1 - c0)
+            if area <= 0:
+                cache[key] = False
+                invalid.append(coord)
+                continue
+
+            count_valid = _window_sum(integral, r0, c0, r1, c1)
+            fraction = count_valid / float(area)
+            is_valid = count_valid > 0 and fraction >= min_valid_fraction
+            cache[key] = is_valid
+            (valid if is_valid else invalid).append(coord)
+    finally:
+        if use_progress:
+            print("[info] Validate raster windows completed (integral).")
+
+    return valid, invalid
+
+
+def _filter_valid_raster_coords_patch(
+    stack: Any,
+    coords_list: Sequence[RegionCoord],
+    window: int,
+    min_valid_fraction: float,
+) -> Tuple[List[RegionCoord], List[RegionCoord]]:
+    cache: Dict[Any, bool] = {}
+    valid: List[RegionCoord] = []
+    invalid: List[RegionCoord] = []
+
+    use_progress = tqdm is not None and len(coords_list) > 0
+    iterator = coords_list
+    if use_progress:
+        iterator = tqdm(coords_list, desc="Validate raster windows")
+
+    for coord in iterator:
         try:
             if hasattr(stack, "resolve_region_stack"):
                 region, row, col = coord
@@ -481,13 +666,24 @@ def filter_valid_raster_coords(
                     row, col = coord
                 else:
                     raise ValueError(f"Unsupported coordinate for validation: {coord!r}")
-            patch, mask = region_stack.read_patch_with_mask(int(row), int(col), int(window))
+            row_int = int(row)
+            col_int = int(col)
+
+            key = (region, row_int, col_int) if hasattr(stack, "resolve_region_stack") else (row_int, col_int)
+            cached = cache.get(key)
+            if cached is not None:
+                (valid if cached else invalid).append(coord)
+                continue
+
+            patch, mask = region_stack.read_patch_with_mask(row_int, col_int, int(window))
         except Exception:
+            cache[key] = False
             invalid.append(coord)
             continue
 
         patch = np.asarray(patch)
         if patch.size == 0 or not np.isfinite(patch).any():
+            cache[key] = False
             invalid.append(coord)
             continue
 
@@ -495,11 +691,12 @@ def filter_valid_raster_coords(
         if mask_bool.shape != patch.shape[-2:]:
             mask_bool = np.broadcast_to(mask_bool, patch.shape[-2:])
         valid_fraction = 1.0 - (mask_bool.sum() / mask_bool.size)
-        if mask_bool.all() or valid_fraction < min_valid_fraction:
-            invalid.append(coord)
-            continue
+        is_valid = not mask_bool.all() and valid_fraction >= min_valid_fraction
+        cache[key] = is_valid
+        (valid if is_valid else invalid).append(coord)
 
-        valid.append(coord)
+    if use_progress:
+        print("[info] Validate raster windows completed (patch).")
 
     return valid, invalid
 
@@ -976,8 +1173,6 @@ def region_coord_to_dict(coord: RegionCoord) -> Dict[str, int]:
     return {"region": str(region), "row": int(row), "col": int(col)}
 
 
-
-
 def resolve_search_root(path: Optional[Path]) -> Optional[Path]:
     if path is None:
         return None
@@ -1205,7 +1400,7 @@ def resolve_label_rasters(
             print(f"[warn] Label raster not found: {tif_path}")
             continue
         region = tif_info.get('region')
-        region_key = str(region or _infer_region_from_name(tif_path) or 'GLOBAL').upper()
+        region_key = str(region or infer_region_from_name(tif_path) or 'GLOBAL').upper()
         resolved.append({"path": tif_path, "region": region_key})
     return resolved
 
@@ -1265,7 +1460,7 @@ def collect_feature_rasters(
                 print(f"[warn] Feature raster not found: {tif_path}")
                 continue
             region = record.get('region')
-            region_key = str(region or _infer_region_from_name(tif_path) or 'GLOBAL').upper()
+            region_key = str(region or infer_region_from_name(tif_path) or 'GLOBAL').upper()
             region_map.setdefault(region_key, {}).setdefault(canonical_name, []).append(tif_path)
 
     usable: Dict[str, List[Path]] = {}
@@ -1308,3 +1503,308 @@ def read_stack_patch(stack: Any, coord: Any, window: int) -> np.ndarray:
 
     row, col = coord
     return stack.read_patch(int(row), int(col), window)
+
+
+def prefilter_valid_window_coords(
+    stack: Any,
+    coords: Sequence[RegionCoord],
+    window: int,
+) -> List[RegionCoord]:
+    """
+    Quickly drop coordinates whose window would fall outside the valid raster mask.
+
+    Uses an eroded dataset mask (window-sized) to approximate which centers are safe
+    without reading patches from disk. Coordinates falling outside the mask are
+    considered invalid and removed.
+    """
+    coords_list = list(coords)
+    if rasterio is None or unary_union is None:
+        return coords_list
+
+    window = int(window)
+    if window <= 1 or not coords_list:
+        return coords_list
+
+    half = window // 2
+
+    def _valid_window_mask(stack_obj: Any) -> Optional[np.ndarray]:
+        mask = getattr(stack_obj, "_valid_window_mask", None)
+        if mask is not None:
+            return mask
+        srcs = getattr(stack_obj, "srcs", None)
+        if not srcs:
+            return None
+        try:
+            mask_arr = srcs[0].dataset_mask()
+        except Exception:
+            mask_arr = None
+        if mask_arr is None:
+            return None
+        mask_arr = np.asarray(mask_arr)
+        if mask_arr.ndim == 3:
+            mask_arr = mask_arr[0]
+        mask_bool = mask_arr != 0
+        if not mask_bool.any():
+            return None
+        try:
+            from scipy.ndimage import minimum_filter
+        except Exception:
+            return None
+        valid_mask = minimum_filter(mask_bool.astype(np.uint8), size=window, mode="constant")
+        valid_mask = valid_mask.astype(bool, copy=False)
+        stack_obj._valid_window_mask = valid_mask  # cache for reuse
+        return valid_mask
+
+    def _is_coord_valid(stack_obj: Any, coord_tuple: Tuple[int, int]) -> bool:
+        mask = _valid_window_mask(stack_obj)
+        if mask is None:
+            return True
+        r, c = coord_tuple
+        if 0 <= r < mask.shape[0] and 0 <= c < mask.shape[1]:
+            return mask[r, c]
+        return False
+
+    iterator = coords_list
+    use_progress = tqdm is not None and len(coords_list) > 0
+    if use_progress:
+        iterator = tqdm(coords_list, desc="Prefilter window coverage")
+
+    filtered: List[RegionCoord] = []
+    for coord in iterator:
+        if hasattr(stack, "resolve_region_stack"):
+            region, row, col = coord
+            region_stack = stack.resolve_region_stack(region)
+            if region_stack is None:
+                continue
+            if _is_coord_valid(region_stack, (int(row), int(col))):
+                filtered.append(coord)
+        else:
+            if isinstance(coord, (tuple, list)):
+                if len(coord) == 3:
+                    _, row, col = coord
+                elif len(coord) == 2:
+                    row, col = coord
+                else:
+                    continue
+            else:
+                row = col = None
+            if row is None or col is None:
+                continue
+            if _is_coord_valid(stack, (int(row), int(col))):
+                filtered.append(coord)
+
+    if use_progress:
+        print("[info] Prefilter window coverage completed.")
+
+    return filtered
+
+
+def _sanitize_region_name(name: str) -> str:
+    sanitized = "".join(ch if ch.isalnum() else "_" for ch in str(name))
+    sanitized = sanitized.strip("_") or "region"
+    return sanitized.lower()
+
+
+def _write_boundary_geojson(
+    geometry: Union[Polygon, MultiPolygon],
+    out_path: Path,
+    *,
+    properties: Optional[Dict[str, Any]] = None,
+    crs_name: Optional[str] = None,
+) -> Path:
+    feature = {
+        "type": "Feature",
+        "properties": properties or {},
+        "geometry": mapping(geometry),
+    }
+    geojson: Dict[str, Any] = {
+        "type": "FeatureCollection",
+        "features": [feature],
+    }
+    if crs_name:
+        geojson["crs"] = {
+            "type": "name",
+            "properties": {"name": crs_name},
+        }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(geojson), encoding="utf-8")
+    return out_path
+
+
+def compute_raster_geometry(
+    raster_path: Union[str, Path]
+) -> Tuple[Optional[Union[Polygon, MultiPolygon]], Optional[str]]:
+    if rasterio is None or raster_shapes is None or shape is None or unary_union is None:
+        return None, None
+
+    raster_path = Path(raster_path)
+    try:
+        with rasterio.open(raster_path) as ds:
+            mask = ds.dataset_mask()
+            if mask is None:
+                return None, None
+            mask_arr = np.asarray(mask)
+            if mask_arr.ndim == 3:
+                mask_arr = mask_arr[0]
+            mask_bool = mask_arr != 0
+            if not mask_bool.any():
+                return None, None
+
+            polygons = []
+            for geom, value in raster_shapes(
+                mask_bool.astype(np.uint8), mask=mask_bool, transform=ds.transform
+            ):
+                if int(value) == 0:
+                    continue
+                poly = shape(geom).buffer(0)
+                if not poly.is_empty:
+                    polygons.append(poly)
+            if not polygons:
+                return None, ds.crs.to_string() if ds.crs else None
+            merged = unary_union(polygons)
+            if merged.is_empty:
+                return None, ds.crs.to_string() if ds.crs else None
+            if not isinstance(merged, (Polygon, MultiPolygon)):
+                merged = merged.buffer(0)
+            if merged.is_empty:
+                return None, ds.crs.to_string() if ds.crs else None
+            crs_name = ds.crs.to_string() if ds.crs else None
+            return merged, crs_name
+    except Exception:
+        return None, None
+
+
+def export_raster_boundary(
+    raster_path: Union[str, Path],
+    out_geojson: Union[str, Path],
+    *,
+    properties: Optional[Dict[str, Any]] = None,
+) -> Optional[Path]:
+    geometry, crs_name = compute_raster_geometry(raster_path)
+    if geometry is None:
+        return None
+    props = {"source_raster": str(Path(raster_path).resolve())}
+    if properties:
+        props.update(properties)
+    out_path = Path(out_geojson)
+    return _write_boundary_geojson(geometry, out_path, properties=props, crs_name=crs_name)
+
+
+def export_region_boundaries(
+    raster_paths_by_region: Dict[str, Sequence[Union[str, Path]]],
+    out_dir: Union[str, Path],
+    *,
+    prefix: str = "boundary",
+) -> Dict[str, Path]:
+    out_dir = Path(out_dir)
+    results: Dict[str, Path] = {}
+    if not raster_paths_by_region:
+        return results
+
+    global_geometries: List[Union[Polygon, MultiPolygon]] = []
+    global_crs: Optional[str] = None
+
+    for region, paths in raster_paths_by_region.items():
+        region_geom: Optional[Union[Polygon, MultiPolygon]] = None
+        region_crs: Optional[str] = None
+        for path in paths:
+            geom, crs_name = compute_raster_geometry(path)
+            if geom is None:
+                continue
+            region_geom = geom if region_geom is None else region_geom.union(geom)
+            region_crs = region_crs or crs_name
+        if region_geom is None or region_geom.is_empty:
+            continue
+        region_slug = _sanitize_region_name(region)
+        out_path = out_dir / f"{prefix}_{region_slug}.geojson"
+        props = {"region": region}
+        results[region] = _write_boundary_geojson(region_geom, out_path, properties=props, crs_name=region_crs)
+        global_geometries.append(region_geom)
+        if region_crs and not global_crs:
+            global_crs = region_crs
+
+    if global_geometries:
+        try:
+            global_geom = unary_union(global_geometries)
+        except Exception:
+            global_geom = None
+        if global_geom and not global_geom.is_empty:
+            out_path = out_dir / f"{prefix}.geojson"
+            props = {"regions": list(results.keys())}
+            results["GLOBAL"] = _write_boundary_geojson(global_geom, out_path, properties=props, crs_name=global_crs)
+
+    return results
+
+
+def export_raster_boundary(
+    raster_path: Union[str, Path],
+    out_geojson: Union[str, Path],
+) -> Optional[Path]:
+    """Export a coarse boundary polygon for the raster's valid data mask."""
+    if rasterio is None or raster_shapes is None or shape is None or unary_union is None:
+        return None
+
+    raster_path = Path(raster_path)
+    out_geojson = Path(out_geojson)
+
+    try:
+        with rasterio.open(raster_path) as ds:
+            mask = ds.dataset_mask()
+            if mask is None:
+                return None
+            mask_arr = np.asarray(mask)
+            if mask_arr.ndim == 3:
+                mask_arr = mask_arr[0]
+            mask_bool = mask_arr != 0
+            if not mask_bool.any():
+                return None
+
+            polygons = []
+            for geom, value in raster_shapes(mask_bool.astype(np.uint8), mask=mask_bool, transform=ds.transform):
+                if int(value) == 0:
+                    continue
+                poly = shape(geom).buffer(0)
+                if not poly.is_empty:
+                    polygons.append(poly)
+    except Exception:
+        return None
+
+    if not polygons:
+        return None
+    try:
+        merged = unary_union(polygons)
+    except Exception:
+        return None
+    if merged.is_empty:
+        return None
+    if not isinstance(merged, (Polygon, MultiPolygon)):
+        merged = merged.buffer(0)
+    if merged.is_empty:
+        return None
+
+    try:
+        out_geojson.parent.mkdir(parents=True, exist_ok=True)
+        feature = {
+            "type": "Feature",
+            "properties": {
+                "source_raster": str(raster_path.resolve()),
+            },
+            "geometry": mapping(merged),
+        }
+        geojson = {
+            "type": "FeatureCollection",
+            "features": [feature],
+        }
+        with rasterio.open(raster_path) as ds:
+            if ds.crs:
+                try:
+                    geojson["crs"] = {
+                        "type": "name",
+                        "properties": {"name": ds.crs.to_string()},
+                    }
+                except Exception:
+                    pass
+        out_geojson.write_text(json.dumps(geojson), encoding="utf-8")
+        return out_geojson
+    except Exception:
+        return None

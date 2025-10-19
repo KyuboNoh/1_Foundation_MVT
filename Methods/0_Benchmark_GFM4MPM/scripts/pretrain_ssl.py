@@ -42,12 +42,27 @@ class SSLDataset(Dataset):
         seed: int = 1337,
         skip_nan: bool = True,
         max_resample_attempts: int = 32,
+        debug_fraction: float = 100.0,
     ):
         self.stack, self.window = stack, window
-        self.rng = np.random.default_rng(seed)
-        self.n = n_samples
+        self._base_seed = int(seed)
+        self.rng = np.random.default_rng(self._base_seed)
+        self.total_samples = int(n_samples)
         self.skip_nan = bool(skip_nan)
         self.max_resample_attempts = max(1, int(max_resample_attempts))
+        frac = float(debug_fraction)
+        if not np.isfinite(frac):
+            frac = 100.0
+        frac = min(max(frac, 0.0), 100.0)
+        self.debug_fraction = frac
+        if frac >= 100.0:
+            self.n = self.total_samples
+            self._debug_mode = False
+        else:
+            reduced = int(round(self.total_samples * frac / 100.0))
+            self.n = max(1, min(self.total_samples, reduced))
+            self._debug_mode = True
+        self._debug_cache: Dict[int, Dict[str, torch.Tensor]] = {}
 
     def __len__(self):
         return self.n
@@ -71,7 +86,7 @@ class SSLDataset(Dataset):
         }
         return sample
 
-    def __getitem__(self, idx):
+    def _draw_patch(self, rng: np.random.Generator) -> Dict[str, torch.Tensor]:
         if hasattr(self.stack, "sample_patch"):
             attempts = self.max_resample_attempts if self.skip_nan else 1
             last_patch = None
@@ -79,14 +94,21 @@ class SSLDataset(Dataset):
             for _ in range(attempts):
                 sample = self.stack.sample_patch(
                     self.window,
-                    self.rng,
+                    rng,
                     skip_nan=self.skip_nan,
                     max_attempts=self.max_resample_attempts,
                 )
-                if isinstance(sample, tuple) and len(sample) == 2:
-                    patch, mask = sample
+                patch = None
+                mask = None
+                if isinstance(sample, tuple):
+                    if len(sample) >= 1:
+                        patch = sample[0]
+                    if len(sample) >= 2:
+                        mask = sample[1]
                 else:
-                    patch, mask = sample, None
+                    patch = sample
+                if patch is None:
+                    continue
                 mask_no_feature = self._ensure_mask(mask, patch)
                 if mask_no_feature.all():
                     last_patch, last_mask = patch, mask_no_feature
@@ -103,13 +125,13 @@ class SSLDataset(Dataset):
         last_mask = None
         for _ in range(attempts):
             if hasattr(self.stack, "random_coord"):
-                r, c = self.stack.random_coord(self.window, self.rng)
+                r, c = self.stack.random_coord(self.window, rng)
             else:
                 half = max(1, self.window // 2)
                 max_row = max(half + 1, self.stack.height - half)
                 max_col = max(half + 1, self.stack.width - half)
-                r = int(self.rng.integers(half, max_row))
-                c = int(self.rng.integers(half, max_col))
+                r = int(rng.integers(half, max_row))
+                c = int(rng.integers(half, max_col))
                 (clamped_coord, _) = clamp_coords_to_window([(r, c)], self.stack, self.window)
                 r, c = clamped_coord[0]
             if hasattr(self.stack, "read_patch_with_mask"):
@@ -136,7 +158,23 @@ class SSLDataset(Dataset):
             raise RuntimeError(
                 "Unable to sample a patch from raster stack; verify raster coverage and metadata."
             )
-        return self._pack_sample(last_patch, last_mask if last_mask is not None else np.zeros(last_patch.shape[-2:], dtype=bool))
+        fallback_mask = last_mask if last_mask is not None else np.zeros(last_patch.shape[-2:], dtype=bool)
+        return self._pack_sample(last_patch, fallback_mask)
+
+    def __getitem__(self, idx):
+        if self._debug_mode:
+            key = int(idx) % self.n
+            cached = self._debug_cache.get(key)
+            if cached is None:
+                local_rng = np.random.default_rng(self._base_seed + key)
+                cached = self._draw_patch(local_rng)
+                self._debug_cache[key] = cached
+            # return clones to avoid in-place modification issues
+            return {
+                name: tensor.clone() if torch.is_tensor(tensor) else tensor
+                for name, tensor in cached.items()
+            }
+        return self._draw_patch(self.rng)
 
 
 def _generate_preview_inference(
@@ -1015,6 +1053,8 @@ if __name__ == '__main__':
     ap.add_argument('--epochs', type=int, default=30)
     ap.add_argument('--batch', type=int, default=128)
     ap.add_argument('--val-batch', type=int, help='Batch size for validation loader (defaults to --batch)')
+
+    # TODO: check train-samples and val-samples are calculated from samples properly
     ap.add_argument('--train-samples', type=int, default=200000, help='Number of training samples per epoch')
     ap.add_argument('--val-samples', type=int, default=8192, help='Number of validation samples per epoch (0 disables validation)')
     ap.add_argument('--seed', type=int, default=1337, help='Random seed for SSL sampling')
@@ -1023,18 +1063,21 @@ if __name__ == '__main__':
     ap.add_argument('--preview-samples', type=int, default=0, help='If >0, create reconstruction previews for this many samples')
     ap.add_argument('--check-image-preproc', action='store_true', help='Render diagnostic plots for patch windowing')
     ap.add_argument('--check-feature', type=str,
-                    default='Gravity_Bouguer_HGM_Worms_Proximity', help='Feature name to visualize when running image preprocessing diagnostics',
-                    )
+                    default='Gravity_Bouguer_HGM_Worms_Proximity', help='Feature name to visualize when running image preprocessing diagnostics',)
     ap.add_argument('--skip-nan', dest='skip_nan', action='store_true',
                     help='Resample until patches contain only finite values (default behaviour)')
     ap.add_argument('--allow-nan', dest='skip_nan', action='store_false',
                     help='Allow NaNs in sampled patches (disables resampling)')
+    
     ap.set_defaults(skip_nan=True)
     ap.set_defaults(norm_per_patch=True, use_ssim=False)
     ap.add_argument('--skip-nan-attempts', type=int, default=64,
                     help='Maximum resampling attempts when skipping NaN-containing patches')
+    
     ap.add_argument('--button-inference', action='store_true',
                     help='Skip training and generate previews from existing checkpoints')
+    ap.add_argument('--button-debug-fraction', type=float, default=100.0,
+                    help='Percentage of training samples to keep for debug runs (fixed subset reused each epoch)',)
     args = ap.parse_args()
 
     modes = [bool(args.bands), bool(args.stac_root), bool(args.stac_table)]
@@ -1160,7 +1203,6 @@ if __name__ == '__main__':
             used_feature_list = []
     used_feature_list = list(dict.fromkeys(str(name) for name in used_feature_list))
 
-    # TODO: check path?
     requested_out = Path(args.out)/"1_SSL/"
     if stac_root_path is not None:
         output_base = (stac_root_path / "work").resolve()
@@ -1226,7 +1268,13 @@ if __name__ == '__main__':
         seed=args.seed,
         skip_nan=args.skip_nan,
         max_resample_attempts=args.skip_nan_attempts,
+        debug_fraction=args.button_debug_fraction,
     )
+    if args.button_debug_fraction < 100.0:
+        print(
+            f"[info] button-debug-fraction={args.button_debug_fraction:.2f}% -> "
+            f"using {len(train_ds)} fixed training sample(s) per epoch (requested {args.train_samples})."
+        )
 
     # TODO: Make it generalized for future development... How so?
     worker_count = 8
@@ -1249,6 +1297,7 @@ if __name__ == '__main__':
             seed=args.seed + 1,
             skip_nan=args.skip_nan,
             max_resample_attempts=args.skip_nan_attempts,
+            debug_fraction=args.button_debug_fraction,
         )
         val_batch = args.val_batch if args.val_batch and args.val_batch > 0 else args.batch
         val_dl = DataLoader(

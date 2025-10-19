@@ -77,6 +77,7 @@ def _mc_predict_single_region(
         mean_map[r, c] += mu
         var_map[r, c]  += sig2
         counts[r, c]   += 1
+
         if save_prediction:
             prediction_buffer[next_row] = (r, c, mu, sig2)
             next_row += 1
@@ -105,8 +106,11 @@ def _mc_predict_single_region(
             os.makedirs(parent_dir, exist_ok=True)
         np.save(target_path, predictions)
 
-    mean_map /= np.maximum(counts, 1)
-    var_map  /= np.maximum(counts, 1)
+    with np.errstate(invalid="ignore"):
+        mean_map = np.divide(mean_map, counts, where=counts > 0)
+        var_map = np.divide(var_map, counts, where=counts > 0)
+    mean_map[counts == 0] = np.nan
+    var_map[counts == 0] = np.nan
     return mean_map, np.sqrt(var_map)
 
 
@@ -284,9 +288,11 @@ def write_prediction_outputs(
             resolved_name = region_name if region_name else "GLOBAL"
             mean_path = out_dir / f"Pospectivity_region_{resolved_name}_mean.tif"
             std_path = out_dir / f"Pospectivity_region_{resolved_name}_std.tif"
+            mean_std_path = out_dir / f"Pospectivity_region_{resolved_name}_mean_std.tif"
         else:
             mean_path = out_dir / 'Pospectivity_mean.tif'
             std_path = out_dir / 'Pospectivity_std.tif'
+            mean_std_path = out_dir /'Pospectivity_mean_std.tif'
 
         save_geotiff(str(mean_path), masked_mean, ref_src, valid_mask=valid_mask)
         save_geotiff(str(std_path), masked_std, ref_src, valid_mask=valid_mask)
@@ -309,19 +315,19 @@ def write_prediction_outputs(
             boundary_mask=boundary_mask,
             pos_coords=region_positions,
         )
+        mean_std_png = mean_std_path.with_suffix('.png')
         save_png2(
-            summary_png, 
+            mean_std_png, 
             masked_mean,
-            std_png,
             masked_std,
-            cmap1="blue_to_yellow",
+            cmap1="inferno",
             cmap2="gray",
             criteria=0.25,
             valid_mask=valid_mask,
             boundary_mask=boundary_mask,
             pos_coords=region_positions,
         )
-        print(f"Wrote {mean_path}, {std_path}, summary PNG {summary_png}, and std PNG {std_png}")
+        print(f"Wrote {mean_path}, {std_path}, {mean_std_path}, mean PNG {summary_png}, std PNG {std_png}, and mean-std PNG {mean_std_png}.")
 
 
 def save_geotiff(path, array, ref_src, valid_mask: np.ndarray = None, nodata: float = np.nan):
@@ -346,99 +352,97 @@ def save_png(
     std_array: np.ndarray = None,
     pos_coords: Sequence[Tuple[int, int]] = None,
 ):
-    data = np.asarray(array, dtype=np.float32)
-    display = data.copy()
-    if valid_mask is not None and valid_mask.shape == data.shape:
-        display = np.where(valid_mask, display, np.nan)
-    finite_mask = np.isfinite(display)
-    if not finite_mask.any():
-        display = np.zeros_like(display, dtype=np.float32)
-        finite_mask = np.ones_like(display, dtype=bool)
-    elif not finite_mask.all():
-        fill_value = float(np.nanmean(display[finite_mask])) if finite_mask.any() else 0.0
-        display = np.where(finite_mask, display, fill_value).astype(np.float32, copy=False)
-
     import matplotlib
     if matplotlib.get_backend().lower() != "agg":
         matplotlib.use("Agg", force=True)
     from matplotlib import pyplot as plt
+    import numpy as np
+
+    data = np.asarray(array, dtype=np.float32)
+    display = data.copy()
+
+    # Apply valid mask (set invalid pixels to NaN)
+    if valid_mask is not None and valid_mask.shape == data.shape:
+        display = np.where(valid_mask, display, np.nan)
+
+    # Replace fully NaN map with zeros
+    if not np.isfinite(display).any():
+        display = np.zeros_like(display)
+
     height, width = display.shape
     dpi = 100
     fig_w = max(width / dpi, 1e-2)
     fig_h = max(height / dpi, 1e-2)
+
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
     ax.axis("off")
 
+
+    # Resolve colormap properly
+    if isinstance(cmap, str):
+        cmap_obj: Colormap = plt.get_cmap(cmap).copy()
+    else:
+        cmap_obj: Colormap = cmap.copy()
+
+    # Make invalid (NaN) pixels white instead of black
+    cmap_obj.set_bad(color="white")
+
+    im = ax.imshow(
+        np.ma.masked_invalid(display),
+        cmap=cmap_obj,
+        vmin=vmin,
+        vmax=vmax,
+        interpolation="bilinear",
+        origin="upper",
+    )
+
+    # Overlay std array (if provided)
     if std_array is not None:
         std_data = np.asarray(std_array, dtype=np.float32)
-        std_display = std_data.copy()
-        if valid_mask is not None and valid_mask.shape == std_display.shape:
-            std_display = np.where(valid_mask, std_display, np.nan)
-        std_finite = np.isfinite(std_display)
-        if not std_finite.any():
-            std_display = np.zeros_like(std_display, dtype=np.float32)
-            std_finite = np.ones_like(std_display, dtype=bool)
-        elif not std_finite.all():
-            std_fill = float(np.nanmean(std_display[std_finite])) if std_finite.any() else 0.0
-            std_display = np.where(std_finite, std_display, std_fill).astype(np.float32, copy=False)
-
-        positive_vals = display[finite_mask & (display > 0)]
-        base_vals = display[finite_mask]
-        if positive_vals.size:
-            hv_vmin = float(np.nanpercentile(positive_vals, 25))
-        elif base_vals.size:
-            hv_vmin = float(np.nanpercentile(base_vals, 25))
-        else:
-            hv_vmin = 0.0
-        hv_vmax_data = float(np.nanmax(base_vals)) if base_vals.size else hv_vmin + 1e-3
-        hv_vmax = 1.0 if hv_vmax_data >= 1.0 else hv_vmax_data
-        if not np.isfinite(hv_vmax):
-            hv_vmax = 1.0
-        if hv_vmax <= hv_vmin:
-            hv_vmin = hv_vmax - 1e-3
-            if hv_vmin < 0.0:
-                hv_vmin = 0.0
-        base_image = np.clip(display, hv_vmin, hv_vmax)
-        ax.imshow(base_image, cmap="inferno", vmin=hv_vmin, vmax=hv_vmax)
-
-        std_vals = std_display[std_finite]
+        if valid_mask is not None and valid_mask.shape == std_data.shape:
+            std_data = np.where(valid_mask, std_data, np.nan)
+        std_vals = std_data[np.isfinite(std_data)]
         if std_vals.size:
-            std_q1 = float(np.nanpercentile(std_vals, 25))
-        else:
-            std_q1 = 0.0
-        std_vmax = std_q1 if std_q1 > 0 else (float(np.nanmax(std_vals)) if std_vals.size else 1.0)
-        if not np.isfinite(std_vmax) or std_vmax <= 0:
-            std_vmax = 1.0
-        std_clipped = np.clip(std_display, 0.0, std_vmax)
-        ax.imshow(std_clipped, cmap="gray", vmin=0.0, vmax=std_vmax, alpha=0.35)
-    else:
-        ax.imshow(display, cmap=cmap, vmin=vmin, vmax=vmax)
-
-    if pos_coords:
-        coords_arr = np.asarray(pos_coords, dtype=np.float32)
-        if coords_arr.ndim == 2 and coords_arr.size:
-            ys = np.clip(coords_arr[:, 0] + 0.5, 0.0, height - 0.5)
-            xs = np.clip(coords_arr[:, 1] + 0.5, 0.0, width - 0.5)
-            ax.scatter(
-                xs,
-                ys,
-                s=18,
-                c="cyan",
-                edgecolors="black",
-                linewidths=0.4,
-                marker="o",
-                zorder=5,
+            std_vmax = np.nanpercentile(std_vals, 95)
+            std_clipped = np.clip(std_data, 0, std_vmax)
+            ax.imshow(
+                std_clipped,
+                cmap="gray",
+                vmin=0,
+                vmax=std_vmax,
+                alpha=0.25,
+                interpolation="bilinear",  # 🔹 smooth overlay
             )
 
+    # Cyan deposit markers
+    if pos_coords:
+        coords_arr = np.asarray(pos_coords, np.float32)
+        if coords_arr.ndim == 2 and coords_arr.size:
+            ys = np.clip(coords_arr[:, 0] + 0.5, 0, height - 0.5)
+            xs = np.clip(coords_arr[:, 1] + 0.5, 0, width - 0.5)
+            ax.scatter(
+                xs, ys, s=18, c="cyan",
+                edgecolors="black", linewidths=0.4,
+                marker="o", zorder=5
+            )
+
+    # Boundary outline
     if boundary_mask is not None and boundary_mask.shape == display.shape and boundary_mask.any():
-        ax.contour(boundary_mask.astype(np.uint8), levels=[0.5], colors="white", linewidths=0.8)
+        ax.contour(
+            boundary_mask.astype(np.uint8),
+            levels=[0.5], colors="white", linewidths=0.8
+        )
 
     ax.set_xlim(-0.5, width - 0.5)
     ax.set_ylim(height - 0.5, -0.5)
     ax.set_aspect("equal")
-    fig.savefig(path, bbox_inches="tight", pad_inches=0)
-    plt.close(fig)
 
+
+    # Optional: add colorbar for quick checks
+    fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
+
+    fig.savefig(path, bbox_inches="tight", pad_inches=0, dpi=dpi)
+    plt.close(fig)
 
 def _resolve_cmap(name: Optional[str], fallback: str):
     from matplotlib import pyplot as plt
@@ -468,98 +472,94 @@ def _resolve_cmap(name: Optional[str], fallback: str):
         except ValueError:
             return plt.get_cmap("viridis")
 
-
 def save_png2(
-    summary_path: Path,
-    summary_array: np.ndarray,
-    std_path: Path,
+    mean_std_path: Path,
+    mean_array: np.ndarray,
     std_array: np.ndarray,
-    cmap1: str = "viridis",
+    cmap1: str = "plasma",
     cmap2: str = "gray",
-    vmin: Optional[float] = None,
-    vmax: float = 1.0,
-    criteria: Optional[float] = None,
+    criteria: float = 0.25,
     valid_mask: np.ndarray = None,
     boundary_mask: np.ndarray = None,
     pos_coords: Sequence[Tuple[int, int]] = None,
-) -> None:
-    summary_path = Path(summary_path)
-    std_path = Path(std_path)
-
-    summary = np.asarray(summary_array, dtype=np.float32)
-    std = np.asarray(std_array, dtype=np.float32)
-
-    if valid_mask is not None and valid_mask.shape == summary.shape:
-        summary = np.where(valid_mask, summary, np.nan)
-        std = np.where(valid_mask, std, np.nan)
-
-    summary_raw = summary.copy()
-    threshold = criteria if criteria is not None else (vmin if vmin is not None else 0.0)
-    threshold = float(max(0.0, min(threshold, 1.0)))
-
-    summary_display = np.clip(summary.copy(), None, 1.0)
-    if threshold > 0.0:
-        mask_below = ~(np.isfinite(summary_display) & (summary_display >= threshold))
-        summary_display[mask_below] = np.nan
-
-    std_display = std.copy()
-    valid_summary = np.isfinite(summary_raw)
-    high_mask = valid_summary & (summary_raw >= threshold)
-    std_display[~valid_summary] = np.nan
-    std_display[high_mask] = np.nan
-
+):
     import matplotlib
     if matplotlib.get_backend().lower() != "agg":
         matplotlib.use("Agg", force=True)
     from matplotlib import pyplot as plt
+    from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
-    cmap_summary = _resolve_cmap(cmap1, "viridis")
-    cmap_std = _resolve_cmap(cmap2, "gray")
+    mean = np.asarray(mean_array, np.float32)
+    std = np.asarray(std_array, np.float32)
 
-    height, width = summary_display.shape
+    # Mask invalid regions
+    if valid_mask is not None and valid_mask.shape == mean.shape:
+        mean = np.where(valid_mask, mean, np.nan)
+        std = np.where(valid_mask, std, np.nan)
+
+    # Normalize both to [0, 1]
+    def _normalize(x):
+        finite = np.isfinite(x)
+        if not np.any(finite):
+            return x
+        x_min, x_max = np.nanmin(x[finite]), np.nanmax(x[finite])
+        return (x - x_min) / (x_max - x_min + 1e-8)
+
+    mean_norm = _normalize(mean)
+    std_norm = _normalize(std)
+
+    # Blend weight: high mean → color, low mean → uncertainty
+    alpha = np.clip((mean_norm - criteria) / (1.0 - criteria), 0.0, 1.0)
+
+    cmap_mean = plt.get_cmap(cmap1)
+    cmap_std = plt.get_cmap(cmap2)
+
+    mean_rgb = cmap_mean(mean_norm)[..., :3]
+    std_rgb = cmap_std(std_norm)[..., :3]
+    combined_rgb = alpha[..., None] * mean_rgb + (1.0 - alpha[..., None]) * std_rgb
+
+    # Fill NaN with white (so black areas disappear)
+    combined_rgb[~np.isfinite(mean)] = (1.0, 1.0, 1.0)
+
+    h, w, _ = combined_rgb.shape
     dpi = 100
-    fig_w = max(width / dpi, 1e-2)
-    fig_h = max(height / dpi, 1e-2)
+    fig, ax = plt.subplots(figsize=(w / dpi, h / dpi), dpi=dpi)
+    ax.imshow(combined_rgb, origin="upper", interpolation="none")
+    ax.axis("off")
 
-    def _plot(path_obj: Path, data: np.ndarray, cmap, vmin_local=None, vmax_local=None):
-        masked_data = np.ma.array(data, mask=~np.isfinite(data))
-        if vmin_local is None:
-            finite_vals = data[np.isfinite(data)]
-            vmin_local = float(finite_vals.min()) if finite_vals.size else None
-        if vmax_local is None:
-            finite_vals = data[np.isfinite(data)]
-            vmax_local = float(finite_vals.max()) if finite_vals.size else None
+    # Boundary contour
+    if boundary_mask is not None and boundary_mask.shape == mean.shape and boundary_mask.any():
+        ax.contour(boundary_mask.astype(np.uint8), levels=[0.5], colors="white", linewidths=0.8)
 
-        fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
-        ax.axis("off")
-        ax.imshow(masked_data, cmap=cmap, vmin=vmin_local, vmax=vmax_local)
-        if boundary_mask is not None and boundary_mask.shape == data.shape and boundary_mask.any():
-            ax.contour(boundary_mask.astype(np.uint8), levels=[0.5], colors="white", linewidths=0.8)
-        if pos_coords:
-            coords_arr = np.asarray(pos_coords, dtype=np.float32)
-            if coords_arr.ndim == 2 and coords_arr.size:
-                ys = np.clip(coords_arr[:, 0] + 0.5, 0.0, height - 0.5)
-                xs = np.clip(coords_arr[:, 1] + 0.5, 0.0, width - 0.5)
-                ax.scatter(
-                    xs,
-                    ys,
-                    s=18,
-                    c="cyan",
-                    edgecolors="black",
-                    linewidths=0.4,
-                    marker="o",
-                    zorder=5,
-                )
-        ax.set_xlim(-0.5, width - 0.5)
-        ax.set_ylim(height - 0.5, -0.5)
-        ax.set_aspect("equal")
-        fig.savefig(path_obj, bbox_inches="tight", pad_inches=0)
-        plt.close(fig)
+    # Deposit positions
+    if pos_coords:
+        coords = np.asarray(pos_coords)
+        ys = np.clip(coords[:, 0] + 0.5, 0, h - 0.5)
+        xs = np.clip(coords[:, 1] + 0.5, 0, w - 0.5)
+        ax.scatter(xs, ys, s=18, c="cyan", edgecolors="black", linewidths=0.4, zorder=5)
 
-    vmax_summary = min(1.0, vmax if vmax is not None else 1.0)
-    summary_vmin = threshold if threshold > 0.0 else vmin
-    _plot(summary_path, summary_display, cmap_summary, vmin_local=summary_vmin, vmax_local=vmax_summary)
+    # --- Add colorbars ---
+    # Likelihood bar
+    cax1 = inset_axes(ax, width="2%", height="35%", loc="upper right", borderpad=0.5)
+    cb1 = plt.colorbar(
+        plt.cm.ScalarMappable(cmap=cmap_mean),
+        cax=cax1,
+        orientation="vertical",
+        fraction=0.05,
+    )
+    cb1.set_label("Likelihood", fontsize=8)
+    cb1.ax.tick_params(labelsize=7)
 
-    std_finite = std_display[np.isfinite(std_display)]
-    std_vmax = float(std_finite.max()) if std_finite.size else None
-    _plot(std_path, std_display, cmap_std, vmin_local=0.0, vmax_local=std_vmax)
+    # Uncertainty bar (below)
+    cax2 = inset_axes(ax, width="2%", height="35%", loc="lower right", borderpad=0.5)
+    cb2 = plt.colorbar(
+        plt.cm.ScalarMappable(cmap=cmap_std),
+        cax=cax2,
+        orientation="vertical",
+        fraction=0.05,
+    )
+    cb2.set_label("Uncertainty", fontsize=8)
+    cb2.ax.tick_params(labelsize=7)
+
+    fig.savefig(mean_std_path, bbox_inches="tight", pad_inches=0)
+    plt.close(fig)

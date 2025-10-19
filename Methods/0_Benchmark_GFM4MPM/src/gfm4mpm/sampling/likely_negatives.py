@@ -39,6 +39,10 @@ def pu_select_negatives(
     Zp = Z_all[pos_idx]
     Zu = Z_all[unk_idx]
 
+    # normalize for fair distance
+    Zp = Zp / np.linalg.norm(Zp, axis=1, keepdims=True)
+    Zu = Zu / np.linalg.norm(Zu, axis=1, keepdims=True)
+
     # Compute min distance to any positive for each unknown
     dists = []
     step = 4096

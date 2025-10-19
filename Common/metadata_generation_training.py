@@ -132,6 +132,19 @@ def generate_training_metadata(
         item_obj = product.get("item")
         if getattr(item_obj, "id", None):
             tif_info["stac_item_id"] = str(item_obj.id)
+        valid_pixels = product.get("valid_pixel_count")
+        total_pixels = product.get("total_pixel_count")
+        if valid_pixels is not None:
+            tif_info["valid_pixels"] = int(valid_pixels)
+        if total_pixels is not None:
+            tif_info["total_pixels"] = int(total_pixels)
+        if valid_pixels is not None and total_pixels:
+            try:
+                fraction = float(valid_pixels) / float(total_pixels) if total_pixels else None
+            except Exception:
+                fraction = None
+            if fraction is not None:
+                tif_info["valid_fraction"] = fraction
 
         abs_path = None
         rel_path = tif_info.get("path")

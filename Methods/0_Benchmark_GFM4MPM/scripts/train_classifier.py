@@ -49,10 +49,10 @@ if __name__ == '__main__':
     ap.add_argument('--encoder', required=True)
     ap.add_argument('--out', required=True)
     ap.add_argument('--batch', type=int, default=32)
-    # ap.add_argument('--patch', type=int, default=32)
     ap.add_argument('--epochs', type=int, default=60)
-    # ap.add_argument('--stride', type=int, default=2, help='Stride for sliding window inference (in pixels)')
-    ap.add_argument('--passes', type=int, default=5, help='Number of stochastic forward passes for MC-Dropout')
+
+    ap.add_argument('--stride', type=int, default=None, help='Stride for sliding window inference (in pixels)')
+    ap.add_argument('--passes', type=int, default=10, help='Number of stochastic forward passes for MC-Dropout')
     ap.add_argument('--debug', action='store_true', help='Generate debug plots for labels and feature rasters')
 
     ap.add_argument('--test-ratio', type=float, default=0.3, help='Fraction of data to use for validation')
@@ -102,6 +102,8 @@ if __name__ == '__main__':
 
     if load_result.mode == 'table' and window_size != 1:
         window_size = 1
+
+    stride = args.stride if args.stride is not None else window_size
 
     state_dict = torch.load(encoder_path, map_location='cpu')
     patch_proj = state_dict.get('patch.proj.weight')
@@ -194,6 +196,8 @@ if __name__ == '__main__':
     encoder = MAEViT(in_chans=stack.count, **mae_kwargs)
     encoder.load_state_dict(state_dict)
     in_dim = encoder.blocks[0].attn.embed_dim
+
+    # TODO: Add hyperparameters for probability, hidden dims...
     mlp = MLPDropout(in_dim=in_dim)
 
     # Train classifier
@@ -208,7 +212,17 @@ if __name__ == '__main__':
     # TODO: Allow stride override?
     # prediction = mc_predict_map(encoder, mlp, stack, window_size=window_size, stride=int(1.00*patch_size), passes=args.passes, show_progress=True, save_prediction=args.save_prediction, save_path=out_dir)
     # prediction = mc_predict_map(encoder, mlp, stack, window_size=window_size, stride=int(1.00*window_size), passes=args.passes, show_progress=True, save_prediction=args.save_prediction, save_path=out_dir)
-    prediction = mc_predict_map(encoder, mlp, stack, window_size=window_size, stride=4, passes=args.passes, show_progress=True, save_prediction=args.save_prediction, save_path=out_dir)
+    prediction = mc_predict_map(
+        encoder,
+        mlp,
+        stack,
+        window_size=window_size,
+        stride=stride,
+        passes=args.passes,
+        show_progress=True,
+        save_prediction=args.save_prediction,
+        save_path=out_dir,
+    )
 
     if getattr(stack, 'is_table', False) and not isinstance(prediction, dict):
         mean_map, std_map = prediction

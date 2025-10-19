@@ -168,17 +168,9 @@ if __name__ == '__main__':
     ap.add_argument('--stac-table', help='Direct path to STAC Parquet table asset')
     ap.add_argument('--splits', required=True)
     ap.add_argument('--encoder', required=True)
-    ap.add_argument('--out', required=True)
-    ap.add_argument('--batch', type=int, default=32)
-    # ap.add_argument('--patch', type=int, default=32)
-    ap.add_argument('--epochs', type=int, default=60)
-    # ap.add_argument('--stride', type=int, default=2, help='Stride for sliding window inference (in pixels)')
-    ap.add_argument('--passes', type=int, default=5, help='Number of stochastic forward passes for MC-Dropout')
-    ap.add_argument('--debug', action='store_true', help='Generate debug plots for labels and feature rasters')
 
-    ap.add_argument('--test-ratio', type=float, default=0.3, help='Fraction of data to use for validation')
-    ap.add_argument('--random-seed', type=int, default=42, help='Random seed for data splits and shuffling')
     ap.add_argument('--prediction-glob', help='Glob pattern to saved *_prediction*.npy files for redraw', default=None)
+    ap.add_argument('--out', required=True)
 
     args = ap.parse_args()
 
@@ -247,6 +239,12 @@ if __name__ == '__main__':
     if args.prediction_glob:
         print(f"[info] Reconstructing prospectivity maps from saved predictions matching {args.prediction_glob}")
         prediction = _load_saved_prediction_maps(args.prediction_glob, stack)
+
+
+        print(prediction)
+        exit()
+
+        
         write_prediction_outputs(
             prediction,
             stack,
