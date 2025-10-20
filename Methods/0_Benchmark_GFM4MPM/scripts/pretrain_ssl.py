@@ -21,7 +21,14 @@ _PROJECT_ROOT = _THIS_DIR.parent  # points to Methods/0_Benchmark_GFM4MPM
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from Common.data_utils import clamp_coords_to_window, load_stac_rasters, MultiRegionStack
+from Common.data_utils import (
+    clamp_coords_to_window,
+    count_valid_window_centers,
+    load_stac_rasters,
+    MultiRegionStack,
+    export_window_center_visualizations,
+    load_region_boundaries,
+)
 from src.gfm4mpm.data.geo_stack import GeoStack
 from src.gfm4mpm.data.stac_table import StacTableStack
 from src.gfm4mpm.models.mae_vit import MAEViT
@@ -1055,30 +1062,34 @@ if __name__ == '__main__':
     ap.add_argument('--val-batch', type=int, help='Batch size for validation loader (defaults to --batch)')
 
     # TODO: check train-samples and val-samples are calculated from samples properly
-    ap.add_argument('--train-samples', type=int, default=200000, help='Number of training samples per epoch')
-    ap.add_argument('--val-samples', type=int, default=8192, help='Number of validation samples per epoch (0 disables validation)')
+    ap.add_argument('--train-samples', type=int, default=None, help='Number of training samples per epoch')
+    ap.add_argument('--val-samples', type=int, default=None, help='Number of validation samples per epoch (0 disables validation)')
     ap.add_argument('--seed', type=int, default=1337, help='Random seed for SSL sampling')
     ap.add_argument('--optimizer', choices=['adamw', 'adam'], default='adamw')
     ap.add_argument('--lr', type=float, default=2.5e-4)
     ap.add_argument('--preview-samples', type=int, default=0, help='If >0, create reconstruction previews for this many samples')
     ap.add_argument('--check-image-preproc', action='store_true', help='Render diagnostic plots for patch windowing')
-    ap.add_argument('--check-feature', type=str,
-                    default='Gravity_Bouguer_HGM_Worms_Proximity', help='Feature name to visualize when running image preprocessing diagnostics',)
-    ap.add_argument('--skip-nan', dest='skip_nan', action='store_true',
-                    help='Resample until patches contain only finite values (default behaviour)')
-    ap.add_argument('--allow-nan', dest='skip_nan', action='store_false',
-                    help='Allow NaNs in sampled patches (disables resampling)')
+    ap.add_argument('--check-feature', type=str, default=None, help='Feature name to visualize when running image preprocessing diagnostics',)
+    ap.add_argument(
+        '--preview-window-centers',
+        nargs='?',
+        const='',
+        default=None,
+        help='Export valid window-center coverage (GeoTIFF + PNG) before training. '
+             'Optionally supply an output directory; defaults to <out>/diagnostics/window_centers.',
+    )
+    ap.add_argument('--skip-nan', dest='skip_nan', action='store_true', help='Resample until patches contain only finite values (default behaviour)')
+    ap.add_argument('--allow-nan', dest='skip_nan', action='store_false', help='Allow NaNs in sampled patches (disables resampling)')
     
     ap.set_defaults(skip_nan=True)
     ap.set_defaults(norm_per_patch=True, use_ssim=False)
-    ap.add_argument('--skip-nan-attempts', type=int, default=64,
-                    help='Maximum resampling attempts when skipping NaN-containing patches')
-    
-    ap.add_argument('--button-inference', action='store_true',
-                    help='Skip training and generate previews from existing checkpoints')
-    ap.add_argument('--button-debug-fraction', type=float, default=100.0,
-                    help='Percentage of training samples to keep for debug runs (fixed subset reused each epoch)',)
+    ap.add_argument('--skip-nan-attempts', type=int, default=64, help='Maximum resampling attempts when skipping NaN-containing patches')
+    ap.add_argument('--button-inference', action='store_true', help='Skip training and generate previews from existing checkpoints')
+    ap.add_argument('--button-debug-fraction', type=float, default=100.0, help='Percentage of training samples to keep for debug runs (fixed subset reused each epoch)',)
+
     args = ap.parse_args()
+
+    training_args_data: Optional[Dict[str, Any]] = None
 
     modes = [bool(args.bands), bool(args.stac_root), bool(args.stac_table)]
     if sum(modes) != 1:
@@ -1203,20 +1214,21 @@ if __name__ == '__main__':
             used_feature_list = []
     used_feature_list = list(dict.fromkeys(str(name) for name in used_feature_list))
 
-    requested_out = Path(args.out)/"1_SSL/"
-    if stac_root_path is not None:
-        output_base = (stac_root_path / "work").resolve()
-        relative_part = requested_out
-        if requested_out.is_absolute():
-            relative_part = Path(requested_out.name)
-        relative_str = str(relative_part).strip()
-        if not relative_str or relative_str in {".", "./"}:
-            output_dir = output_base
-        else:
-            output_dir = (output_base / relative_part).resolve()
-        print(f"[info] Output artifacts will be stored under {output_dir}")
-    else:
-        output_dir = requested_out.resolve()
+    # requested_out = Path(args.out)/"1_SSL/"
+    # if stac_root_path is not None:
+    #     output_base = (stac_root_path / "work").resolve()
+    #     relative_part = requested_out
+    #     if requested_out.is_absolute():
+    #         relative_part = Path(requested_out.name)
+    #     relative_str = str(relative_part).strip()
+    #     if not relative_str or relative_str in {".", "./"}:
+    #         output_dir = output_base
+    #     else:
+    #         output_dir = (output_base / relative_part).resolve()
+    #     print(f"[info] Output artifacts will be stored under {output_dir}")
+    # else:
+    #     output_dir = requested_out.resolve()
+    output_dir = Path(args.out)
 
     if args.window <= 0:
         ap.error('--window must be positive')
@@ -1226,6 +1238,47 @@ if __name__ == '__main__':
         ap.error('--window must be divisible by --patch to form an integer patch grid')
 
     preview_dir = output_dir / 'previews'
+    window_preview_dir: Optional[Path] = None
+    if args.preview_window_centers is not None:
+        preview_arg = args.preview_window_centers
+        if preview_arg == "":
+            window_preview_dir = (output_dir / "diagnostics" / "window_centers").resolve()
+        else:
+            candidate = Path(preview_arg).expanduser()
+            if not candidate.is_absolute():
+                candidate = (output_dir / candidate).resolve()
+            window_preview_dir = candidate
+
+    if window_preview_dir is not None:
+        if getattr(stack, "kind", None) != "raster":
+            print("[warn] Window-center previews currently supported for raster stacks only; skipping export.")
+        else:
+            boundary_map: Dict[str, Any] = {}
+            if stac_root_path is not None:
+                boundary_dir = (stac_root_path / "boundaries").resolve()
+                boundary_map = load_region_boundaries(boundary_dir, project_only=True)
+                if boundary_map:
+                    print(f"[info] Loaded {len(boundary_map)} boundary raster mask(s) from {boundary_dir}")
+                else:
+                    print(f"[warn] No boundary GeoJSON files found under {boundary_dir}; proceeding without overlays.")
+            try:
+                exports = export_window_center_visualizations(
+                    stack,
+                    window_size,
+                    window_preview_dir,
+                    boundaries=boundary_map if boundary_map else None,
+                )
+                if exports:
+                    regions_list = ", ".join(sorted(exports.keys()))
+                    print(
+                        f"[info] Window-center coverage exported to {window_preview_dir} for region(s): {regions_list}"
+                    )
+                else:
+                    print(
+                        "[warn] No valid window-center masks were generated; verify raster coverage and window size."
+                    )
+            except Exception as exc:
+                print(f"[warn] Failed to export window-center previews: {exc}")
 
     if args.check_image_preproc:
         if metadata and feature_entries:
@@ -1261,20 +1314,56 @@ if __name__ == '__main__':
         else:
             _maybe_check_image_preproc(stack, args.check_feature, window_size, preview_dir)
 
+    available_windows = count_valid_window_centers(stack, window_size)
+    if available_windows is not None:
+        if available_windows <= 0:
+            raise RuntimeError(f"No valid window centers available for window size {window_size}.")
+        print(f"[info] Estimated {available_windows:,} valid window center(s) for window size {window_size}.")
+    else:
+        print("[info] Unable to estimate valid window centers; proceeding with requested sample counts.")
+
+    train_samples_requested = args.train_samples
+    if train_samples_requested is None:
+        if training_args_data and training_args_data.get("train_samples") is not None:
+            train_samples_requested = int(training_args_data["train_samples"])
+        elif available_windows is not None:
+            train_samples_requested = int(available_windows)
+        else:
+            train_samples_requested = 200000
+    train_samples_requested = max(1, int(train_samples_requested))
+
+    effective_train_samples = train_samples_requested
+    if available_windows is not None:
+        effective_train_samples = max(1, min(train_samples_requested, available_windows))
+
+    val_samples_requested = args.val_samples
+    if val_samples_requested is None:
+        if training_args_data and training_args_data.get("val_samples") is not None:
+            val_samples_requested = int(training_args_data["val_samples"])
+        elif available_windows is not None:
+            val_samples_requested = max(1, min(available_windows, max(effective_train_samples // 8, 1)))
+        else:
+            val_samples_requested = max(1, effective_train_samples // 8)
+    val_samples_requested = max(0, int(val_samples_requested))
+    effective_val_samples = val_samples_requested
+    if available_windows is not None:
+        effective_val_samples = min(val_samples_requested, available_windows)
+
     train_ds = SSLDataset(
         stack,
         window=window_size,
-        n_samples=args.train_samples,
+        n_samples=effective_train_samples,
         seed=args.seed,
         skip_nan=args.skip_nan,
         max_resample_attempts=args.skip_nan_attempts,
         debug_fraction=args.button_debug_fraction,
     )
+    train_details = [f"requested {train_samples_requested}"]
+    if available_windows is not None:
+        train_details.append(f"available {available_windows}")
     if args.button_debug_fraction < 100.0:
-        print(
-            f"[info] button-debug-fraction={args.button_debug_fraction:.2f}% -> "
-            f"using {len(train_ds)} fixed training sample(s) per epoch (requested {args.train_samples})."
-        )
+        train_details.append(f"debug fraction {args.button_debug_fraction:.2f}%")
+    print(f"[info] Training samples per epoch: {len(train_ds)} ({', '.join(train_details)})")
 
     # TODO: Make it generalized for future development... How so?
     worker_count = 8
@@ -1289,16 +1378,21 @@ if __name__ == '__main__':
     )
 
     val_dl: Optional[DataLoader] = None
-    if not args.button_inference and args.val_samples > 0:
+    if not args.button_inference and effective_val_samples > 0:
         val_ds = SSLDataset(
             stack,
             window=window_size,
-            n_samples=args.val_samples,
+            n_samples=effective_val_samples,
             seed=args.seed + 1,
             skip_nan=args.skip_nan,
             max_resample_attempts=args.skip_nan_attempts,
-            debug_fraction=args.button_debug_fraction,
+            debug_fraction=100.0,
         )
+        val_details = [f"requested {val_samples_requested}"]
+        if available_windows is not None:
+            val_details.append(f"available {available_windows}")
+        print(f"[info] Validation samples per epoch: {len(val_ds)} ({', '.join(val_details)})")
+
         val_batch = args.val_batch if args.val_batch and args.val_batch > 0 else args.batch
         val_dl = DataLoader(
             val_ds,
@@ -1307,6 +1401,8 @@ if __name__ == '__main__':
             num_workers=worker_count,
             pin_memory=True,
         )
+    elif not args.button_inference:
+        print("[info] Validation disabled (no samples requested).")
 
     model = MAEViT(
         in_chans=stack.count,

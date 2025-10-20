@@ -600,6 +600,8 @@ def _generate_raster_assets(
     grid_size: int,
     check_raster: bool,
     check_features: Optional[Sequence[str]],
+    downsample_factor: Optional[float],
+    upsample_factor: Optional[float],
 ) -> tuple[List[Dict[str, Path]], Path]:
     assetization_dir = assets_dir / "assetization"
     ensure_dir(assetization_dir)
@@ -1334,7 +1336,14 @@ def _generate_raster_assets(
 
     products: List[Dict[str, Any]] = []
     try:
-        products = add_raster_assets(collection, raster_paths, target_asset_dir, cogify=True)
+        products = add_raster_assets(
+            collection,
+            raster_paths,
+            target_asset_dir,
+            cogify=True,
+            downsample_factor=downsample_factor,
+            upsample_factor=upsample_factor,
+        )
         for product in products:
             detail = raster_details.get(product.get("source_path"))
             if detail:
@@ -1398,6 +1407,18 @@ def main() -> None:
     parser.add_argument("--schema", type=str, default=None, help="Optional JSON column:type hints")
     parser.add_argument("--validate", action="store_true", help="Run STAC validation")
     parser.add_argument("--source-url", type=str, default=None, help="Optional source data URL")
+    parser.add_argument(
+        "--downsample-factor",
+        type=float,
+        default=None,
+        help="Optional downsampling ratio (>1.0) applied during raster asset creation.",
+    )
+    parser.add_argument(
+        "--upsample-factor",
+        type=float,
+        default=None,
+        help="Optional upsampling ratio (>1.0) applied during raster asset creation.",
+    )
 
     parser.add_argument("--features", nargs="+", default=None, help="Feature columns to rasterize (defaults to numeric inference when omitted).",)
     parser.add_argument(
@@ -1465,6 +1486,13 @@ def main() -> None:
         help="Skip raster and thumbnail generation for faster debugging.",
     )
     args = parser.parse_args()
+
+    if args.downsample_factor is not None and args.upsample_factor is not None:
+        parser.error("Only one of --downsample-factor or --upsample-factor may be provided.")
+    if args.downsample_factor is not None and args.downsample_factor <= 0:
+        parser.error("--downsample-factor must be positive.")
+    if args.upsample_factor is not None and args.upsample_factor <= 0:
+        parser.error("--upsample-factor must be positive.")
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
@@ -1601,6 +1629,8 @@ def main() -> None:
                 args.grid_size,
                 args.check_raster,
                 args.check_raster_features,
+                args.downsample_factor,
+                args.upsample_factor,
             )
         except Exception as exc:
             logging.exception("Failed to generate raster assets: %s", exc)

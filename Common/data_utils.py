@@ -12,12 +12,17 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 import numpy as np
 
+from affine import Affine
 try:  # Optional heavy imports; guard for environments without rasterio/shapely
     import rasterio  # type: ignore
-    from rasterio.features import shapes as raster_shapes  # type: ignore
+    from rasterio.features import shapes as raster_shapes, rasterize  # type: ignore
+    from rasterio.warp import Resampling, reproject  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     rasterio = None  # type: ignore
     raster_shapes = None  # type: ignore
+    rasterize = None  # type: ignore
+    Resampling = None  # type: ignore
+    reproject = None  # type: ignore
 
 try:
     from shapely.geometry import Polygon, MultiPolygon, shape, mapping  # type: ignore
@@ -38,6 +43,15 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from src.gfm4mpm.data.geo_stack import GeoStack  # noqa: E402
 from src.gfm4mpm.data.stac_table import StacTableStack  # noqa: E402
+
+
+@dataclass
+class BoundaryInfo:
+    path: Path
+    mask: np.ndarray
+    transform: Affine
+    crs: Optional[str]
+    geometry: Optional[Union[Polygon, MultiPolygon]]
 
 
 @dataclass
@@ -134,6 +148,47 @@ def load_split_stack(
     region_stacks, feature_names, metadata, feature_entries = load_region_stacks(metadata_root, feature_columns)
     if not region_stacks:
         raise RuntimeError("No region stacks could be constructed; check raster metadata")
+
+    boundary_sources: List[Union[str, Path]] = []
+    boundary_dir = (metadata_root / "boundaries").resolve()
+    if boundary_dir.exists():
+        boundary_sources.append(boundary_dir)
+
+    if training_metadata:
+        boundaries_section = training_metadata.get("boundaries")
+        if isinstance(boundaries_section, dict):
+            def _collect_boundary_records(records: Any) -> None:
+                if not isinstance(records, list):
+                    return
+                for entry in records:
+                    if not isinstance(entry, dict):
+                        continue
+                    path_val = entry.get("path") or entry.get("filename")
+                    if not path_val:
+                        continue
+                    candidate = Path(path_val)
+                    if not candidate.is_absolute():
+                        candidate = (metadata_root / candidate).resolve()
+                    boundary_sources.append(candidate)
+
+            project_records = boundaries_section.get("project")
+            if project_records:
+                _collect_boundary_records(project_records)
+            else:
+                for value in boundaries_section.values():
+                    _collect_boundary_records(value)
+
+    boundary_infos: Dict[str, BoundaryInfo] = {}
+    if boundary_sources:
+        boundary_infos = load_region_boundaries(boundary_sources, project_only=True)
+        if boundary_infos:
+            applied_masks = apply_boundaries_to_region_stacks(region_stacks, boundary_infos)
+            if applied_masks:
+                applied_regions = ", ".join(sorted(applied_masks.keys()))
+                source_desc = ", ".join({str(Path(src)) for src in boundary_sources})
+                print(
+                    f"[info] Applied boundary constraints for {len(applied_masks)} region(s) from {source_desc}: {applied_regions}"
+                )
 
     label_paths_by_region = collect_label_paths_by_region(
         metadata,
@@ -563,6 +618,18 @@ def _filter_valid_raster_coords_integral(
 
     half = window // 2
     use_progress = tqdm is not None and len(coords_list) > 0
+    global_mask = None
+    if not hasattr(stack, "resolve_region_stack"):
+        global_mask = _get_valid_window_mask(stack, window)
+        if global_mask is None:
+            return coords_list
+
+    global_mask = None
+    if not hasattr(stack, "resolve_region_stack"):
+        global_mask = _get_valid_window_mask(stack, window)
+        if global_mask is None:
+            return coords_list
+
     iterator = coords_list
     if use_progress:
         iterator = tqdm(coords_list, desc="Validate raster windows")
@@ -699,6 +766,42 @@ def _filter_valid_raster_coords_patch(
         print("[info] Validate raster windows completed (patch).")
 
     return valid, invalid
+
+
+def count_valid_window_centers(stack: Any, window: int) -> Optional[int]:
+    window = int(window)
+    if window <= 1:
+        if hasattr(stack, "resolve_region_stack") and hasattr(stack, "iter_region_stacks"):
+            total = 0
+            for _, region_stack in stack.iter_region_stacks():
+                h = getattr(region_stack, "height", None)
+                w = getattr(region_stack, "width", None)
+                if h is None or w is None:
+                    return None
+                total += int(h) * int(w)
+            return total
+        h = getattr(stack, "height", None)
+        w = getattr(stack, "width", None)
+        if h is not None and w is not None:
+            return int(h) * int(w)
+        return None
+
+    def _count_for_stack(stack_obj: Any) -> Optional[int]:
+        mask = _get_valid_window_mask(stack_obj, window)
+        if mask is None:
+            return None
+        return int(mask.sum())
+
+    if hasattr(stack, "resolve_region_stack") and hasattr(stack, "iter_region_stacks"):
+        total = 0
+        for _, region_stack in stack.iter_region_stacks():
+            count = _count_for_stack(region_stack)
+            if count is None:
+                return None
+            total += count
+        return total
+
+    return _count_for_stack(stack)
 
 
 class MultiRegionStack:
@@ -922,6 +1025,8 @@ def load_stac_rasters(
     features: Optional[Sequence[str]] = None,
     numeric_filter: Optional[Callable[[GeoStack], GeoStack]] = None,
 ) -> Tuple[Any, Dict[str, GeoStack], List[str], Optional[Dict[str, Any]], Optional[Dict[str, Any]], Dict[str, List[Path]]]:
+    stac_root = Path(stac_root).resolve()
+    metadata_root = stac_root
     feature_names, region_paths, metadata, feature_entries = collect_region_feature_paths(stac_root, features)
     region_stacks: Dict[str, GeoStack] = {}
     for region, paths in region_paths.items():
@@ -929,6 +1034,28 @@ def load_stac_rasters(
         stack.feature_columns = list(feature_names)
         stack.feature_metadata = [{"regions": [region]} for _ in feature_names]
         region_stacks[region] = stack
+
+    boundary_dir = (metadata_root / "boundaries").resolve()
+    if boundary_dir.exists():
+        boundary_infos = load_region_boundaries(boundary_dir, project_only=True)
+        if boundary_infos:
+            applied_masks = apply_boundaries_to_region_stacks(region_stacks, boundary_infos)
+            if applied_masks:
+                applied_regions = ", ".join(sorted(applied_masks.keys()))
+                print(
+                    f"[info] Applied boundary constraints for {len(applied_masks)} region(s) from {boundary_dir}: {applied_regions}"
+                )
+
+    boundary_dir = (stac_root / "boundaries").resolve()
+    if boundary_dir.exists():
+        boundary_geoms = load_region_boundaries(boundary_dir, project_only=True)
+        if boundary_geoms:
+            applied_masks = apply_boundaries_to_region_stacks(region_stacks, boundary_geoms)
+            if applied_masks:
+                applied_regions = ", ".join(sorted(applied_masks.keys()))
+                print(
+                    f"[info] Applied boundary constraints for {len(applied_masks)} region(s) from {boundary_dir}: {applied_regions}"
+                )
 
     base_stack, resolved_features = build_geostack_for_regions(
         feature_names,
@@ -1505,6 +1632,55 @@ def read_stack_patch(stack: Any, coord: Any, window: int) -> np.ndarray:
     return stack.read_patch(int(row), int(col), window)
 
 
+def _get_valid_window_mask(stack_obj: Any, window: int) -> Optional[np.ndarray]:
+    if rasterio is None:
+        return None
+    window = int(window)
+    if window <= 1:
+        return None
+
+    cache = getattr(stack_obj, "_valid_window_masks", None)
+    if cache is None:
+        cache = {}
+        setattr(stack_obj, "_valid_window_masks", cache)
+    mask = cache.get(window)
+    if mask is not None:
+        return mask
+
+    base_mask: Optional[np.ndarray] = None
+    srcs = getattr(stack_obj, "srcs", None)
+    if srcs:
+        try:
+            mask_arr = srcs[0].dataset_mask()
+        except Exception:
+            mask_arr = None
+        if mask_arr is not None:
+            mask_arr = np.asarray(mask_arr)
+            if mask_arr.ndim == 3:
+                mask_arr = mask_arr[0]
+            mask_bool = mask_arr != 0
+            if mask_bool.any():
+                base_mask = mask_bool.astype(bool, copy=False)
+    if base_mask is None:
+        combined = getattr(stack_obj, "_combined_valid_mask", None)
+        if combined is not None and combined.any():
+            base_mask = combined.astype(bool, copy=False)
+    if base_mask is None:
+        boundary = getattr(stack_obj, "boundary_mask", None)
+        if boundary is not None and boundary.any():
+            base_mask = boundary.astype(bool, copy=False)
+    if base_mask is None or not base_mask.any():
+        return None
+    boundary_overlay = getattr(stack_obj, "boundary_mask", None)
+    if boundary_overlay is not None:
+        base_mask = base_mask & boundary_overlay.astype(bool, copy=False)
+        if not base_mask.any():
+            return None
+    valid_mask = base_mask.astype(bool, copy=False)
+    cache[window] = valid_mask
+    return valid_mask
+
+
 def prefilter_valid_window_coords(
     stack: Any,
     coords: Sequence[RegionCoord],
@@ -1518,51 +1694,12 @@ def prefilter_valid_window_coords(
     considered invalid and removed.
     """
     coords_list = list(coords)
-    if rasterio is None or unary_union is None:
-        return coords_list
+    if not coords_list:
+        return []
 
     window = int(window)
-    if window <= 1 or not coords_list:
+    if window <= 1:
         return coords_list
-
-    half = window // 2
-
-    def _valid_window_mask(stack_obj: Any) -> Optional[np.ndarray]:
-        mask = getattr(stack_obj, "_valid_window_mask", None)
-        if mask is not None:
-            return mask
-        srcs = getattr(stack_obj, "srcs", None)
-        if not srcs:
-            return None
-        try:
-            mask_arr = srcs[0].dataset_mask()
-        except Exception:
-            mask_arr = None
-        if mask_arr is None:
-            return None
-        mask_arr = np.asarray(mask_arr)
-        if mask_arr.ndim == 3:
-            mask_arr = mask_arr[0]
-        mask_bool = mask_arr != 0
-        if not mask_bool.any():
-            return None
-        try:
-            from scipy.ndimage import minimum_filter
-        except Exception:
-            return None
-        valid_mask = minimum_filter(mask_bool.astype(np.uint8), size=window, mode="constant")
-        valid_mask = valid_mask.astype(bool, copy=False)
-        stack_obj._valid_window_mask = valid_mask  # cache for reuse
-        return valid_mask
-
-    def _is_coord_valid(stack_obj: Any, coord_tuple: Tuple[int, int]) -> bool:
-        mask = _valid_window_mask(stack_obj)
-        if mask is None:
-            return True
-        r, c = coord_tuple
-        if 0 <= r < mask.shape[0] and 0 <= c < mask.shape[1]:
-            return mask[r, c]
-        return False
 
     iterator = coords_list
     use_progress = tqdm is not None and len(coords_list) > 0
@@ -1570,13 +1707,24 @@ def prefilter_valid_window_coords(
         iterator = tqdm(coords_list, desc="Prefilter window coverage")
 
     filtered: List[RegionCoord] = []
+    global_mask: Optional[np.ndarray] = None
+    if not hasattr(stack, "resolve_region_stack"):
+        global_mask = _get_valid_window_mask(stack, window)
+        if global_mask is None:
+            return coords_list
+
     for coord in iterator:
         if hasattr(stack, "resolve_region_stack"):
             region, row, col = coord
             region_stack = stack.resolve_region_stack(region)
             if region_stack is None:
                 continue
-            if _is_coord_valid(region_stack, (int(row), int(col))):
+            mask = _get_valid_window_mask(region_stack, window)
+            if mask is None:
+                filtered.append(coord)
+                continue
+            r, c = int(row), int(col)
+            if 0 <= r < mask.shape[0] and 0 <= c < mask.shape[1] and mask[r, c]:
                 filtered.append(coord)
         else:
             if isinstance(coord, (tuple, list)):
@@ -1590,7 +1738,11 @@ def prefilter_valid_window_coords(
                 row = col = None
             if row is None or col is None:
                 continue
-            if _is_coord_valid(stack, (int(row), int(col))):
+            mask = global_mask
+            if mask is None:
+                continue
+            r, c = int(row), int(col)
+            if 0 <= r < mask.shape[0] and 0 <= c < mask.shape[1] and mask[r, c]:
                 filtered.append(coord)
 
     if use_progress:
@@ -1808,3 +1960,378 @@ def export_raster_boundary(
         return out_geojson
     except Exception:
         return None
+
+
+def load_region_boundaries(
+    boundary_source: Union[str, Path, Sequence[Union[str, Path]]],
+    project_only: bool = False,
+) -> Dict[str, BoundaryInfo]:
+    """Load boundary rasters (GeoTIFF) and derive masks/geometry."""
+    if rasterio is None:
+        return {}
+
+    def _normalize_path(item: Union[str, Path]) -> Optional[Path]:
+        try:
+            path_obj = Path(item)
+        except Exception:
+            return None
+        try:
+            return path_obj.resolve()
+        except Exception:
+            return path_obj
+
+    candidate_paths: List[Path] = []
+
+    if isinstance(boundary_source, (list, tuple, set)):
+        items = list(boundary_source)
+    else:
+        items = [boundary_source]
+
+    for entry in items:
+        normalized = _normalize_path(entry)
+        if normalized is None:
+            continue
+        if normalized.is_dir():
+            candidate_paths.extend(sorted(normalized.glob("*.tif")))
+            candidate_paths.extend(sorted(normalized.glob("*.tiff")))
+        elif normalized.is_file():
+            candidate_paths.append(normalized)
+
+    if not candidate_paths:
+        return {}
+
+    # Deduplicate paths while preserving order
+    seen: set[Path] = set()
+    candidates: List[Path] = []
+    for path in candidate_paths:
+        try:
+            real = path.resolve()
+        except Exception:
+            real = path
+        if real in seen:
+            continue
+        seen.add(real)
+        candidates.append(real)
+
+    if not candidates:
+        return {}
+
+    results: Dict[str, BoundaryInfo] = {}
+    for candidate in sorted(candidates):
+        stem_lower = candidate.stem.lower()
+        if project_only and "project" not in stem_lower:
+            continue
+        region_key = "PROJECT" if "project" in stem_lower else stem_lower.upper()
+        try:
+            with rasterio.open(candidate) as ds:
+                band = ds.read(1, masked=True)
+                if np.ma.isMaskedArray(band):
+                    data = np.asarray(band.filled(0.0), dtype=np.float64)
+                    validity = ~np.asarray(band.mask, dtype=bool)
+                else:
+                    data = np.asarray(band, dtype=np.float64)
+                    validity = np.ones_like(data, dtype=bool)
+                mask = validity & np.isfinite(data) & (data != 0)
+                if not mask.any():
+                    continue
+                crs_name = ds.crs.to_string() if ds.crs else None
+                geometry = None
+                if raster_shapes is not None and shape is not None:
+                    try:
+                        polygons: List[Union[Polygon, MultiPolygon]] = []
+                        for geom, value in raster_shapes(
+                            mask.astype(np.uint8),
+                            mask=mask,
+                            transform=ds.transform,
+                        ):
+                            if int(value) == 0:
+                                continue
+                            poly = shape(geom)
+                            if not poly.is_empty:
+                                polygons.append(poly)
+                        if polygons:
+                            geometry = unary_union(polygons) if unary_union is not None else polygons[0]
+                            if isinstance(geometry, (list, tuple)) and polygons:
+                                geometry = polygons[0]
+                    except Exception:
+                        geometry = None
+                info = BoundaryInfo(
+                    path=candidate.resolve(),
+                    mask=mask.astype(bool, copy=False),
+                    transform=ds.transform,
+                    crs=crs_name,
+                    geometry=geometry,
+                )
+        except Exception:
+            continue
+        results[region_key] = info
+    return results
+
+
+def _resample_boundary_mask(
+    info: BoundaryInfo,
+    target_transform: Affine,
+    target_crs: Optional[str],
+    height: int,
+    width: int,
+) -> Optional[np.ndarray]:
+    if reproject is None or Resampling is None:
+        return None
+    dst = np.zeros((height, width), dtype=np.float32)
+    try:
+        reproject(
+            source=info.mask.astype(np.uint8),
+            destination=dst,
+            src_transform=info.transform,
+            src_crs=info.crs,
+            dst_transform=target_transform,
+            dst_crs=target_crs,
+            resampling=Resampling.nearest,
+        )
+    except Exception:
+        return None
+    return (dst >= 0.5)
+
+
+def apply_boundaries_to_region_stacks(
+    region_stacks: Dict[str, GeoStack],
+    boundary_infos: Dict[str, BoundaryInfo],
+) -> Dict[str, np.ndarray]:
+    if not boundary_infos:
+        return {}
+
+    applied_masks: Dict[str, np.ndarray] = {}
+    for region, stack in region_stacks.items():
+        region_keys = [
+            region,
+            str(region).upper(),
+            str(region).lower(),
+            str(region).title(),
+        ]
+        info = None
+        for key in region_keys:
+            info = boundary_infos.get(key)
+            if info is not None:
+                break
+        if info is None:
+            info = boundary_infos.get("PROJECT") or boundary_infos.get("GLOBAL")
+        if info is None:
+            continue
+        mask = info.mask
+        if mask.shape != (stack.height, stack.width):
+            target_crs = None
+            stack_crs = getattr(stack, "crs", None)
+            if stack_crs is not None:
+                try:
+                    target_crs = stack_crs.to_string()
+                except Exception:
+                    target_crs = stack_crs
+            resampled = _resample_boundary_mask(
+                info,
+                stack.transform,
+                target_crs,
+                stack.height,
+                stack.width,
+            )
+            if resampled is None:
+                print(
+                    f"[warn] Boundary raster {info.path} could not be resampled to match stack "
+                    f"{region} dimensions {(stack.height, stack.width)}; skipping."
+                )
+                continue
+            mask = resampled
+        try:
+            stack.set_boundary_mask(mask)
+        except ValueError as exc:
+            print(f"[warn] Boundary mask for region '{region}' skipped: {exc}")
+            continue
+        applied_masks[region] = mask
+    return applied_masks
+
+
+def export_window_center_visualizations(
+    stack: Any,
+    window: int,
+    out_dir: Union[str, Path],
+    *,
+    boundaries: Optional[Dict[str, BoundaryInfo]] = None,
+    prefix: str = "window_centers",
+    max_scatter_points: int = 250_000,
+) -> Dict[str, Dict[str, Path]]:
+    """
+    Export GeoTIFF/PNG diagnostics showing valid window centers relative to dataset boundaries.
+    """
+    if rasterio is None:
+        raise RuntimeError("rasterio is required to export window center diagnostics.")
+
+    from rasterio.transform import array_bounds  # type: ignore
+    from rasterio import transform as rio_transform  # type: ignore
+
+    try:
+        import matplotlib
+        try:
+            matplotlib.use("Agg")
+        except Exception:
+            pass
+        import matplotlib.pyplot as plt  # type: ignore
+    except Exception:
+        plt = None  # type: ignore
+
+    if plt is None:
+        print("[warn] Matplotlib unavailable; PNG window center previews will be skipped.")
+
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    def _iter_regions():
+        if hasattr(stack, "iter_region_stacks"):
+            yield from stack.iter_region_stacks()
+        else:
+            region_name = getattr(stack, "default_region", None) or "GLOBAL"
+            yield (region_name, stack)
+
+    def _resolve_boundary(region_name: str) -> Optional[BoundaryInfo]:
+        if not boundaries:
+            return None
+        keys = [
+            region_name,
+            str(region_name).upper(),
+            str(region_name).lower(),
+            str(region_name).title(),
+            "PROJECT",
+            "GLOBAL",
+        ]
+        for key in keys:
+            info = boundaries.get(key)
+            if info is not None:
+                return info
+        return None
+
+    def _plot_geometry(ax, geom):
+        if geom is None or geom.is_empty:
+            return
+        if hasattr(geom, "geoms"):
+            for sub in geom.geoms:
+                _plot_geometry(ax, sub)
+            return
+        try:
+            exterior = geom.exterior
+        except Exception:
+            exterior = None
+        if exterior is not None:
+            x, y = exterior.xy
+            ax.plot(x, y, color="crimson", linewidth=1.0, alpha=0.9)
+        interiors = getattr(geom, "interiors", [])
+        for ring in interiors:
+            xi, yi = ring.xy
+            ax.plot(xi, yi, color="crimson", linewidth=0.6, alpha=0.8)
+
+    def _mask_to_geometry(mask_arr, transform):
+        if raster_shapes is None or shape is None:
+            return None
+        polygons = []
+        try:
+            for geom, value in raster_shapes(mask_arr.astype(np.uint8), mask=mask_arr, transform=transform):
+                if int(value) == 0:
+                    continue
+                poly = shape(geom)
+                if not poly.is_empty:
+                    polygons.append(poly)
+        except Exception:
+            return None
+        if not polygons:
+            return None
+        try:
+            merged = unary_union(polygons) if unary_union is not None else None
+        except Exception:
+            merged = None
+        if merged is None:
+            merged = polygons[0] if len(polygons) == 1 else None
+        return merged
+
+    results: Dict[str, Dict[str, Path]] = {}
+    for region_name, region_stack in _iter_regions():
+        mask = _get_valid_window_mask(region_stack, window)
+        if mask is None:
+            continue
+        srcs = getattr(region_stack, "srcs", None)
+        if not srcs:
+            continue
+        primary = srcs[0]
+        profile = primary.profile.copy()
+        profile.update(
+            count=1,
+            dtype="uint8",
+            nodata=0,
+        )
+
+        region_key = str(region_name or "GLOBAL")
+        slug = _sanitize_region_name(region_key or "GLOBAL")
+        tif_path = out_path / f"{prefix}_{slug}.tif"
+        png_path = out_path / f"{prefix}_{slug}.png"
+
+        data = mask.astype(np.uint8, copy=False)
+        with rasterio.open(tif_path, "w", **profile) as dst:
+            dst.write(data, 1)
+
+        entry: Dict[str, Path] = {"tif": tif_path}
+
+        if plt is not None:
+            try:
+                bounds = array_bounds(mask.shape[0], mask.shape[1], primary.transform)
+                extent = (bounds[0], bounds[2], bounds[3], bounds[1])
+                fig, ax = plt.subplots(figsize=(8, 8))
+                boundary_info = _resolve_boundary(region_key)
+                geometry = None
+                if boundary_info is not None:
+                    overlay_mask = boundary_info.mask
+                    overlay_transform = boundary_info.transform
+                    if overlay_mask.shape != data.shape:
+                        target_crs = None
+                        if primary.crs is not None:
+                            try:
+                                target_crs = primary.crs.to_string()
+                            except Exception:
+                                target_crs = primary.crs
+                        resampled_overlay = _resample_boundary_mask(
+                            boundary_info,
+                            primary.transform,
+                            target_crs,
+                            data.shape[0],
+                            data.shape[1],
+                        )
+                        if resampled_overlay is not None:
+                            overlay_mask = resampled_overlay
+                            overlay_transform = primary.transform
+                    geometry = boundary_info.geometry
+                    if geometry is None and overlay_mask is not None:
+                        geometry = _mask_to_geometry(overlay_mask, overlay_transform)
+                if geometry is None:
+                    geometry = _mask_to_geometry(mask, primary.transform)
+                if geometry is not None:
+                    _plot_geometry(ax, geometry)
+
+                rows, cols = np.where(mask)
+                if rows.size > 0:
+                    if rows.size > max_scatter_points:
+                        rng = np.random.default_rng(0)
+                        indices = rng.choice(rows.size, size=max_scatter_points, replace=False)
+                        rows = rows[indices]
+                        cols = cols[indices]
+                    xs, ys = rio_transform.xy(primary.transform, rows, cols, offset="center")
+                    ax.scatter(xs, ys, s=1, c="tab:blue", alpha=0.6, linewidths=0)
+
+                ax.set_title(f"Window centers (window={window}) — {region_key}")
+                ax.set_xlabel("X")
+                ax.set_ylabel("Y")
+                ax.set_aspect("equal")
+                fig.tight_layout()
+                fig.savefig(png_path, dpi=180, bbox_inches="tight")
+                plt.close(fig)
+                entry["png"] = png_path
+            except Exception:
+                if plt is not None:
+                    plt.close("all")
+
+        results[region_key] = entry
+    return results

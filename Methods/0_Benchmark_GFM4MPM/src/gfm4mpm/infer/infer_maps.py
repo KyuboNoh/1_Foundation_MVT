@@ -8,6 +8,81 @@ import torch
 import torch.nn as nn
 import rasterio
 
+def _regular_grid_idw(sampled: np.ndarray, row_coords: np.ndarray, col_coords: np.ndarray, shape: Tuple[int, int]) -> np.ndarray:
+    """Bilinear IDW interpolation across a regular grid."""
+    height, width = shape
+    rows = np.arange(height, dtype=np.float32)
+    cols = np.arange(width, dtype=np.float32)
+
+    # Row indices
+    row_idx_low = np.searchsorted(row_coords, rows, side="right") - 1
+    row_idx_low = np.clip(row_idx_low, 0, row_coords.size - 1)
+    row_idx_high = np.clip(row_idx_low + 1, 0, row_coords.size - 1)
+    row_low = row_coords[row_idx_low].astype(np.float32)
+    row_high = row_coords[row_idx_high].astype(np.float32)
+    row_denom = row_high - row_low
+    row_denom[row_denom == 0] = 1.0
+    row_alpha = (rows - row_low) / row_denom
+    row_alpha[row_idx_high == row_idx_low] = 0.0
+
+    # Column indices
+    col_idx_low = np.searchsorted(col_coords, cols, side="right") - 1
+    col_idx_low = np.clip(col_idx_low, 0, col_coords.size - 1)
+    col_idx_high = np.clip(col_idx_low + 1, 0, col_coords.size - 1)
+    col_low = col_coords[col_idx_low].astype(np.float32)
+    col_high = col_coords[col_idx_high].astype(np.float32)
+    col_denom = col_high - col_low
+    col_denom[col_denom == 0] = 1.0
+    col_alpha = (cols - col_low) / col_denom
+    col_alpha[col_idx_high == col_idx_low] = 0.0
+
+    row_alpha = row_alpha[:, None]
+    col_alpha = col_alpha[None, :]
+
+    v00 = sampled[row_idx_low[:, None], col_idx_low[None, :]]
+    v01 = sampled[row_idx_low[:, None], col_idx_high[None, :]]
+    v10 = sampled[row_idx_high[:, None], col_idx_low[None, :]]
+    v11 = sampled[row_idx_high[:, None], col_idx_high[None, :]]
+
+    w00 = (1.0 - row_alpha) * (1.0 - col_alpha)
+    w01 = (1.0 - row_alpha) * col_alpha
+    w10 = row_alpha * (1.0 - col_alpha)
+    w11 = row_alpha * col_alpha
+
+    interpolated = v00 * w00 + v01 * w01 + v10 * w10 + v11 * w11
+    return interpolated.astype(np.float32, copy=False)
+
+
+def _interpolate_prediction_grid(values: np.ndarray, counts: np.ndarray) -> np.ndarray:
+    """Upsample sparse prediction grid using bilinear IDW interpolation."""
+    valid_mask = counts > 0
+    if valid_mask.all():
+        return values
+    valid_indices = np.argwhere(valid_mask)
+    if valid_indices.size == 0:
+        return values
+    row_coords = np.unique(valid_indices[:, 0])
+    col_coords = np.unique(valid_indices[:, 1])
+    if row_coords.size == 0 or col_coords.size == 0:
+        return values
+    sampled = values[np.ix_(row_coords, col_coords)]
+    # Prefer smooth spline interpolation if SciPy is available
+    try:
+        from scipy.interpolate import RectBivariateSpline  # type: ignore
+
+        kx = min(3, max(1, row_coords.size - 1))
+        ky = min(3, max(1, col_coords.size - 1))
+        spline = RectBivariateSpline(row_coords, col_coords, sampled, kx=kx, ky=ky)
+        grid_rows = np.arange(values.shape[0], dtype=np.float64)
+        grid_cols = np.arange(values.shape[1], dtype=np.float64)
+        filled = spline(grid_rows, grid_cols)
+        return filled.astype(np.float32, copy=False)
+    except Exception:
+        pass
+    filled = _regular_grid_idw(sampled, row_coords, col_coords, values.shape)
+    return filled
+
+
 try:
     from tqdm import tqdm
 except ImportError:
@@ -111,6 +186,9 @@ def _mc_predict_single_region(
         var_map = np.divide(var_map, counts, where=counts > 0)
     mean_map[counts == 0] = np.nan
     var_map[counts == 0] = np.nan
+    if stride > 1:
+        mean_map = _interpolate_prediction_grid(mean_map, counts)
+        var_map = _interpolate_prediction_grid(var_map, counts)
     return mean_map, np.sqrt(var_map)
 
 
@@ -169,22 +247,33 @@ def _compute_boundary_mask(mask: np.ndarray) -> np.ndarray:
 
 
 def _extract_valid_boundary_masks(stack: Any) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    if not getattr(stack, "srcs", None):
+    combined: Optional[np.ndarray] = None
+
+    boundary_mask = getattr(stack, "boundary_mask", None)
+    if boundary_mask is not None:
+        boundary_arr = np.asarray(boundary_mask).astype(bool, copy=False)
+        if boundary_arr.any():
+            combined = boundary_arr
+
+    if getattr(stack, "srcs", None):
+        try:
+            dataset_mask = stack.srcs[0].dataset_mask()
+        except Exception:
+            dataset_mask = None
+        if dataset_mask is not None:
+            mask_arr = np.asarray(dataset_mask)
+            if mask_arr.ndim == 3:
+                mask_arr = mask_arr[0]
+            dataset_bool = mask_arr != 0
+            if dataset_bool.any():
+                combined = dataset_bool if combined is None else (combined & dataset_bool)
+
+    if combined is None or not combined.any():
         return None, None
-    try:
-        mask = stack.srcs[0].dataset_mask()
-    except Exception:
-        mask = None
-    if mask is None:
-        return None, None
-    mask_arr = np.asarray(mask)
-    if mask_arr.ndim == 3:
-        mask_arr = mask_arr[0]
-    valid_mask = mask_arr != 0
-    if not valid_mask.any():
-        return None, None
-    boundary_mask = _compute_boundary_mask(valid_mask)
-    return valid_mask, boundary_mask
+
+    combined = combined.astype(bool, copy=False)
+    boundary = _compute_boundary_mask(combined)
+    return combined, boundary
 
 
 def _normalize_prediction_result(result: Any, default_stack: Any) -> Dict[str, Tuple[np.ndarray, np.ndarray, Any]]:

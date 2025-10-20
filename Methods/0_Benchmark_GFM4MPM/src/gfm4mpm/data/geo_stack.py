@@ -27,21 +27,26 @@ class GeoStack:
         self.band_mean, self.band_std = self._compute_band_stats()
         self._valid_rows: Optional[np.ndarray] = None
         self._valid_cols: Optional[np.ndarray] = None
+        self.boundary_mask: Optional[np.ndarray] = None
+        self._base_valid_mask: Optional[np.ndarray] = None
+        self._combined_valid_mask: Optional[np.ndarray] = None
+        self._valid_indices: Optional[np.ndarray] = None
         try:
             mask = ref.dataset_mask()
             if mask is not None:
-                mask_arr = np.asarray(mask) != 0
+                mask_arr = np.asarray(mask)
                 if mask_arr.ndim == 3:
                     mask_arr = mask_arr[0]
-                if mask_arr.any():
-                    rows = np.where(mask_arr.any(axis=1))[0]
-                    cols = np.where(mask_arr.any(axis=0))[0]
-                    if rows.size and cols.size:
-                        self._valid_rows = rows
-                        self._valid_cols = cols
+                mask_bool = mask_arr != 0
+                if mask_bool.any():
+                    self._base_valid_mask = mask_bool.astype(bool, copy=False)
+                    self._update_combined_mask(None)
+                else:
+                    self._set_valid_mask(None)
+            else:
+                self._set_valid_mask(None)
         except Exception:
-            self._valid_rows = None
-            self._valid_cols = None
+            self._set_valid_mask(None)
 
     # ------------------------------------------------------------------
     def _compute_band_stats(self) -> Tuple[np.ndarray, np.ndarray]:
@@ -158,6 +163,17 @@ class GeoStack:
             patch = np.pad(patch, pad_config, mode='constant', constant_values=np.nan)
             mask = np.pad(mask, pad_config, mode='constant', constant_values=False)
 
+        if self._combined_valid_mask is not None:
+            combined_slice = self._combined_valid_mask[r0:r1, c0:c1]
+            if pad_h or pad_w:
+                combined_slice = np.pad(
+                    combined_slice,
+                    ((0, max(0, pad_h)), (0, max(0, pad_w))),
+                    mode='constant',
+                    constant_values=False,
+                )
+            mask &= combined_slice[np.newaxis, ...]
+
         if nodata_val is not None:
             invalid = np.isclose(patch[0], nodata_val, equal_nan=True)
             mask[:, invalid] = False
@@ -193,24 +209,81 @@ class GeoStack:
 
     def random_coord(self, patch: int, rng: np.random.Generator) -> Tuple[int, int]:
         half = patch // 2
+        if self._valid_indices is not None and self._valid_indices.size:
+            idx = int(rng.integers(0, self._valid_indices.shape[0]))
+            r, c = self._valid_indices[idx]
+            r = int(np.clip(r, half, max(self.height - half - 1, half)))
+            c = int(np.clip(c, half, max(self.width - half - 1, half)))
+            return r, c
         if (
             self._valid_rows is not None
             and self._valid_cols is not None
             and self._valid_rows.size
             and self._valid_cols.size
         ):
-            r = int(self._valid_rows[int(rng.integers(0, self._valid_rows.size))])
-            c = int(self._valid_cols[int(rng.integers(0, self._valid_cols.size))])
-            r = int(np.clip(r, half, max(self.height - half - 1, half)))
-            c = int(np.clip(c, half, max(self.width - half - 1, half)))
-        else:
-            r = int(rng.integers(half, max(self.height - half, half + 1)))
-            c = int(rng.integers(half, max(self.width - half, half + 1)))
+            for _ in range(128):
+                r = int(self._valid_rows[int(rng.integers(0, self._valid_rows.size))])
+                c = int(self._valid_cols[int(rng.integers(0, self._valid_cols.size))])
+                if self._combined_valid_mask is None or self._combined_valid_mask[r, c]:
+                    r = int(np.clip(r, half, max(self.height - half - 1, half)))
+                    c = int(np.clip(c, half, max(self.width - half - 1, half)))
+                    return r, c
+        r = int(rng.integers(half, max(self.height - half, half + 1)))
+        c = int(rng.integers(half, max(self.width - half, half + 1)))
         return r, c
 
     def coord_to_index(self, coord: Tuple[int, int]) -> int:
         r, c = coord
         return r * self.width + c
+
+    # ------------------------------------------------------------------
+    def _set_valid_mask(self, mask: Optional[np.ndarray]) -> None:
+        if mask is None:
+            self._combined_valid_mask = None
+            self._valid_rows = None
+            self._valid_cols = None
+            self._valid_indices = None
+            return
+        mask_bool = mask.astype(bool, copy=False)
+        if not mask_bool.any():
+            self._combined_valid_mask = None
+            self._valid_rows = np.empty(0, dtype=np.int32)
+            self._valid_cols = np.empty(0, dtype=np.int32)
+            self._valid_indices = np.empty((0, 2), dtype=np.int32)
+            return
+        self._combined_valid_mask = mask_bool
+        self._valid_rows = np.where(mask_bool.any(axis=1))[0]
+        self._valid_cols = np.where(mask_bool.any(axis=0))[0]
+        self._valid_indices = np.argwhere(mask_bool)
+
+    def _update_combined_mask(self, boundary_mask: Optional[np.ndarray]) -> None:
+        boundary_bool = boundary_mask.astype(bool, copy=False) if boundary_mask is not None else None
+        if self._base_valid_mask is not None and boundary_bool is not None:
+            combined = self._base_valid_mask & boundary_bool
+        elif self._base_valid_mask is not None:
+            combined = self._base_valid_mask
+        elif boundary_bool is not None:
+            combined = boundary_bool
+        else:
+            combined = None
+        self._set_valid_mask(combined)
+
+    def set_boundary_mask(self, mask: np.ndarray) -> None:
+        if mask.shape != (self.height, self.width):
+            raise ValueError("Boundary mask shape does not match raster dimensions.")
+        mask_bool = mask.astype(bool, copy=False)
+        self.boundary_mask = mask_bool
+        if hasattr(self, "_valid_window_masks"):
+            setattr(self, "_valid_window_masks", {})
+        self._update_combined_mask(mask_bool)
+        if self._valid_indices is None or self._valid_indices.shape[0] == 0:
+            raise ValueError("Boundary mask removed all valid pixels for this stack.")
+
+    def clear_boundary_mask(self) -> None:
+        self.boundary_mask = None
+        if hasattr(self, "_valid_window_masks"):
+            setattr(self, "_valid_window_masks", {})
+        self._update_combined_mask(None)
 
 def load_deposit_pixels(geojson_path: str, stack: GeoStack) -> List[Tuple[int,int]]:
     """Convert deposit points (class=1) into pixel indices (row, col)."""

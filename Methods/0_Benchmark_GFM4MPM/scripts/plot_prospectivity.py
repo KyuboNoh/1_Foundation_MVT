@@ -240,11 +240,6 @@ if __name__ == '__main__':
         print(f"[info] Reconstructing prospectivity maps from saved predictions matching {args.prediction_glob}")
         prediction = _load_saved_prediction_maps(args.prediction_glob, stack)
 
-
-        print(prediction)
-        exit()
-
-        
         write_prediction_outputs(
             prediction,
             stack,

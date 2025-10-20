@@ -19,7 +19,13 @@ _PROJECT_ROOT = _THIS_DIR.parent  # points to Methods/0_Benchmark_GFM4MPM
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from Common.data_utils import clamp_coords_to_window, filter_valid_raster_coords, load_split_stack, normalize_region_coord
+from Common.data_utils import (
+    clamp_coords_to_window,
+    filter_valid_raster_coords,
+    load_split_stack,
+    normalize_region_coord,
+    prefilter_valid_window_coords,
+)
 from Common.data_utils import resolve_search_root, load_training_args, load_training_metadata, mae_kwargs_from_training_args, resolve_pretraining_patch, infer_region_from_name, resolve_label_rasters, collect_feature_rasters, read_stack_patch
 from Common.debug_visualization import visualize_debug_features
 from src.gfm4mpm.models.mae_vit import MAEViT
@@ -146,6 +152,13 @@ if __name__ == '__main__':
     coords_with_labels = list(zip(coords, labels))
 
     if load_result.mode == 'raster':
+        prefiltered = prefilter_valid_window_coords(stack, coords, window_size)
+        if len(prefiltered) != len(coords):
+            removed = len(coords) - len(prefiltered)
+            print(f"[info] Prefiltered {removed} coordinate(s) falling outside the project boundary")
+        valid_prefilter = set(prefiltered)
+        coords_with_labels = [(coord, lab) for coord, lab in coords_with_labels if coord in valid_prefilter]
+        coords = [coord for coord, _ in coords_with_labels]
         filtered_coords, dropped_coords = filter_valid_raster_coords(stack, coords, window_size, min_valid_fraction=0.05)
         dropped_count = len(dropped_coords)
         if dropped_count:

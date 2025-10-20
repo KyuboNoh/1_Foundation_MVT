@@ -14,22 +14,24 @@
 # Date: 2025-09-22 (Updated on 2025-10-01)
 
 import argparse
+import json
 import os
 import sys
 import hashlib
 import logging
+import math
 import shutil
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Sequence
 from datetime import datetime, timezone
 
 import numpy as np
+from affine import Affine
 
 # Shared utilities for 2D raster/label pipelines.
 from Common.data_utils import (
     TwoD_data_TwoD_label_normalize_raster,
     TwoD_data_TwoD_label_rasterize_labels,
-    export_region_boundaries,
 )
 from Common.metadata_generation_label_GeoJSON import generate_label_geojson
 from Common.metadata_generation_training import generate_training_metadata
@@ -120,6 +122,73 @@ def _has_rio_cogeo():
         return True
     except Exception:
         return False
+
+
+def _read_resampled_data(src, downsample_factor: Optional[float], upsample_factor: Optional[float]):
+    rasterio = _require_rasterio()
+    from rasterio.enums import Resampling
+
+    if downsample_factor is not None and upsample_factor is not None:
+        raise ValueError("Only one of downsample_factor or upsample_factor may be provided.")
+
+    def _sanitize_mask(mask_arr):
+        if mask_arr is None:
+            return None
+        mask_arr = np.asarray(mask_arr)
+        if mask_arr.ndim == 3:
+            mask_arr = mask_arr[0]
+        return mask_arr
+
+    transform = src.transform
+    data = None
+    mask = None
+    target_height = src.height
+    target_width = src.width
+
+    if downsample_factor is not None:
+        factor = float(downsample_factor)
+        if factor <= 0:
+            raise ValueError("downsample_factor must be positive.")
+        new_height = max(1, int(math.ceil(src.height / factor)))
+        new_width = max(1, int(math.ceil(src.width / factor)))
+        target_height, target_width = new_height, new_width
+        data = src.read(
+            out_shape=(src.count, new_height, new_width),
+            resampling=Resampling.average,
+        )
+        try:
+            mask = src.dataset_mask(out_shape=(new_height, new_width), resampling=Resampling.nearest)
+        except Exception:
+            mask = None
+        scale_x = src.width / new_width
+        scale_y = src.height / new_height
+        transform = transform * Affine.scale(scale_x, scale_y)
+    elif upsample_factor is not None:
+        factor = float(upsample_factor)
+        if factor <= 0:
+            raise ValueError("upsample_factor must be positive.")
+        new_height = max(1, int(math.ceil(src.height * factor)))
+        new_width = max(1, int(math.ceil(src.width * factor)))
+        target_height, target_width = new_height, new_width
+        data = src.read(
+            out_shape=(src.count, new_height, new_width),
+            resampling=Resampling.bilinear,
+        )
+        try:
+            mask = src.dataset_mask(out_shape=(new_height, new_width), resampling=Resampling.nearest)
+        except Exception:
+            mask = None
+        scale_x = src.width / new_width
+        scale_y = src.height / new_height
+        transform = transform * Affine.scale(scale_x, scale_y)
+    else:
+        data = src.read()
+        try:
+            mask = src.dataset_mask()
+        except Exception:
+            mask = None
+
+    return data.astype(np.float32, copy=False), transform, _sanitize_mask(mask)
 
 
 def sha256sum(path: Path, blocksize: int = 65536) -> str:
@@ -231,7 +300,10 @@ def raster_item_from_tif(tif_path: Path, item_id: Optional[str] = None, asset_hr
             properties={},
         )
 
-        item.properties["raster:resolution"] = [abs(res_x), abs(res_y)]
+        resolution_m = [abs(res_x), abs(res_y)]
+        resolution_km = [r / 1000.0 for r in resolution_m]
+        item.properties["raster:resolution"] = resolution_km
+        item.properties["gfm:resolution_meters"] = resolution_m
         item.properties["raster:datatype"] = band_dtype
 
         ProjectionExtension.add_to(item)
@@ -629,13 +701,25 @@ def add_raster_assets(collection,
                       files: List[Path],
                       out_asset_dir: Path,
                       cogify: bool = True,
-                      normalize: bool = False) -> List[Dict[str, Path]]:
+                      normalize: bool = False,
+                      downsample_factor: Optional[float] = None,
+                      upsample_factor: Optional[float] = None) -> List[Dict[str, Path]]:
     ensure_dir(out_asset_dir)
     thumb_dir = out_asset_dir / "thumbnails"
     mods = _require_pystac()
     Link = mods["Link"]
     Asset = mods["Asset"]
     rasterio = _require_rasterio()
+
+    ds_factor = float(downsample_factor) if downsample_factor is not None else None
+    us_factor = float(upsample_factor) if upsample_factor is not None else None
+    if ds_factor is not None and ds_factor <= 0:
+        raise ValueError("downsample_factor must be positive.")
+    if us_factor is not None and us_factor <= 0:
+        raise ValueError("upsample_factor must be positive.")
+    if ds_factor is not None and us_factor is not None:
+        raise ValueError("Only one of downsample_factor or upsample_factor may be provided.")
+    needs_resample = (ds_factor is not None) or (us_factor is not None)
 
     products = []
     for tif in files:
@@ -651,25 +735,41 @@ def add_raster_assets(collection,
 
             if normalize:
                 with rasterio.open(tif) as src:
+                    resampled_data, resampled_transform, mask_array = _read_resampled_data(src, ds_factor, us_factor)
                     profile = src.profile.copy()
-                    vp, tp, vf = _dataset_valid_pixel_stats(src)
-                    if vp is not None:
-                        valid_pixel_count, total_pixel_count, valid_pixel_fraction = vp, tp, vf
+                    profile.update(
+                        height=resampled_data.shape[1],
+                        width=resampled_data.shape[2],
+                        transform=resampled_transform,
+                        count=resampled_data.shape[0],
+                    )
                     arrays: List[np.ndarray] = []
-                    for band_index in range(1, src.count + 1):
-                        band = src.read(band_index)
+                    mask_bool: Optional[np.ndarray] = None
+                    if mask_array is not None:
+                        mask_bool = mask_array.astype(bool)
+                        total_pixel_count = int(mask_array.size)
+                        valid_pixel_count = int(np.count_nonzero(mask_array))
+                        valid_pixel_fraction = (
+                            float(valid_pixel_count / total_pixel_count) if total_pixel_count else None
+                        )
+                    else:
+                        vp, tp, vf = _dataset_valid_pixel_stats(src)
+                        if vp is not None:
+                            valid_pixel_count, total_pixel_count, valid_pixel_fraction = vp, tp, vf
+                    for band_index in range(src.count):
+                        band = resampled_data[band_index].astype(np.float64, copy=True)
                         band_nodata = None
-                        if src.nodatavals and band_index - 1 < len(src.nodatavals):
-                            band_nodata = src.nodatavals[band_index - 1]
+                        if src.nodatavals and band_index < len(src.nodatavals):
+                            band_nodata = src.nodatavals[band_index]
                         elif src.nodata is not None:
                             band_nodata = src.nodata
-                        band = band.astype(np.float64, copy=False)
+                        if mask_bool is not None:
+                            band[~mask_bool] = np.nan
                         nodata_candidates = {-99.0, -999.0, -9999.0}
                         if band_nodata is not None:
                             nodata_candidates.add(float(band_nodata))
                         nodata_mask = np.isin(band, list(nodata_candidates))
                         if nodata_mask.any():
-                            band = band.copy()
                             band[nodata_mask] = np.nan
                         finite_vals = band[np.isfinite(band)]
                         is_binary = False
@@ -677,7 +777,7 @@ def add_raster_assets(collection,
                             unique_vals = np.unique(finite_vals)
                             if unique_vals.size <= 3 and set(unique_vals.tolist()).issubset({0.0, 1.0, 2.0}):
                                 is_binary = True
-                        band_dtype = src.dtypes[band_index - 1] if src.dtypes else band.dtype
+                        band_dtype = src.dtypes[band_index] if src.dtypes else band.dtype
                         if is_binary:
                             arr = np.where(np.isfinite(band), band, 0.0).astype(np.float32)
                             info = {
@@ -734,11 +834,34 @@ def add_raster_assets(collection,
                         profile_summary["total_pixels"] = total_pixel_count
                         profile_summary["valid_fraction"] = valid_pixel_fraction
             else:
-                if cogify:
-                    to_cog(tif, asset_path)
+                if needs_resample:
+                    with rasterio.open(tif) as src:
+                        resampled_data, resampled_transform, _ = _read_resampled_data(src, ds_factor, us_factor)
+                        profile = src.profile.copy()
+                    profile.update(
+                        height=resampled_data.shape[1],
+                        width=resampled_data.shape[2],
+                        transform=resampled_transform,
+                        count=resampled_data.shape[0],
+                        dtype=resampled_data.dtype.name,
+                    )
+                    tmp_path = asset_path.parent / f".tmp_{asset_path.name}"
+                    ensure_dir(tmp_path.parent)
+                    try:
+                        with rasterio.open(tmp_path, "w", **profile) as dst:
+                            dst.write(resampled_data)
+                        to_cog(tmp_path, asset_path)
+                    finally:
+                        try:
+                            tmp_path.unlink()
+                        except FileNotFoundError:
+                            pass
                 else:
-                    if tif.resolve() != asset_path.resolve():
-                        shutil.copy2(tif, asset_path)
+                    if cogify:
+                        to_cog(tif, asset_path)
+                    else:
+                        if tif.resolve() != asset_path.resolve():
+                            shutil.copy2(tif, asset_path)
                 with rasterio.open(asset_path) as asset_src:
                     vp, tp, vf = _dataset_valid_pixel_stats(asset_src)
                     if vp is not None:
@@ -1042,14 +1165,19 @@ def _dataset_valid_pixel_stats(src) -> Tuple[Optional[int], Optional[int], Optio
     return valid, total, fraction
 
 
-def scan_files(raw_dir: Path, ignore_roots: Optional[List[Path]] = None) -> Tuple[List[Path], List[Path]]:
+def scan_files(raw_dir: Path,
+               ignore_roots: Optional[List[Path]] = None,
+               exclude_paths: Optional[Sequence[Path]] = None) -> Tuple[List[Path], List[Path]]:
     rasters, vectors = [], []
     vector_exts = {".shp", ".gpkg", ".geojson", ".json"}
     ignore_roots = [p.resolve() for p in ignore_roots or []]
+    exclude_lookup = {p.resolve() for p in (exclude_paths or [])}
     for p in raw_dir.rglob("*"):
         if not p.is_file():
             continue
         if _should_skip(p.resolve(), ignore_roots):
+            continue
+        if p.resolve() in exclude_lookup:
             continue
         suf = p.suffix.lower()
         if suf in [".tif", ".tiff"]:
@@ -1087,12 +1215,37 @@ def main():
     parser.add_argument("--label", action="append", default=[], help="Path to a label shapefile (can be repeated).")
     parser.add_argument("--label-column", type=str, default=None, help="Optional attribute name to treat as the label value when generating GeoJSON outputs.")
     parser.add_argument("--assets-subdir", type=str, default="assets", help="Subdirectory (under OUT) for asset files.")
+    parser.add_argument(
+        "--project-boundary",
+        action="append",
+        default=[],
+        help="Raster mask (.tif) describing the project boundary. Provide paths relative to --raw-dir or absolute. Can be repeated.",
+    )
     parser.add_argument("--validate", action="store_true", help="Run STAC validation before saving.")
     parser.add_argument("--source-url", type=str, default=None, help="Optional source data portal URL for lineage links.")
     parser.add_argument("--cogify", action="store_true", help="Convert rasters to Cloud-Optimized GeoTIFFs.")
+    parser.add_argument(
+        "--downsample-factor",
+        type=float,
+        default=None,
+        help="Optional downsampling ratio (>1.0) applied during raster processing.",
+    )
+    parser.add_argument(
+        "--upsample-factor",
+        type=float,
+        default=None,
+        help="Optional upsampling ratio (>1.0) applied during raster processing.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    if args.downsample_factor is not None and args.upsample_factor is not None:
+        parser.error("Only one of --downsample-factor or --upsample-factor may be provided.")
+    if args.downsample_factor is not None and args.downsample_factor <= 0:
+        parser.error("--downsample-factor must be positive.")
+    if args.upsample_factor is not None and args.upsample_factor <= 0:
+        parser.error("--upsample-factor must be positive.")
 
     raw_dir = Path(args.raw_dir)
     out_dir = Path(args.out)
@@ -1125,24 +1278,25 @@ def main():
     asset_dir = collection_root / args.assets_subdir
     ensure_dir(asset_dir)
 
-    boundary_dir = collection_root / "boundaries"
-    raster_region_paths: Dict[str, List[Path]] = {}
-    for prod in raster_items:
-        asset_path = prod.get("asset_path") if isinstance(prod, dict) else None
-        if not asset_path:
-            continue
-        region = prod.get("region") if isinstance(prod, dict) else None
-        region_key = str(region or "GLOBAL")
-        raster_region_paths.setdefault(region_key, []).append(Path(asset_path))
-
-    boundary_results = export_region_boundaries(raster_region_paths, boundary_dir)
-    for region_key, geo_path in boundary_results.items():
-        try:
-            resolved_href = geo_path.resolve().as_uri()
-        except Exception:
-            resolved_href = str(geo_path)
-        title = "Dataset boundary" if region_key == "GLOBAL" else f"Boundary - {region_key}"
-        coll.add_link(Link(rel="derived_from", target=resolved_href, title=title))
+    project_boundary_paths: List[Path] = []
+    for boundary_arg in args.project_boundary or []:
+        candidate = Path(boundary_arg)
+        if not candidate.is_absolute():
+            candidate = (raw_dir / candidate).resolve()
+        else:
+            candidate = candidate.resolve()
+        if candidate.exists():
+            project_boundary_paths.append(candidate)
+        else:
+            logging.warning("Project boundary raster %s not found; skipping.", candidate)
+    if project_boundary_paths:
+        project_boundary_paths = list(dict.fromkeys(project_boundary_paths))
+    if project_boundary_paths:
+        logging.info(
+            "Using %d project boundary raster(s): %s",
+            len(project_boundary_paths),
+            ", ".join(str(p) for p in project_boundary_paths),
+        )
 
     registry_dst = collection_root / "feature_registry.yaml"
     if not registry_dst.exists():
@@ -1160,7 +1314,11 @@ def main():
     # Only ignore generated asset outputs to avoid re-ingesting them;
     # leave the broader collection root available so raw_dir can live inside it.
     ignore_roots = [asset_dir]
-    rasters, vector_sources = scan_files(raw_dir, ignore_roots=ignore_roots)
+    rasters, vector_sources = scan_files(
+        raw_dir,
+        ignore_roots=ignore_roots,
+        exclude_paths=project_boundary_paths,
+    )
     logging.info(f"Found {len(rasters)} rasters and {len(vector_sources)} vector files in {raw_dir}")
 
     label_paths: List[Path] = []
@@ -1177,6 +1335,8 @@ def main():
         asset_dir / "rasters",
         cogify=args.cogify,
         normalize=True,
+        downsample_factor=args.downsample_factor,
+        upsample_factor=args.upsample_factor,
     )
 
     template_profile: Optional[Dict[str, object]] = None
@@ -1196,6 +1356,57 @@ def main():
     )
 
     vector_items = add_vector_assets(coll, vector_sources, asset_dir / "vectors", target_crs=args.target_crs)
+
+    boundary_dir = collection_root / "boundaries"
+    copied_boundary_paths: List[Path] = []
+    boundary_metadata_records: List[Dict[str, str]] = []
+    if project_boundary_paths:
+        ensure_dir(boundary_dir)
+        for idx, source_path in enumerate(project_boundary_paths, start=1):
+            try:
+                target_name = source_path.name
+                if "project" not in target_name.lower():
+                    suffix = source_path.suffix or ".tif"
+                    base = "boundary_project" if len(project_boundary_paths) == 1 else f"boundary_project_{idx}"
+                    target_name = f"{base}{suffix}"
+                destination = boundary_dir / target_name
+                if source_path.resolve() != destination.resolve():
+                    shutil.copy2(source_path, destination)
+                copied_boundary_paths.append(destination)
+            except Exception as exc:
+                logging.warning("Failed to copy project boundary %s: %s", source_path, exc)
+        if copied_boundary_paths:
+            coll.extra_fields = coll.extra_fields or {}
+            project_boundary_refs: List[str] = []
+            for path in copied_boundary_paths:
+                try:
+                    rel_str = str(path.relative_to(collection_root))
+                except ValueError:
+                    rel_str = str(path.resolve())
+                project_boundary_refs.append(rel_str)
+                boundary_metadata_records.append({
+                    "path": rel_str,
+                    "filename": path.name,
+                    "role": "project",
+                })
+            coll.extra_fields["gfm:project_boundary_rasters"] = project_boundary_refs
+            for boundary_path in copied_boundary_paths:
+                try:
+                    coll.add_link(
+                        Link(
+                            rel="derived_from",
+                            target=boundary_path.resolve().as_uri(),
+                            title=f"Project boundary raster ({boundary_path.name})",
+                        )
+                    )
+                except Exception:
+                    coll.add_link(
+                        Link(
+                            rel="derived_from",
+                            target=str(boundary_path),
+                            title=f"Project boundary raster ({boundary_path.name})",
+                        )
+                    )
 
     if label_paths:
         parquet_dir = asset_dir / "labels" / "tables"
@@ -1301,6 +1512,35 @@ def main():
         debug=False,
     )
     logging.info("Training metadata summary written to %s", training_metadata_path)
+    if boundary_metadata_records:
+        try:
+            metadata_doc = json.loads(training_metadata_path.read_text(encoding="utf-8"))
+        except Exception:
+            metadata_doc = {}
+        if not isinstance(metadata_doc, dict):
+            metadata_doc = {}
+        boundaries_section = metadata_doc.setdefault("boundaries", {})
+        existing_records = boundaries_section.get("project")
+        record_map: Dict[str, Dict[str, str]] = {}
+        if isinstance(existing_records, list):
+            for entry in existing_records:
+                if not isinstance(entry, dict):
+                    continue
+                key = entry.get("path") or entry.get("filename")
+                if not key:
+                    continue
+                record_map[str(key)] = dict(entry)
+        for record in boundary_metadata_records:
+            key = record.get("path") or record.get("filename")
+            if not key:
+                continue
+            record_map[str(key)] = dict(record)
+        boundaries_section["project"] = list(record_map.values())
+        try:
+            training_metadata_path.write_text(json.dumps(metadata_doc, indent=2), encoding="utf-8")
+            logging.info("Recorded project boundary metadata for %d raster(s)", len(boundary_metadata_records))
+        except Exception as exc:
+            logging.warning("Failed to update training metadata with boundary info: %s", exc)
     cat.set_self_href(str(catalog_href))
     cat.save(catalog_type=pystac.CatalogType.SELF_CONTAINED)
     print(f"STAC catalog written to: {out_dir}")
