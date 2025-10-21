@@ -114,24 +114,53 @@ class FMIntegrator:
 
     def _prepare_overlap_pairs(self) -> None:
         self.overlap_pairs: List[Tuple[str, str]] = []
+        pair_summary: Dict[str, int] = {}
         if self.cfg.overlap_pairs_path and self.cfg.overlap_pairs_path.exists():
             try:
                 with self.cfg.overlap_pairs_path.open("r", encoding="utf-8") as fh:
                     doc = json.load(fh)
                 for row in doc:
-                    a = row.get("dataset_a_tile")
-                    b = row.get("dataset_b_tile")
-                    if a and b:
-                        self.overlap_pairs.append((a, b))
+                    ds_a = row.get("dataset_a")
+                    ds_b = row.get("dataset_b")
+                    if ds_a and ds_b:
+                        key = f"{ds_a}->{ds_b}"
+                        pair_summary[key] = pair_summary.get(key, 0) + 1
+                    row_data = {
+                        "dataset_a": ds_a,
+                        "dataset_b": ds_b,
+                        "tile_a": row.get("dataset_a_tile"),
+                        "tile_b": row.get("dataset_b_tile"),
+                        "centroid": row.get("overlap_centroid"),
+                    }
+                    self.overlap_pairs.append(row_data)
             except Exception as exc:
                 print(f"[warn] Failed to read overlap pairs: {exc}")
                 self.overlap_pairs = []
 
         self.tile_lookup: Dict[str, Tuple[str, torch.Tensor, int]] = {}
+        self.dataset_coord_arrays: Dict[str, np.ndarray] = {}
+        self.dataset_coord_indices: Dict[str, List[int]] = {}
         for bundle in self.bundles.values():
+            coords_list: List[Tuple[float, float]] = []
+            indices: List[int] = []
             for idx, rec in enumerate(bundle.dataset.records):
                 emb = torch.from_numpy(rec.embedding).float()
                 self.tile_lookup[rec.tile_id] = (bundle.name, emb, rec.label)
+                if rec.coord is not None and not any(np.isnan(rec.coord)):
+                    coords_list.append(tuple(rec.coord))
+                    indices.append(idx)
+            if coords_list:
+                self.dataset_coord_arrays[bundle.name] = np.asarray(coords_list, dtype=np.float64)
+                self.dataset_coord_indices[bundle.name] = indices
+
+        if self.overlap_pairs:
+            pair_total = len(self.overlap_pairs)
+            print(f"[info] Detected {pair_total} overlapping tile pair(s) for cross-view alignment")
+            if pair_summary:
+                for key, count in sorted(pair_summary.items()):
+                    print(f"  [info]   {key}: {count}")
+        else:
+            print("[info] No overlap pairs detected; Phase 2 alignment will be skipped")
 
     def _optimizers(self):
         params = []
@@ -145,29 +174,65 @@ class FMIntegrator:
             disc_opt = torch.optim.AdamW(self.domain_disc.parameters(), lr=self.cfg.optimization.lr * 0.5)
         return opt, disc_opt
 
+    def _nearest_embedding(self, dataset_name: str, centroid: Sequence[float]) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        bundle = self.bundles.get(dataset_name)
+        if bundle is None:
+            return None
+        coord_array = self.dataset_coord_arrays.get(dataset_name)
+        coord_indices = self.dataset_coord_indices.get(dataset_name)
+        if coord_array is None or coord_indices is None or centroid is None:
+            return None
+        centroid_np = np.asarray(centroid, dtype=np.float64)
+        if centroid_np.size != 2 or np.any(np.isnan(centroid_np)):
+            return None
+        diffs = coord_array - centroid_np
+        dist_sq = np.sum(diffs * diffs, axis=1)
+        best_idx = int(np.argmin(dist_sq))
+        record_idx = coord_indices[best_idx]
+        rec = bundle.dataset.records[record_idx]
+        emb = torch.from_numpy(rec.embedding).float().to(self.device)
+        proj = bundle.projector(emb)
+        logits = bundle.head(proj)
+        return proj, logits
+
     def _gather_overlap_batch(self, batch_size: int = 128):
         if not self.overlap_pairs:
             return None
-        pairs = random.sample(self.overlap_pairs, min(batch_size, len(self.overlap_pairs)))
+        selected = random.sample(self.overlap_pairs, min(batch_size, len(self.overlap_pairs)))
         anchor_embeddings = []
         target_embeddings = []
         anchor_logits = []
         target_logits = []
-        for tile_a, tile_b in pairs:
-            if tile_a not in self.tile_lookup or tile_b not in self.tile_lookup:
+        for pair in selected:
+            ds_a = pair.get("dataset_a")
+            ds_b = pair.get("dataset_b")
+            centroid = pair.get("centroid")
+            result_a = self._nearest_embedding(ds_a, centroid)
+            result_b = self._nearest_embedding(ds_b, centroid)
+            if result_a is None or result_b is None:
+                tile_a = pair.get("tile_a")
+                tile_b = pair.get("tile_b")
+                if tile_a in self.tile_lookup and tile_b in self.tile_lookup:
+                    ds_a_lookup, emb_a, _ = self.tile_lookup[tile_a]
+                    ds_b_lookup, emb_b, _ = self.tile_lookup[tile_b]
+                    bundle_a = self.bundles.get(ds_a_lookup)
+                    bundle_b = self.bundles.get(ds_b_lookup)
+                    if bundle_a is None or bundle_b is None:
+                        continue
+                    proj_a = bundle_a.projector(emb_a.to(self.device))
+                    proj_b = bundle_b.projector(emb_b.to(self.device))
+                    logits_a = bundle_a.head(proj_a)
+                    logits_b = bundle_b.head(proj_b)
+                    result_a = (proj_a, logits_a)
+                    result_b = (proj_b, logits_b)
+            if result_a is None or result_b is None:
                 continue
-            ds_a, emb_a, label_a = self.tile_lookup[tile_a]
-            ds_b, emb_b, label_b = self.tile_lookup[tile_b]
-            bundle_a = self.bundles.get(ds_a)
-            bundle_b = self.bundles.get(ds_b)
-            if bundle_a is None or bundle_b is None:
-                continue
-            z_a = bundle_a.projector(emb_a.to(self.device))
-            z_b = bundle_b.projector(emb_b.to(self.device))
-            anchor_embeddings.append(z_b)
-            target_embeddings.append(z_a)
-            anchor_logits.append(bundle_b.head(z_b))
-            target_logits.append(bundle_a.head(z_a))
+            proj_a, logits_a = result_a
+            proj_b, logits_b = result_b
+            anchor_embeddings.append(proj_b)
+            target_embeddings.append(proj_a)
+            anchor_logits.append(logits_b)
+            target_logits.append(logits_a)
         if not anchor_embeddings:
             return None
         return (
@@ -371,10 +436,10 @@ class FMIntegrator:
 
 def run_training(config_path: Path):
     try:
-        from .config import load_config
+        from .config import load_config_1_int_FMs
     except ImportError:  # pragma: no cover
-        from config import load_config  # type: ignore
+        from config import load_config_1_int_FMs  # type: ignore
 
-    cfg = load_config(config_path)
+    cfg = load_config_1_int_FMs(config_path)
     trainer = FMIntegrator(cfg)
     trainer.train()
