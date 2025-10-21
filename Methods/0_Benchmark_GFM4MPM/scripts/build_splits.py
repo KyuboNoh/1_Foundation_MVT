@@ -11,6 +11,12 @@ import torch
 import rasterio
 from tqdm import tqdm
 
+try:
+    from pyproj import CRS, Transformer
+except Exception:  # pragma: no cover - optional dependency
+    CRS = None  # type: ignore[assignment]
+    Transformer = None  # type: ignore[assignment]
+
 # ensure repo-root execution can resolve the local src package
 import sys
 _THIS_DIR = Path(__file__).resolve().parent
@@ -33,6 +39,94 @@ from src.gfm4mpm.data.stac_table import StacTableStack
 from src.gfm4mpm.models.mae_vit import MAEViT
 from src.gfm4mpm.sampling.likely_negatives import compute_embeddings, pu_select_negatives
 from Common.data_utils import resolve_search_root, load_training_args, load_training_metadata, mae_kwargs_from_training_args, resolve_pretraining_patch, infer_region_from_name, resolve_label_rasters, collect_feature_rasters, read_stack_patch
+
+TARGET_CRS_EPSG = 8857
+TARGET_CRS = CRS.from_epsg(TARGET_CRS_EPSG) if CRS is not None else None
+_TRANSFORMER_CACHE: Dict[str, Transformer] = {}
+
+
+def _project_to_target_crs(x: float, y: float, src_crs) -> Tuple[float, float]:
+    if TARGET_CRS is None or Transformer is None or src_crs is None:
+        return float(x), float(y)
+    try:
+        src = CRS.from_user_input(src_crs)
+        key = src.to_string()
+        transformer = _TRANSFORMER_CACHE.get(key)
+        if transformer is None:
+            transformer = Transformer.from_crs(src, TARGET_CRS, always_xy=True)
+            _TRANSFORMER_CACHE[key] = transformer
+        x_t, y_t = transformer.transform(x, y)
+        return float(x_t), float(y_t)
+    except Exception:
+        return float(x), float(y)
+
+
+def _prepare_region_stack_lookup(stack: Any) -> Dict[str, Any]:
+    lookup: Dict[str, Any] = {}
+    if hasattr(stack, "iter_region_stacks"):
+        try:
+            for region_name, region_stack in stack.iter_region_stacks():
+                lookup[str(region_name)] = region_stack
+        except Exception:
+            lookup = {}
+    if not lookup:
+        lookup["GLOBAL"] = stack
+    return lookup
+
+
+def _metadata_for_raster_coord(
+    region_lookup: Dict[str, Any],
+    coord: Tuple[str, int, int],
+    label_value: int,
+) -> Tuple[str, Dict[str, Any], Tuple[float, float]]:
+    region, row, col = coord
+    entry: Dict[str, Any] = {
+        "region": region,
+        "row": int(row),
+        "col": int(col),
+        "label": int(label_value),
+        "label_type": "positive" if label_value == 1 else "unlabeled",
+    }
+    tile_id = f"{region}_{int(row)}_{int(col)}"
+    region_stack = region_lookup.get(str(region)) or region_lookup.get("GLOBAL")
+    coords_xy = (float("nan"), float("nan"))
+    if region_stack is not None:
+        transform = getattr(region_stack, "transform", None)
+        crs = getattr(region_stack, "crs", None)
+        if transform is not None:
+            try:
+                x, y = rasterio.transform.xy(transform, int(row), int(col), offset="center")
+                coords_xy = _project_to_target_crs(float(x), float(y), crs)
+            except Exception:
+                pass
+        if crs is not None:
+            try:
+                entry["crs"] = str(crs)
+            except Exception:
+                entry["crs"] = None
+    return tile_id, entry, coords_xy
+
+
+def _metadata_for_table_coord(stack: Any, coord: Tuple[int, int], label_value: int) -> Tuple[str, Dict[str, Any], Tuple[float, float]]:
+    index = int(coord[0]) if isinstance(coord, (tuple, list)) else int(coord)
+    entry: Dict[str, Any] = {
+        "index": index,
+        "label": int(label_value),
+        "label_type": "positive" if label_value == 1 else "unlabeled",
+    }
+    coords_xy = (float("nan"), float("nan"))
+    try:
+        meta_row = stack.metadata_row(index)
+        if isinstance(meta_row, dict):
+            entry.update(meta_row)
+    except Exception:
+        pass
+    tile_id = str(entry.get("h3_address") or entry.get("index") or f"row_{index}")
+    lon = entry.get("longitude")
+    lat = entry.get("latitude")
+    if lon is not None and lat is not None:
+        coords_xy = _project_to_target_crs(float(lon), float(lat), "EPSG:4326")
+    return tile_id, entry, coords_xy
 
 
 def _mae_kwargs_from_training_args(args_dict: Dict) -> Dict:
@@ -441,6 +535,27 @@ if __name__ == '__main__':
     metrics_summary["final_positive_candidates"] = len(pos)
     metrics_summary["final_unknown_candidates"] = len(unk)
 
+    labels_array = np.zeros(len(coords_all), dtype=np.int8)
+    labels_array[:len(pos)] = 1
+
+    region_lookup = _prepare_region_stack_lookup(stack) if load_result.mode != "table" else {}
+    metadata_records: List[Dict[str, Any]] = []
+    tile_ids: List[str] = []
+    coords_xy = np.full((len(coords_all), 2), np.nan, dtype=np.float64)
+
+    if load_result.mode == "table":
+        for idx, coord in enumerate(coords_all):
+            tile_id, meta_entry, xy = _metadata_for_table_coord(stack, coord, int(labels_array[idx]))
+            tile_ids.append(tile_id)
+            metadata_records.append(meta_entry)
+            coords_xy[idx] = xy
+    else:
+        for idx, coord in enumerate(coords_all):
+            tile_id, meta_entry, xy = _metadata_for_raster_coord(region_lookup, coord, int(labels_array[idx]))
+            tile_ids.append(tile_id)
+            metadata_records.append(meta_entry)
+            coords_xy[idx] = xy
+
     if hasattr(stack, "resolve_region_stack"):
         serialize_default_region = getattr(stack, "default_region", None)
         if serialize_default_region is None:
@@ -590,11 +705,24 @@ if __name__ == '__main__':
 
         if Z_all is None:
             raise RuntimeError('No coordinates collected to compute embeddings')
+        bundle_path = embedding_cache_path.with_suffix('.npz')
         try:
             np.save(embedding_cache_path, Z_all)
             print(f"[info] Saved embeddings to {embedding_cache_path}")
         except Exception as exc:
             print(f"[warn] Failed to save embeddings cache to {embedding_cache_path}: {exc}")
+        try:
+            np.savez_compressed(
+                bundle_path,
+                embeddings=Z_all,
+                labels=labels_array,
+                tile_ids=np.asarray(tile_ids, dtype=object),
+                coords=coords_xy.astype(np.float32, copy=False),
+                metadata=np.asarray(metadata_records, dtype=object),
+            )
+            print(f"[info] Saved embedding bundle to {bundle_path}")
+        except Exception as exc:
+            print(f"[warn] Failed to save embedding bundle to {bundle_path}: {exc}")
     else:
         if not embedding_cache_path.exists():
             raise FileNotFoundError(

@@ -17,11 +17,12 @@ import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+from itertools import combinations
 
 import json
 
 try:
-    from shapely.geometry import MultiPolygon, Polygon, mapping, shape as shapely_shape
+    from shapely.geometry import MultiPolygon, Polygon, box, mapping, shape as shapely_shape
     from shapely.ops import transform as shapely_transform, unary_union
 except Exception:  # pragma: no cover - optional dependency guard
     shapely_shape = None  # type: ignore[assignment]
@@ -582,6 +583,117 @@ def _collect_dataset_geometry(summary: DatasetSummary, dataset_crs: CRS) -> Opti
     return merged
 
 
+def _collect_dataset_tiles(summary: DatasetSummary, target_crs: Optional[CRS]) -> List[Dict[str, object]]:
+    if shapely_shape is None or rasterio is None or box is None:
+        return []
+    tiles: List[Dict[str, object]] = []
+    seen_paths: set[Path] = set()
+    for region_name, region_info in summary.regions.items():
+        feature_entries = region_info.get("features", {}) if isinstance(region_info, dict) else {}
+        for feature_name, entry in feature_entries.items():
+            tifs = entry.get("tifs", []) if isinstance(entry, dict) else []
+            for record in tifs:
+                if not isinstance(record, dict):
+                    continue
+                path_value = record.get("path_resolved") or record.get("path")
+                if not path_value:
+                    continue
+                tile_path = Path(str(path_value))
+                if not tile_path.is_absolute():
+                    tile_path = (summary.root / tile_path).resolve()
+                else:
+                    tile_path = tile_path.resolve()
+                if tile_path in seen_paths or not tile_path.exists():
+                    continue
+                try:
+                    with rasterio.open(tile_path) as ds:
+                        if ds.crs is None:
+                            continue
+                        bounds = ds.bounds
+                        geom = box(bounds.left, bounds.bottom, bounds.right, bounds.top)
+                        src_crs = ds.crs
+                        if target_crs is not None and Transformer is not None and shapely_transform is not None:
+                            if src_crs != target_crs:
+                                transformer = Transformer.from_crs(src_crs, target_crs, always_xy=True)
+                                geom = shapely_transform(transformer.transform, geom)
+                        elif target_crs is not None:
+                            continue
+                except Exception:
+                    continue
+                tiles.append(
+                    {
+                        "tile_id": record.get("tile_id") or tile_path.stem,
+                        "path": str(tile_path),
+                        "region": region_name,
+                        "feature": feature_name,
+                        "geom": geom,
+                    }
+                )
+                seen_paths.add(tile_path)
+    return tiles
+
+
+def _write_overlap_pairs(
+    tile_geoms: Dict[str, List[Dict[str, object]]],
+    overlap_geom: Optional[Polygon],
+    target_dir: Path,
+) -> Dict[str, str]:
+    if shapely_shape is None or not tile_geoms:
+        return {}
+    data_dir = target_dir / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    pair_outputs: Dict[str, str] = {}
+    for ds_a, ds_b in combinations(sorted(tile_geoms.keys()), 2):
+        records: List[Dict[str, object]] = []
+        for tile_a in tile_geoms[ds_a]:
+            geom_a = tile_a.get("geom")
+            if geom_a is None:
+                continue
+            for tile_b in tile_geoms[ds_b]:
+                geom_b = tile_b.get("geom")
+                if geom_b is None:
+                    continue
+                inter = geom_a.intersection(geom_b)
+                if overlap_geom is not None:
+                    inter = inter.intersection(overlap_geom)
+                if inter.is_empty:
+                    continue
+                area = float(inter.area)
+                if area <= 0:
+                    continue
+                centroid = inter.centroid
+                area_a = float(geom_a.area) if geom_a.area else None
+                area_b = float(geom_b.area) if geom_b.area else None
+                records.append(
+                    {
+                        "dataset_a": ds_a,
+                        "dataset_a_tile": tile_a.get("tile_id"),
+                        "dataset_a_feature": tile_a.get("feature"),
+                        "dataset_a_region": tile_a.get("region"),
+                        "dataset_a_path": tile_a.get("path"),
+                        "dataset_b": ds_b,
+                        "dataset_b_tile": tile_b.get("tile_id"),
+                        "dataset_b_feature": tile_b.get("feature"),
+                        "dataset_b_region": tile_b.get("region"),
+                        "dataset_b_path": tile_b.get("path"),
+                        "overlap_area": area,
+                        "overlap_fraction_a": (area / area_a) if area_a else None,
+                        "overlap_fraction_b": (area / area_b) if area_b else None,
+                        "overlap_centroid": [float(centroid.x), float(centroid.y)],
+                    }
+                )
+        if records:
+            pair_name = f"{ds_a}_{ds_b}_overlap_pairs.json"
+            output_path = data_dir / pair_name
+            try:
+                with output_path.open("w", encoding="utf-8") as fh:
+                    json.dump(records, fh, indent=2)
+                pair_outputs[f"{ds_a}-{ds_b}"] = str(output_path)
+            except Exception as exc:
+                print(f"[warn] Failed to write overlap pairs for {ds_a}-{ds_b}: {exc}")
+    return pair_outputs
+
+
 def _build_union_feature_table(datasets: Sequence[DatasetSummary]) -> Dict[str, List[str]]:
     """Map each feature name to the dataset IDs that provide it."""
     table: Dict[str, List[str]] = {}
@@ -790,6 +902,13 @@ def main() -> None:
         if ds.label_geojsons
     }
 
+    tile_geoms_index: Dict[str, List[Dict[str, object]]] = {}
+    if shapely_shape is not None and rasterio is not None:
+        for ds in datasets:
+            tiles = _collect_dataset_tiles(ds, target_crs)
+            if tiles:
+                tile_geoms_index[ds.dataset_id] = tiles
+
     label_union = sorted({label for ds in datasets for label in ds.label_names})
     region_union = sorted({region for ds in datasets for region in ds.region_keys})
 
@@ -953,8 +1072,18 @@ def main() -> None:
                     except Exception:
                         pass
                 overlap_mask_path = None
+                payload["study_area_overlap_mask"] = None
         else:
             print("[warn] Rasterio unavailable; skipping overlap mask generation.")
+            payload["study_area_overlap_mask"] = None
+    else:
+        payload["study_area_overlap_mask"] = None
+
+    pair_output_root = visual_base if visual_base is not None else Path.cwd()
+    overlap_pairs_outputs: Dict[str, str] = {}
+    if tile_geoms_index:
+        overlap_pairs_outputs = _write_overlap_pairs(tile_geoms_index, overlap_geom_equal, pair_output_root)
+    payload["study_area_overlap_pairs"] = overlap_pairs_outputs
 
     if args.visualize:
         if visual_base is None:

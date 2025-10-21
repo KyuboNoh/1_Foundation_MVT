@@ -21,4 +21,6 @@ python stacify_bc_data.py  --raw-dir /home/qubuntu25/Desktop/Research/Data/BCGS_
 
 python stacify_bc_data.py  --raw-dir /home/qubuntu25/Desktop/Research/Data/BCGS_OF2024-11/Data_Binary_Geophy_Float/ --label /home/qubuntu25/Desktop/Research/Data/BCGS_OF2024-11/Data_Binary_Geophy_Float/NEBC_MVT_TP.shp  --out /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/ --license "CC-BY-4.0"   --keywords MVT British_Columbia --project-boundary /home/qubuntu25/Desktop/Research/Data/BCGS_OF2024-11/Data_Binary_Geophy_Float/NEBC_StudyArea_1.tif --cogify   --validate --collection-id Out_Data_Binary_Geophy_Float_Down10 --downsample-factor 10 
 
+python stacify_bc_data.py  --raw-dir /home/qubuntu25/Desktop/Research/Data/BCGS_OF2024-11/Data_Binary_Geophy_Float/ --label /home/qubuntu25/Desktop/Research/Data/BCGS_OF2024-11/Data_Binary_Geophy_Float/NEBC_MVT_TP.shp  --out /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/ --license "CC-BY-4.0"   --keywords MVT British_Columbia --project-boundary /home/qubuntu25/Desktop/Research/Data/BCGS_OF2024-11/Data_Binary_Geophy_Float/NEBC_StudyArea_1.tif --cogify   --validate --collection-id Out_Data_Binary_Geophy_Float_Down5 --downsample-factor 5
+
 ```
