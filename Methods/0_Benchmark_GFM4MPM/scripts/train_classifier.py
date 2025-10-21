@@ -26,11 +26,12 @@ from Common.data_utils import (
     normalize_region_coord,
     prefilter_valid_window_coords,
 )
+
 from Common.data_utils import resolve_search_root, load_training_args, load_training_metadata, mae_kwargs_from_training_args, resolve_pretraining_patch, infer_region_from_name, resolve_label_rasters, collect_feature_rasters, read_stack_patch
 from Common.debug_visualization import visualize_debug_features
 from src.gfm4mpm.models.mae_vit import MAEViT
 from src.gfm4mpm.models.mlp_dropout import MLPDropout
-from src.gfm4mpm.training.train_cls import train_classifier
+from src.gfm4mpm.training.train_cls import train_classifier, eval_classifier
 from src.gfm4mpm.infer.infer_maps import group_positive_coords, mc_predict_map, write_prediction_outputs
 
 class LabeledPatches(Dataset):
@@ -45,6 +46,19 @@ class LabeledPatches(Dataset):
         x = read_stack_patch(self.stack, coord, self.window)
         y = self.labels[idx]
         return torch.from_numpy(x), torch.tensor(y, dtype=torch.long)
+
+
+def _to_serializable(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _to_serializable(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_serializable(v) for v in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
@@ -70,6 +84,12 @@ if __name__ == '__main__':
     ap.set_defaults(plot_prediction=False)
 
     args = ap.parse_args()
+    metrics_summary: Dict[str, Any] = {}
+    metrics_summary["test_ratio"] = float(args.test_ratio)
+    metrics_summary["random_seed"] = int(args.random_seed)
+    metrics_summary["save_prediction"] = bool(args.save_prediction)
+    metrics_summary["plot_prediction"] = bool(args.plot_prediction)
+    metrics_summary["passes"] = int(args.passes)
 
     modes = [bool(args.bands), bool(args.stac_root), bool(args.stac_table)]
     if sum(modes) != 1:
@@ -93,6 +113,9 @@ if __name__ == '__main__':
 
     stack = load_result.stack
     training_args_data = load_result.training_args
+    metrics_summary["input_mode"] = load_result.mode
+    if load_result.training_args_path is not None:
+        metrics_summary["pretrain_args_path"] = str(load_result.training_args_path)
 
     # if load_result.mode == 'table':
     #     default_patch = 1
@@ -108,8 +131,11 @@ if __name__ == '__main__':
 
     if load_result.mode == 'table' and window_size != 1:
         window_size = 1
+    metrics_summary["patch_size"] = int(patch_size)
+    metrics_summary["window_size"] = int(window_size)
 
     stride = args.stride if args.stride is not None else window_size
+    metrics_summary["stride"] = int(stride)
 
     state_dict = torch.load(encoder_path, map_location='cpu')
     patch_proj = state_dict.get('patch.proj.weight')
@@ -141,6 +167,8 @@ if __name__ == '__main__':
     neg_coords = [normalize_region_coord(entry, default_region=default_region) for entry in sp['neg']]
     coords = pos_coords + neg_coords
     labels = [1]*len(pos_coords) + [0]*len(neg_coords)
+    metrics_summary["initial_pos"] = len(pos_coords)
+    metrics_summary["initial_neg"] = len(neg_coords)
 
     batch_size = args.batch
     print(f"[info] Using batch size {batch_size} from training_args_1_pretrain.json")
@@ -148,14 +176,16 @@ if __name__ == '__main__':
     coords_clamped, clamp_count = clamp_coords_to_window(coords, stack, window_size)
     if clamp_count:
         print(f"[info] Adjusted {clamp_count} split coordinate(s) to stay within window bounds")
+    metrics_summary["clamp_count"] = int(clamp_count)
     coords = [normalize_region_coord(coord, default_region=default_region) for coord in coords_clamped]
     coords_with_labels = list(zip(coords, labels))
 
     if load_result.mode == 'raster':
         prefiltered = prefilter_valid_window_coords(stack, coords, window_size)
-        if len(prefiltered) != len(coords):
-            removed = len(coords) - len(prefiltered)
+        removed = len(coords) - len(prefiltered)
+        if removed:
             print(f"[info] Prefiltered {removed} coordinate(s) falling outside the project boundary")
+        metrics_summary["prefilter_removed"] = int(removed)
         valid_prefilter = set(prefiltered)
         coords_with_labels = [(coord, lab) for coord, lab in coords_with_labels if coord in valid_prefilter]
         coords = [coord for coord, _ in coords_with_labels]
@@ -163,10 +193,14 @@ if __name__ == '__main__':
         dropped_count = len(dropped_coords)
         if dropped_count:
             print(f"[info] Dropped {dropped_count} coordinate(s) due to insufficient valid pixels")
+        metrics_summary["dropped_invalid"] = int(dropped_count)
         if not filtered_coords:
             raise RuntimeError("All training samples were filtered out; check raster coverage or label coordinates.")
         valid_set = set(filtered_coords)
         coords_with_labels = [(coord, lab) for coord, lab in coords_with_labels if coord in valid_set]
+    else:
+        metrics_summary["prefilter_removed"] = 0
+        metrics_summary["dropped_invalid"] = 0
 
     coords = [coord for coord, _ in coords_with_labels]
     labels = [lab for _, lab in coords_with_labels]
@@ -177,6 +211,9 @@ if __name__ == '__main__':
         raise RuntimeError("No training samples available after preprocessing.")
 
     print(f"[info] Training classifier with {len(coords)} samples ({len(pos_coords_final)} positive, {len(neg_coords_final)} negative)")
+    metrics_summary["final_training_samples"] = len(coords)
+    metrics_summary["final_pos"] = len(pos_coords_final)
+    metrics_summary["final_neg"] = len(neg_coords_final)
 
     if args.debug:
         if load_result.mode != 'raster':
@@ -197,6 +234,14 @@ if __name__ == '__main__':
 
     # Split data
     Xtr, Xval, ytr, yval = train_test_split(coords, labels, test_size=args.test_ratio, stratify=labels, random_state=args.random_seed)
+    train_pos = int(sum(ytr))
+    val_pos = int(sum(yval))
+    metrics_summary["train_samples"] = len(Xtr)
+    metrics_summary["val_samples"] = len(Xval)
+    metrics_summary["train_pos"] = train_pos
+    metrics_summary["train_neg"] = len(Xtr) - train_pos
+    metrics_summary["val_pos"] = val_pos
+    metrics_summary["val_neg"] = len(Xval) - val_pos
 
     ds_tr = LabeledPatches(stack, Xtr, ytr, window=window_size)
     ds_va = LabeledPatches(stack, Xval, yval, window=window_size)
@@ -205,6 +250,8 @@ if __name__ == '__main__':
         print('[info] Using single-process data loading for raster stack')
     dl_tr = DataLoader(ds_tr, batch_size=batch_size, shuffle=True, num_workers=worker_count)
     dl_va = DataLoader(ds_va, batch_size=batch_size, shuffle=False, num_workers=worker_count)
+    metrics_summary["batch_size"] = int(batch_size)
+    metrics_summary["epochs"] = int(args.epochs)
 
     encoder = MAEViT(in_chans=stack.count, **mae_kwargs)
     encoder.load_state_dict(state_dict)
@@ -214,12 +261,59 @@ if __name__ == '__main__':
     mlp = MLPDropout(in_dim=in_dim)
 
     # Train classifier
-    mlp = train_classifier(encoder, mlp, dl_tr, dl_va, epochs=args.epochs)
+    mlp, epoch_history = train_classifier(
+        encoder,
+        mlp,
+        dl_tr,
+        dl_va,
+        epochs=args.epochs,
+        return_history=True,
+    )
+    train_eval = eval_classifier(encoder, mlp, dl_tr)
+    val_eval = eval_classifier(encoder, mlp, dl_va)
+    metrics_summary["evaluation"] = {
+        "train": {
+            "f1": float(train_eval[0]),
+            "mcc": float(train_eval[1]),
+            "auprc": float(train_eval[2]),
+            "auroc": float(train_eval[3]),
+        },
+        "val": {
+            "f1": float(val_eval[0]),
+            "mcc": float(val_eval[1]),
+            "auprc": float(val_eval[2]),
+            "auroc": float(val_eval[3]),
+        },
+    }
+    metrics_summary["epoch_metrics"] = [
+        {
+            "epoch": rec["epoch"],
+            "train": {k: float(v) for k, v in rec["train"].items()},
+            "val": {k: float(v) for k, v in rec["val"].items()},
+        }
+        for rec in epoch_history
+    ]
+
+    print("[info] Final evaluation metrics:")
+    print(
+        "       Train - "
+        f"F1={train_eval[0]:.3f} | MCC={train_eval[1]:.3f} | "
+        f"AUPRC={train_eval[2]:.3f} | AUROC={train_eval[3]:.3f}"
+    )
+    print(
+        "       Val   - "
+        f"F1={val_eval[0]:.3f} | MCC={val_eval[1]:.3f} | "
+        f"AUPRC={val_eval[2]:.3f} | AUROC={val_eval[3]:.3f}"
+    )
     out_dir = Path(args.out) if args.out else Path('.')
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / 'mlp_classifier.pth'
     torch.save(mlp.state_dict(), out_path)
     print(f"[info] Saved classifier to {out_path}")
+    outputs_summary = {
+        "classifier_path": str(out_path),
+        "saved_prediction_arrays": bool(args.save_prediction),
+    }
 
     print("[info] Generating prediction maps with MC-Dropout")
     # TODO: Allow stride override?
@@ -254,6 +348,7 @@ if __name__ == '__main__':
             writer.writeheader()
             writer.writerows(rows)
         print(f"Wrote table predictions to {out_csv}")
+        outputs_summary["prediction_table"] = str(out_csv)
     else:
         pos_coord_map = group_positive_coords(pos_coords_final, stack)
         write_prediction_outputs(
@@ -262,3 +357,17 @@ if __name__ == '__main__':
             out_dir,
             pos_coords_by_region=pos_coord_map,
         )
+        outputs_summary["prediction_directory"] = str(out_dir)
+
+    summary_path = Path(args.out) / "training_args_3_cls.json"
+    summary_payload = {
+        "metrics": _to_serializable(metrics_summary),
+        "outputs": _to_serializable(outputs_summary),
+    }
+    try:
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        with summary_path.open("w", encoding="utf-8") as fh:
+            json.dump(summary_payload, fh, indent=2)
+        print(f"[info] Saved classifier configuration to {summary_path}")
+    except Exception as exc:
+        print(f"[warn] Failed to write classifier summary to {summary_path}: {exc}")

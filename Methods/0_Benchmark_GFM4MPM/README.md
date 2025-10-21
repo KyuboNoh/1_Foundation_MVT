@@ -108,11 +108,20 @@ python -m Methods.0_Benchmark_GFM4MPM.scripts.train_classifier \
 4) **Plot again**:
 ```bash
 python -m Methods.0_Benchmark_GFM4MPM.scripts.plot_prospectivity \
---bands "/home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/Out_Data_Binary_Down30/assets/rasters/*.tif" \
---encoder /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/Out_Data_Binary_Down30/1_SSL_re/mae_encoder.pth \
---splits /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/Out_Data_Binary_Down30/2_Labeling_01_10/splits.json \
---out /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/Out_Data_Binary_Down30/3_cls_01_10/ \
---prediction-glob /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/Out_Data_Binary_Down30/3_cls_01_10/prediction_predictions.npy 
+--bands "/home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/assets/rasters/2021_Table04_Datacube_selected_Norm_*.tif" \
+--encoder /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/work/f21_2_10/1_SSL/mae_encoder.pth \
+--splits /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/work/f21_2_10/2_Labeling_01_10/splits.json \
+--out /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/work/f21_2_10/3_cls_01_10 \
+--prediction-glob "/home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/work/f21_2_10/3_cls_01_10/*_predictions.npy" 
+```
+
+```bash
+python -m Methods.0_Benchmark_GFM4MPM.scripts.plot_prospectivity \
+--bands "/home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/Out_Data_Binary_Geophy_Float_Down10/assets/rasters/*.tif" \
+--encoder /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/Out_Data_Binary_Geophy_Float_Down10/1_SSL_re/mae_encoder.pth \
+--splits /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/Out_Data_Binary_Geophy_Float_Down10/2_Labeling_01_10/splits.json \
+--out /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/Out_Data_Binary_Geophy_Float_Down10/3_cls_01_10 \
+--prediction-glob /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/Out_Data_Binary_Geophy_Float_Down10/3_cls_01_10/prediction_predictions.npy 
 ```
 
 5) **Explainability (IG)**:

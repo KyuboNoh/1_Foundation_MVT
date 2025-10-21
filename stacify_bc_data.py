@@ -703,7 +703,8 @@ def add_raster_assets(collection,
                       cogify: bool = True,
                       normalize: bool = False,
                       downsample_factor: Optional[float] = None,
-                      upsample_factor: Optional[float] = None) -> List[Dict[str, Path]]:
+                      upsample_factor: Optional[float] = None,
+                      project_boundaries: Optional[Sequence[Path]] = None) -> List[Dict[str, Path]]:
     ensure_dir(out_asset_dir)
     thumb_dir = out_asset_dir / "thumbnails"
     mods = _require_pystac()
@@ -747,8 +748,24 @@ def add_raster_assets(collection,
                     mask_bool: Optional[np.ndarray] = None
                     if mask_array is not None:
                         mask_bool = mask_array.astype(bool)
-                        total_pixel_count = int(mask_array.size)
-                        valid_pixel_count = int(np.count_nonzero(mask_array))
+
+                    boundary_mask: Optional[np.ndarray] = None
+                    if project_boundaries:
+                        boundary_mask = _resample_boundary_mask(
+                            project_boundaries,
+                            {
+                                "height": profile.get("height"),
+                                "width": profile.get("width"),
+                                "transform": profile.get("transform"),
+                                "crs": profile.get("crs"),
+                            },
+                        )
+                    if boundary_mask is not None:
+                        mask_bool = boundary_mask if mask_bool is None else (mask_bool & boundary_mask)
+
+                    if mask_bool is not None:
+                        valid_pixel_count = int(np.count_nonzero(mask_bool))
+                        total_pixel_count = int(mask_bool.size)
                         valid_pixel_fraction = (
                             float(valid_pixel_count / total_pixel_count) if total_pixel_count else None
                         )
@@ -798,6 +815,14 @@ def add_raster_assets(collection,
                             )
                             arrays.append(normalized_band)
                             band_infos.append(info)
+                    if mask_bool is not None:
+                        mask_bool_arr = np.asarray(mask_bool, dtype=bool)
+                        masked_arrays: List[np.ndarray] = []
+                        for arr in arrays:
+                            working = arr if np.issubdtype(arr.dtype, np.floating) else arr.astype(np.float32)
+                            masked = np.where(mask_bool_arr, working, np.nan).astype(working.dtype, copy=False)
+                            masked_arrays.append(masked)
+                        arrays = masked_arrays
                     if not arrays:
                         raise RuntimeError(f"No bands could be read from raster {tif}")
 
@@ -836,8 +861,30 @@ def add_raster_assets(collection,
             else:
                 if needs_resample:
                     with rasterio.open(tif) as src:
-                        resampled_data, resampled_transform, _ = _read_resampled_data(src, ds_factor, us_factor)
+                        resampled_data, resampled_transform, mask_array = _read_resampled_data(src, ds_factor, us_factor)
                         profile = src.profile.copy()
+                        mask_bool: Optional[np.ndarray] = None
+                        if mask_array is not None:
+                            mask_bool = mask_array.astype(bool)
+                        boundary_mask = None
+                        if project_boundaries:
+                            boundary_mask = _resample_boundary_mask(
+                                project_boundaries,
+                                {
+                                    "height": resampled_data.shape[1],
+                                    "width": resampled_data.shape[2],
+                                    "transform": resampled_transform,
+                                    "crs": profile.get("crs"),
+                                },
+                            )
+                        if boundary_mask is not None:
+                            mask_bool = boundary_mask if mask_bool is None else (mask_bool & boundary_mask)
+                        if mask_bool is not None:
+                            mask_bool_arr = np.asarray(mask_bool, dtype=bool)
+                            resampled_data = np.where(mask_bool_arr[np.newaxis, ...], resampled_data, 0).astype(resampled_data.dtype, copy=False)
+                            valid_pixel_count = int(np.count_nonzero(mask_bool_arr))
+                            total_pixel_count = int(mask_bool_arr.size)
+                            valid_pixel_fraction = float(valid_pixel_count / total_pixel_count) if total_pixel_count else None
                     profile.update(
                         height=resampled_data.shape[1],
                         width=resampled_data.shape[2],
@@ -857,15 +904,56 @@ def add_raster_assets(collection,
                         except FileNotFoundError:
                             pass
                 else:
-                    if cogify:
-                        to_cog(tif, asset_path)
-                    else:
-                        if tif.resolve() != asset_path.resolve():
-                            shutil.copy2(tif, asset_path)
+                    boundary_applied = False
+                    if project_boundaries:
+                        with rasterio.open(tif) as src:
+                            boundary_mask = _resample_boundary_mask(
+                                project_boundaries,
+                                {
+                                    "height": src.height,
+                                    "width": src.width,
+                                    "transform": src.transform,
+                                    "crs": src.crs,
+                                },
+                            )
+                            if boundary_mask is not None:
+                                try:
+                                    mask_array = src.dataset_mask()
+                                except Exception:
+                                    mask_array = None
+                                mask_bool = np.asarray(boundary_mask, dtype=bool)
+                                if mask_array is not None:
+                                    mask_bool = mask_bool & np.asarray(mask_array, dtype=bool)
+                                data = src.read()
+                                masked_data = np.where(mask_bool[np.newaxis, ...], data, 0).astype(data.dtype, copy=False)
+                                valid_pixel_count = int(np.count_nonzero(mask_bool))
+                                total_pixel_count = int(mask_bool.size)
+                                valid_pixel_fraction = (
+                                    float(valid_pixel_count / total_pixel_count) if total_pixel_count else None
+                                )
+                                profile = src.profile.copy()
+                                write_path = asset_path if not cogify else asset_path.parent / f".tmp_{asset_path.name}"
+                                ensure_dir(write_path.parent)
+                                with rasterio.open(write_path, "w", **profile) as dst:
+                                    dst.write(masked_data)
+                                if cogify:
+                                    to_cog(write_path, asset_path)
+                                    try:
+                                        write_path.unlink()
+                                    except FileNotFoundError:
+                                        pass
+                                boundary_applied = True
+                    if not boundary_applied:
+                        if cogify:
+                            to_cog(tif, asset_path)
+                        else:
+                            if tif.resolve() != asset_path.resolve():
+                                shutil.copy2(tif, asset_path)
                 with rasterio.open(asset_path) as asset_src:
-                    vp, tp, vf = _dataset_valid_pixel_stats(asset_src)
-                    if vp is not None:
-                        valid_pixel_count, total_pixel_count, valid_pixel_fraction = vp, tp, vf
+                    if valid_pixel_count is None or total_pixel_count is None or valid_pixel_fraction is None:
+                        vp, tp, vf = _dataset_valid_pixel_stats(asset_src)
+                        if vp is not None:
+                            valid_pixel_count, total_pixel_count, valid_pixel_fraction = vp, tp, vf
                     profile_summary = {
                         "width": asset_src.width,
                         "height": asset_src.height,
@@ -940,7 +1028,8 @@ def add_raster_assets(collection,
 def add_label_raster_assets(collection,
                             label_paths: List[Path],
                             out_asset_dir: Path,
-                            template_profile: Optional[Dict[str, object]]) -> List[Dict[str, object]]:
+                            template_profile: Optional[Dict[str, object]],
+                            project_boundaries: Optional[Sequence[Path]] = None) -> List[Dict[str, object]]:
     """Rasterize label shapefiles onto the feature grid and register them as STAC items."""
     if not label_paths:
         return []
@@ -991,6 +1080,20 @@ def add_label_raster_assets(collection,
                 fill_value=0.0,
                 all_touched=True,
             )
+            if project_boundaries:
+                boundary_mask = _resample_boundary_mask(
+                    project_boundaries,
+                    {
+                        "height": height,
+                        "width": width,
+                        "transform": transform,
+                        "crs": crs,
+                    },
+                )
+            else:
+                boundary_mask = None
+            if boundary_mask is not None:
+                raster = raster * boundary_mask.astype(raster.dtype, copy=False)
             valid_pixel_count = int(np.count_nonzero(raster))
             total_pixel_count = int(raster.size)
             valid_pixel_fraction = float(valid_pixel_count / total_pixel_count) if total_pixel_count else 0.0
@@ -1165,6 +1268,50 @@ def _dataset_valid_pixel_stats(src) -> Tuple[Optional[int], Optional[int], Optio
     return valid, total, fraction
 
 
+def _resample_boundary_mask(boundary_paths: Sequence[Path], target_profile: Dict[str, object]) -> Optional[np.ndarray]:
+    """Return a boolean mask aligned to target_profile where True denotes in-boundary pixels."""
+    if not boundary_paths:
+        return None
+    height = int(target_profile.get("height") or 0)
+    width = int(target_profile.get("width") or 0)
+    transform = target_profile.get("transform")
+    crs = target_profile.get("crs")
+    if height <= 0 or width <= 0 or transform is None or crs is None:
+        logging.warning("Cannot apply project boundary; target profile missing shape/transform/CRS.")
+        return None
+
+    rasterio = _require_rasterio()
+    from rasterio.warp import reproject, Resampling
+
+    union_mask = np.zeros((height, width), dtype=np.float32)
+    for boundary_path in boundary_paths:
+        try:
+            with rasterio.open(boundary_path) as src:
+                src_array = src.read(1, masked=False).astype(np.float32, copy=False)
+                if src_array.size == 0:
+                    continue
+                destination = np.zeros((height, width), dtype=np.float32)
+                src_transform = src.transform
+                src_crs = src.crs if src.crs is not None else crs
+                reproject(
+                    source=src_array,
+                    destination=destination,
+                    src_transform=src_transform,
+                    src_crs=src_crs,
+                    dst_transform=transform,
+                    dst_crs=crs,
+                    dst_nodata=0.0,
+                    resampling=Resampling.nearest,
+                )
+                destination = np.nan_to_num(destination, nan=0.0)
+                union_mask = np.maximum(union_mask, destination)
+        except Exception as exc:
+            logging.warning("Failed to project boundary mask %s onto raster grid: %s", boundary_path, exc)
+    if not np.any(union_mask):
+        return np.zeros((height, width), dtype=bool)
+    return union_mask > 0.5
+
+
 def scan_files(raw_dir: Path,
                ignore_roots: Optional[List[Path]] = None,
                exclude_paths: Optional[Sequence[Path]] = None) -> Tuple[List[Path], List[Path]]:
@@ -1337,6 +1484,7 @@ def main():
         normalize=True,
         downsample_factor=args.downsample_factor,
         upsample_factor=args.upsample_factor,
+        project_boundaries=project_boundary_paths,
     )
 
     template_profile: Optional[Dict[str, object]] = None
@@ -1353,6 +1501,7 @@ def main():
         label_paths,
         asset_dir / "labels",
         template_profile,
+        project_boundaries=project_boundary_paths,
     )
 
     vector_items = add_vector_assets(coll, vector_sources, asset_dir / "vectors", target_crs=args.target_crs)

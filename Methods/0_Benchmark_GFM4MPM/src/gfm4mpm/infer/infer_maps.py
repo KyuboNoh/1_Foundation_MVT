@@ -2,11 +2,39 @@
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from collections import defaultdict
 
+import json
 import numpy as np
-import torch
-import torch.nn as nn
+try:
+    import torch  # type: ignore
+    import torch.nn as nn  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    torch = None  # type: ignore[assignment]
+    nn = None  # type: ignore[assignment]
 import rasterio
+from rasterio.transform import array_bounds, xy
+from rasterio.mask import mask
+from rasterio.features import rasterize
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+
+try:
+    from shapely.geometry import MultiPolygon, Polygon, mapping
+    from shapely.ops import transform as shapely_transform, unary_union
+except Exception:  # pragma: no cover - optional dependency
+    MultiPolygon = Polygon = mapping = shapely_transform = unary_union = None  # type: ignore[assignment]
+
+try:
+    from pyproj import Transformer  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    Transformer = None  # type: ignore[assignment]
+
+
+def _require_torch():
+    if torch is None or nn is None:
+        raise RuntimeError("PyTorch is required for this operation; install torch to enable inference utilities.")
+    return torch
+
 
 def _regular_grid_idw(sampled: np.ndarray, row_coords: np.ndarray, col_coords: np.ndarray, shape: Tuple[int, int]) -> np.ndarray:
     """Bilinear IDW interpolation across a regular grid."""
@@ -101,6 +129,7 @@ def _mc_predict_single_region(
     save_prediction: bool = False,
     save_path: str = None,
 ):
+    torch_mod = _require_torch()
     encoder.eval().to(device)
     mlp.eval().to(device)
     for module in mlp.modules():
@@ -130,7 +159,7 @@ def _mc_predict_single_region(
         print("[warn] tqdm not installed; progress bar disabled.")
     for r, c in iterator:
         x = stack.read_patch(r, c, window_size)
-        x = torch.from_numpy(x[None]).to(device)
+        x = torch_mod.from_numpy(x[None]).to(device)
         zs = encoder.encode(x)
         preds = []
         for _ in range(passes):
@@ -192,47 +221,48 @@ def _mc_predict_single_region(
     return mean_map, np.sqrt(var_map)
 
 
-@torch.no_grad()
 def mc_predict_map(encoder, mlp, stack, window_size=32, stride=16, passes=30, device=None, show_progress=False, save_prediction=False, save_path=None):
+    torch_mod = _require_torch()
     if device is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        device = 'cuda' if torch_mod.cuda.is_available() else 'cpu'
 
-    if hasattr(stack, "resolve_region_stack") and hasattr(stack, "iter_region_stacks"):
-        region_results = {}
-        for region_name, region_stack in stack.iter_region_stacks():
-            region_mean, region_std = _mc_predict_single_region(
-                encoder,
-                mlp,
-                region_stack,
-                window_size=window_size,
-                stride=stride,
-                passes=passes,
-                device=device,
-                show_progress=show_progress,
-                region_name=str(region_name),
-                save_prediction=save_prediction,
-                save_path=save_path
-            )
-            region_results[str(region_name)] = {
-                "mean": region_mean,
-                "std": region_std,
-                "stack": region_stack,
-            }
-        return region_results
+    with torch_mod.no_grad():
+        if hasattr(stack, "resolve_region_stack") and hasattr(stack, "iter_region_stacks"):
+            region_results = {}
+            for region_name, region_stack in stack.iter_region_stacks():
+                region_mean, region_std = _mc_predict_single_region(
+                    encoder,
+                    mlp,
+                    region_stack,
+                    window_size=window_size,
+                    stride=stride,
+                    passes=passes,
+                    device=device,
+                    show_progress=show_progress,
+                    region_name=str(region_name),
+                    save_prediction=save_prediction,
+                    save_path=save_path
+                )
+                region_results[str(region_name)] = {
+                    "mean": region_mean,
+                    "std": region_std,
+                    "stack": region_stack,
+                }
+            return region_results
 
-    mean_map, std_map = _mc_predict_single_region(
-        encoder,
-        mlp,
-        stack,
-        window_size=window_size,
-        stride=stride,
-        passes=passes,
-        device=device,
-        show_progress=show_progress,
-        save_prediction=save_prediction,
-        save_path=save_path
-    )
-    return mean_map, std_map
+        mean_map, std_map = _mc_predict_single_region(
+            encoder,
+            mlp,
+            stack,
+            window_size=window_size,
+            stride=stride,
+            passes=passes,
+            device=device,
+            show_progress=show_progress,
+            save_prediction=save_prediction,
+            save_path=save_path
+        )
+        return mean_map, std_map
 
 
 def _compute_boundary_mask(mask: np.ndarray) -> np.ndarray:
@@ -357,9 +387,9 @@ def write_prediction_outputs(
         valid_mask, boundary_mask = _extract_valid_boundary_masks(ref_stack)
         masked_mean = mean_map
         masked_std = std_map
-        if valid_mask is not None and valid_mask.shape == mean_map.shape:
-            masked_mean = np.where(valid_mask, mean_map, np.nan).astype(np.float32, copy=False)
-            masked_std = np.where(valid_mask, std_map, np.nan).astype(np.float32, copy=False)
+        # if valid_mask is not None and valid_mask.shape == mean_map.shape:
+        #     masked_mean = np.where(valid_mask, mean_map, np.nan).astype(np.float32, copy=False)
+        #     masked_std = np.where(valid_mask, std_map, np.nan).astype(np.float32, copy=False)
 
         region_positions: Optional[List[Tuple[int, int]]] = None
         if pos_coords_by_region:
@@ -385,10 +415,25 @@ def write_prediction_outputs(
 
         save_geotiff(str(mean_path), masked_mean, ref_src, valid_mask=valid_mask)
         save_geotiff(str(std_path), masked_std, ref_src, valid_mask=valid_mask)
+        
+        from matplotlib.colors import LinearSegmentedColormap
+        # Blue → yellow gradient for cmap1
+        blue_yellow = LinearSegmentedColormap.from_list(
+            "blue_yellow",
+            ["#08306B", "#4EB3D3", "#FFFF00"],
+        )
+
+        # White → black gradient for cmap2
+        white_black = LinearSegmentedColormap.from_list(
+            "white_black",
+            ["#FFFFFF", "#000000"],
+        )
+
         summary_png = mean_path.with_suffix('.png')
         save_png(
             summary_png,
             masked_mean,
+            cmap=blue_yellow,
             valid_mask=valid_mask,
             boundary_mask=boundary_mask,
             std_array=masked_std,
@@ -398,7 +443,7 @@ def write_prediction_outputs(
         save_png(
             std_png,
             masked_std,
-            cmap="gray",
+            cmap=white_black,
             vmin=0.0,
             valid_mask=valid_mask,
             boundary_mask=boundary_mask,
@@ -409,8 +454,8 @@ def write_prediction_outputs(
             mean_std_png, 
             masked_mean,
             masked_std,
-            cmap1="inferno",
-            cmap2="gray",
+            cmap1=blue_yellow,
+            cmap2=white_black,
             criteria=0.25,
             valid_mask=valid_mask,
             boundary_mask=boundary_mask,
@@ -445,6 +490,7 @@ def save_png(
     if matplotlib.get_backend().lower() != "agg":
         matplotlib.use("Agg", force=True)
     from matplotlib import pyplot as plt
+    from matplotlib.colors import Colormap
     import numpy as np
 
     data = np.asarray(array, dtype=np.float32)
@@ -504,22 +550,24 @@ def save_png(
             )
 
     # Cyan deposit markers
-    if pos_coords:
-        coords_arr = np.asarray(pos_coords, np.float32)
-        if coords_arr.ndim == 2 and coords_arr.size:
-            ys = np.clip(coords_arr[:, 0] + 0.5, 0, height - 0.5)
-            xs = np.clip(coords_arr[:, 1] + 0.5, 0, width - 0.5)
-            ax.scatter(
-                xs, ys, s=18, c="cyan",
-                edgecolors="black", linewidths=0.4,
-                marker="o", zorder=5
-            )
+        if pos_coords:
+            coords_arr = np.asarray(pos_coords, np.float32)
+            if coords_arr.ndim == 2 and coords_arr.size:
+                ys = np.clip(coords_arr[:, 0] + 0.5, 0, height - 0.5)
+                xs = np.clip(coords_arr[:, 1] + 0.5, 0, width - 0.5)
+                ax.scatter(
+                    xs, ys, s=18, c="cyan",
+                    edgecolors="black", linewidths=0.4,
+                    marker="o", zorder=5
+                )
 
     # Boundary outline
     if boundary_mask is not None and boundary_mask.shape == display.shape and boundary_mask.any():
         ax.contour(
             boundary_mask.astype(np.uint8),
-            levels=[0.5], colors="white", linewidths=0.8
+            levels=[0.5],
+            colors="black",
+            linewidths=2.0,
         )
 
     ax.set_xlim(-0.5, width - 0.5)
@@ -576,6 +624,7 @@ def save_png2(
     if matplotlib.get_backend().lower() != "agg":
         matplotlib.use("Agg", force=True)
     from matplotlib import pyplot as plt
+    from matplotlib import colors as mcolors
     from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
     mean = np.asarray(mean_array, np.float32)
@@ -586,29 +635,45 @@ def save_png2(
         mean = np.where(valid_mask, mean, np.nan)
         std = np.where(valid_mask, std, np.nan)
 
-    # Normalize both to [0, 1]
-    def _normalize(x):
-        finite = np.isfinite(x)
-        if not np.any(finite):
-            return x
-        x_min, x_max = np.nanmin(x[finite]), np.nanmax(x[finite])
-        return (x - x_min) / (x_max - x_min + 1e-8)
+    if isinstance(cmap1, str):
+        cmap_mean = plt.get_cmap(cmap1)
+    else:
+        cmap_mean = cmap1
+    if isinstance(cmap2, str):
+        cmap_std = plt.get_cmap(cmap2)
+    else:
+        cmap_std = cmap2
 
-    mean_norm = _normalize(mean)
-    std_norm = _normalize(std)
+    combined_rgb = np.ones((*mean.shape, 3), dtype=np.float32)
 
-    # Blend weight: high mean → color, low mean → uncertainty
-    alpha = np.clip((mean_norm - criteria) / (1.0 - criteria), 0.0, 1.0)
+    finite_mean = np.isfinite(mean)
+    finite_std = np.isfinite(std)
+    mean_mask = finite_mean & (mean > criteria)
+    std_mask = finite_std & ~mean_mask
 
-    cmap_mean = plt.get_cmap(cmap1)
-    cmap_std = plt.get_cmap(cmap2)
+    norm_mean = None
+    if mean_mask.any():
+        vmin_mean = float(np.nanmin(mean[mean_mask]))
+        vmax_mean = float(np.nanmax(mean[mean_mask]))
+        if not np.isfinite(vmin_mean):
+            vmin_mean = 0.0
+        if not np.isfinite(vmax_mean) or vmax_mean == vmin_mean:
+            vmax_mean = vmin_mean + 1.0
+        norm_mean = mcolors.Normalize(vmin=vmin_mean, vmax=vmax_mean, clip=True)
+        mean_rgba = cmap_mean(norm_mean(mean))
+        combined_rgb[mean_mask] = mean_rgba[..., :3][mean_mask]
 
-    mean_rgb = cmap_mean(mean_norm)[..., :3]
-    std_rgb = cmap_std(std_norm)[..., :3]
-    combined_rgb = alpha[..., None] * mean_rgb + (1.0 - alpha[..., None]) * std_rgb
-
-    # Fill NaN with white (so black areas disappear)
-    combined_rgb[~np.isfinite(mean)] = (1.0, 1.0, 1.0)
+    norm_std = None
+    if std_mask.any():
+        vmin_std = float(np.nanmin(std[std_mask]))
+        vmax_std = float(np.nanmax(std[std_mask]))
+        if not np.isfinite(vmin_std):
+            vmin_std = 0.0
+        if not np.isfinite(vmax_std) or vmax_std == vmin_std:
+            vmax_std = vmin_std + 1.0
+        norm_std = mcolors.Normalize(vmin=vmin_std, vmax=vmax_std, clip=True)
+        std_rgba = cmap_std(norm_std(std))
+        combined_rgb[std_mask] = std_rgba[..., :3][std_mask]
 
     h, w, _ = combined_rgb.shape
     dpi = 100
@@ -618,37 +683,821 @@ def save_png2(
 
     # Boundary contour
     if boundary_mask is not None and boundary_mask.shape == mean.shape and boundary_mask.any():
-        ax.contour(boundary_mask.astype(np.uint8), levels=[0.5], colors="white", linewidths=0.8)
+        ax.contour(
+            boundary_mask.astype(np.uint8),
+            levels=[0.5],
+            colors="black",
+            linewidths=2.0,
+        )
 
-    # Deposit positions
-    if pos_coords:
-        coords = np.asarray(pos_coords)
-        ys = np.clip(coords[:, 0] + 0.5, 0, h - 0.5)
-        xs = np.clip(coords[:, 1] + 0.5, 0, w - 0.5)
-        ax.scatter(xs, ys, s=18, c="cyan", edgecolors="black", linewidths=0.4, zorder=5)
+    # Positive positions
+        if pos_coords:
+            coords = np.asarray(pos_coords)
+            try:
+                xs, ys = xy(
+                    transform,
+                    coords[:, 0],
+                    coords[:, 1],
+                    offset="center",
+                )
+                ax.scatter(xs, ys, s=18, c="cyan", edgecolors="black", linewidths=0.4, zorder=5)
+            except Exception:
+                ys = np.clip(coords[:, 0] + 0.5, 0, h - 0.5)
+                xs = np.clip(coords[:, 1] + 0.5, 0, w - 0.5)
+                ax.scatter(xs, ys, s=18, c="cyan", edgecolors="black", linewidths=0.4, zorder=5)
 
     # --- Add colorbars ---
     # Likelihood bar
-    cax1 = inset_axes(ax, width="2%", height="35%", loc="upper right", borderpad=0.5)
-    cb1 = plt.colorbar(
-        plt.cm.ScalarMappable(cmap=cmap_mean),
-        cax=cax1,
-        orientation="vertical",
-        fraction=0.05,
-    )
-    cb1.set_label("Likelihood", fontsize=8)
-    cb1.ax.tick_params(labelsize=7)
+    cax1 = inset_axes(ax, width="2%", height="35%", loc="upper right", borderpad=0.6)
+    if norm_mean is not None:
+        cb1 = plt.colorbar(
+            plt.cm.ScalarMappable(norm=norm_mean, cmap=cmap_mean),
+            cax=cax1,
+            orientation="vertical",
+            fraction=0.05,
+        )
+        cb1.set_label("Likelihood", fontsize=8)
+        cb1.ax.tick_params(labelsize=7)
+    else:
+        cax1.set_visible(False)
 
     # Uncertainty bar (below)
-    cax2 = inset_axes(ax, width="2%", height="35%", loc="lower right", borderpad=0.5)
-    cb2 = plt.colorbar(
-        plt.cm.ScalarMappable(cmap=cmap_std),
-        cax=cax2,
-        orientation="vertical",
-        fraction=0.05,
-    )
-    cb2.set_label("Uncertainty", fontsize=8)
-    cb2.ax.tick_params(labelsize=7)
+    cax2 = inset_axes(ax, width="2%", height="35%", loc="lower right", borderpad=0.6)
+    if norm_std is not None:
+        cb2 = plt.colorbar(
+            plt.cm.ScalarMappable(norm=norm_std, cmap=cmap_std),
+            cax=cax2,
+            orientation="vertical",
+            fraction=0.05,
+        )
+        cb2.set_label("Uncertainty", fontsize=8)
+        cb2.ax.tick_params(labelsize=7)
+    else:
+        cax2.set_visible(False)
 
     fig.savefig(mean_std_path, bbox_inches="tight", pad_inches=0)
     plt.close(fig)
+
+
+def _load_boundary_mask(
+    summary_boundaries: Dict[str, List[Dict]],
+    region_name: str,
+    dataset_root: Path,
+    target_shape: Tuple[int, int],
+) -> Optional[np.ndarray]:
+    region_upper = region_name.upper()
+    for records in summary_boundaries.values():
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            record_region = str(record.get("region") or "GLOBAL").upper()
+            if record_region != region_upper:
+                continue
+            path_value = record.get("path_resolved") or record.get("path")
+            if not path_value:
+                continue
+            boundary_path = Path(path_value)
+            if not boundary_path.is_absolute():
+                boundary_path = (dataset_root / boundary_path).resolve()
+            if not boundary_path.exists():
+                continue
+            try:
+                with rasterio.open(boundary_path) as boundary_ds:
+                    mask_data = boundary_ds.read(1, masked=True)
+                    if hasattr(mask_data, "filled"):
+                        mask_array = mask_data.filled(0).astype(np.uint8, copy=False)
+                    else:
+                        mask_array = np.asarray(mask_data, dtype=np.uint8)
+                    boundary_mask = mask_array != 0
+                    if boundary_mask.shape == target_shape:
+                        return boundary_mask
+            except Exception:
+                continue
+    return None
+
+
+def generate_bridge_visualizations(
+    bridge_mappings: Sequence[Dict[str, List[str]]],
+    dataset_lookup: Dict[str, Any],
+    output_dir: Path,
+    label_geojson_map: Optional[Dict[str, Dict[str, List[str]]]] = None,
+    overlap_geoms: Optional[Dict[str, Any]] = None,
+    dataset_crs_map: Optional[Dict[str, Any]] = None,
+    target_crs: Optional[Any] = None,
+    overall_overlap_geom: Optional[Any] = None,
+    overlap_mask_path: Optional[Path] = None,
+) -> None:
+    """Materialise TIFF/PNG previews for bridge features and labels (with positive masks)."""
+    if not bridge_mappings:
+        return
+    try:
+        import matplotlib.pyplot as plt
+        import shutil
+    except Exception as exc:
+        print(f"[warn] Skipping bridge visualisations (dependencies missing): {exc}")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    overlap_mask_data = None
+    overlap_mask_transform = None
+    overlap_mask_crs = None
+    overlap_mask_bounds = None
+    if overlap_mask_path:
+        try:
+            with rasterio.open(overlap_mask_path) as mask_ds:
+                overlap_mask_data = mask_ds.read(1).astype(np.uint8)
+                overlap_mask_transform = mask_ds.transform
+                overlap_mask_crs = mask_ds.crs
+                overlap_mask_bounds = array_bounds(
+                    overlap_mask_data.shape[0],
+                    overlap_mask_data.shape[1],
+                    overlap_mask_transform,
+                )
+        except Exception as exc:
+            print(f"[warn] Failed to load overlap mask {overlap_mask_path}: {exc}")
+            overlap_mask_data = None
+            overlap_mask_transform = None
+            overlap_mask_crs = None
+            overlap_mask_bounds = None
+
+    def _project_mask_to_grid(shape: Tuple[int, int], transform, crs) -> Optional[np.ndarray]:
+        if (
+            overlap_mask_data is None
+            or overlap_mask_transform is None
+            or overlap_mask_crs is None
+            or transform is None
+            or crs is None
+        ):
+            return None
+        target = np.zeros(shape, dtype=np.uint8)
+        try:
+            reproject(
+                overlap_mask_data,
+                target,
+                src_transform=overlap_mask_transform,
+                src_crs=overlap_mask_crs,
+                dst_transform=transform,
+                dst_crs=crs,
+                resampling=Resampling.nearest,
+            )
+            return target > 0
+        except Exception:
+            return None
+
+    def _project_to_overlap_grid(array: np.ndarray, transform, crs, bucket: str) -> Optional[np.ndarray]:
+        if (
+            overlap_mask_data is None
+            or overlap_mask_transform is None
+            or overlap_mask_crs is None
+            or transform is None
+            or crs is None
+        ):
+            return None
+        dest = np.full(overlap_mask_data.shape, np.nan, dtype=np.float32)
+        resampling_method = Resampling.nearest if bucket == "labels" else Resampling.bilinear
+        try:
+            reproject(
+                array,
+                dest,
+                src_transform=transform,
+                src_crs=crs,
+                dst_transform=overlap_mask_transform,
+                dst_crs=overlap_mask_crs,
+                resampling=resampling_method,
+                src_nodata=np.nan,
+                dst_nodata=np.nan,
+            )
+            mask_bool = overlap_mask_data > 0
+            dest = np.where(mask_bool, dest, np.nan)
+            return dest
+        except Exception:
+            return None
+
+    for idx, mapping in enumerate(bridge_mappings, start=1):
+        bridge_dir = output_dir / f"bridge_{idx:02d}"
+        bridge_overlap_assets: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for dataset_id, feature_names in mapping.items():
+            if not feature_names:
+                continue
+            summary = dataset_lookup.get(dataset_id)
+            if summary is None:
+                print(f"[warn] Dataset '{dataset_id}' referenced in bridge {idx} not found; skipping.")
+                continue
+
+            dataset_root = Path(getattr(summary, "root", Path.cwd()))
+            regions = getattr(summary, "regions", {})
+            geojson_lookup: Dict[str, List[Path]] = {}
+            if label_geojson_map and dataset_id in label_geojson_map:
+                geojson_lookup = {
+                    region: [Path(p) for p in paths]
+                    for region, paths in label_geojson_map[dataset_id].items()
+                }
+            overlap_geom_dataset = overlap_geoms.get(dataset_id) if overlap_geoms else None
+            dataset_crs = None
+            if dataset_crs_map and dataset_id in dataset_crs_map:
+                dataset_crs = dataset_crs_map.get(dataset_id)
+            point_transformer = None
+            if dataset_crs is not None and target_crs is not None and Transformer is not None:
+                try:
+                    point_transformer = Transformer.from_crs(dataset_crs, target_crs, always_xy=True)
+                except Exception:
+                    point_transformer = None
+            overlap_geom_native = None
+            if overlap_geom_dataset is not None:
+                overlap_geom_native = overlap_geom_dataset
+                if (
+                    shapely_transform is not None
+                    and dataset_crs is not None
+                    and target_crs is not None
+                    and Transformer is not None
+                    and overlap_geom_dataset is not None
+                ):
+                    try:
+                        to_native = Transformer.from_crs(target_crs, dataset_crs, always_xy=True)
+                        overlap_geom_native = shapely_transform(to_native.transform, overlap_geom_dataset)
+                    except Exception:
+                        overlap_geom_native = overlap_geom_dataset
+
+            for feature_name in feature_names:
+                located = False
+                for region_name, region_info in regions.items():
+                    region_safe = region_name.replace("/", "_")
+                    region_base_dir = bridge_dir / dataset_id / region_safe
+                    region_base_dir.mkdir(parents=True, exist_ok=True)
+
+                    geojson_paths = geojson_lookup.get(region_name) or geojson_lookup.get("GLOBAL", [])
+                    geojson_dest_dir = region_base_dir / "label_geojson"
+                    for geo_path in geojson_paths:
+                        try:
+                            geojson_dest_dir.mkdir(parents=True, exist_ok=True)
+                            copy_target = geojson_dest_dir / geo_path.name
+                            if not copy_target.exists():
+                                shutil.copy2(geo_path, copy_target)
+                        except Exception as exc:
+                            print(f"[warn] Failed to copy label GeoJSON {geo_path}: {exc}")
+
+                    for bucket in ("features", "labels"):
+                        entry = region_info.get(bucket, {}).get(feature_name)
+                        if not isinstance(entry, dict):
+                            continue
+                        tif_records = entry.get("tifs", [])
+                        if not tif_records:
+                            continue
+                        record = next(
+                            (
+                                rec
+                                for rec in tif_records
+                                if isinstance(rec, dict) and (rec.get("path_resolved") or rec.get("path"))
+                            ),
+                            None,
+                        )
+                        if record is None:
+                            continue
+                        path_value = record.get("path_resolved") or record.get("path")
+                        if not path_value:
+                            continue
+                        src_path = Path(path_value)
+                        if not src_path.is_absolute():
+                            src_path = (dataset_root / src_path).resolve()
+                        if not src_path.exists():
+                            print(f"[warn] Bridge asset missing on disk: {src_path}")
+                            continue
+
+                        dest_dir = region_base_dir / bucket
+                        dest_dir.mkdir(parents=True, exist_ok=True)
+                        dest_tif = dest_dir / f"{feature_name}.tif"
+                        try:
+                            if not dest_tif.exists():
+                                shutil.copy2(src_path, dest_tif)
+                        except Exception as exc:
+                            print(f"[warn] Failed to copy {src_path} -> {dest_tif}: {exc}")
+
+                        dest_png = dest_dir / f"{feature_name}.png"
+                        try:
+                            label_points: List[Tuple[float, float]] = []
+                            clipped_result = None
+                            clipped_meta = None
+                            clipped_transform = None
+                            with rasterio.open(src_path) as src_ds:
+                                data = src_ds.read(1, masked=True)
+                                if hasattr(data, "filled"):
+                                    arr_native = data.filled(np.nan).astype(np.float32, copy=False)
+                                else:
+                                    arr_native = np.asarray(data, dtype=np.float32)
+                                native_transform = src_ds.transform
+                                src_crs = src_ds.crs
+
+                                arr = arr_native
+                                transform = native_transform
+                                dest_crs = src_crs
+                                if target_crs is not None and src_crs is not None:
+                                    try:
+                                        transform, width, height = calculate_default_transform(
+                                            src_crs,
+                                            target_crs,
+                                            src_ds.width,
+                                            src_ds.height,
+                                            *src_ds.bounds,
+                                        )
+                                        dest = np.empty((height, width), dtype=np.float32)
+                                        reproject(
+                                            arr_native,
+                                            dest,
+                                            src_transform=native_transform,
+                                            src_crs=src_crs,
+                                            dst_transform=transform,
+                                            dst_crs=target_crs,
+                                            resampling=Resampling.bilinear,
+                                        )
+                                        arr = dest
+                                        dest_crs = target_crs
+                                    except Exception:
+                                        arr = arr_native
+                                        transform = native_transform
+                                        dest_crs = src_crs
+                                else:
+                                    transform = native_transform
+                                    dest_crs = src_crs
+
+                                overlap_clip_geom = None
+                                if overlap_geom_dataset is not None and mapping is not None:
+                                    overlap_clip_geom = overlap_geom_native or overlap_geom_dataset
+                                if overlap_clip_geom is not None and mapping is not None:
+                                    try:
+                                        shapes_to_mask = [mapping(overlap_clip_geom)]
+                                        clipped_arr, clipped_transform = mask(
+                                            src_ds,
+                                            shapes_to_mask,
+                                            crop=True,
+                                            filled=True,
+                                            all_touched=True,
+                                        )
+                                        if target_crs is not None and src_crs is not None and clipped_arr.size:
+                                            clip_bounds = array_bounds(
+                                                clipped_arr.shape[1],
+                                                clipped_arr.shape[2],
+                                                clipped_transform,
+                                            )
+                                            c_transform, c_width, c_height = calculate_default_transform(
+                                                src_crs,
+                                                target_crs,
+                                                clipped_arr.shape[2],
+                                                clipped_arr.shape[1],
+                                                *clip_bounds,
+                                            )
+                                            clipped_dest = np.empty((1, c_height, c_width), dtype=clipped_arr.dtype)
+                                            reproject(
+                                                clipped_arr,
+                                                clipped_dest,
+                                                src_transform=clipped_transform,
+                                                src_crs=src_crs,
+                                                dst_transform=c_transform,
+                                                dst_crs=target_crs,
+                                                resampling=Resampling.bilinear,
+                                            )
+                                            clipped_meta = src_ds.meta.copy()
+                                            clipped_meta.update(
+                                                height=c_height,
+                                                width=c_width,
+                                                transform=c_transform,
+                                                crs=target_crs,
+                                            )
+                                            clipped_result = clipped_dest
+                                            clipped_transform = c_transform
+                                        elif clipped_arr.size:
+                                            clipped_meta = src_ds.meta.copy()
+                                            clipped_meta.update(
+                                                height=clipped_arr.shape[1],
+                                                width=clipped_arr.shape[2],
+                                                transform=clipped_transform,
+                                            )
+                                            clipped_result = clipped_arr
+                                    except Exception:
+                                        clipped_result = None
+
+                                boundary_mask = None
+                                try:
+                                    mask_native = src_ds.dataset_mask()
+                                    if mask_native is not None:
+                                        mask_native = mask_native != 0
+                                        if mask_native.any():
+                                            if target_crs is not None and src_crs is not None and mask_native.shape == arr_native.shape:
+                                                mask_dest = np.zeros((arr.shape[0], arr.shape[1]), dtype=np.uint8)
+                                                reproject(
+                                                    mask_native.astype(np.uint8),
+                                                    mask_dest,
+                                                    src_transform=native_transform,
+                                                    src_crs=src_crs,
+                                                    dst_transform=transform,
+                                                    dst_crs=dest_crs,
+                                                    resampling=Resampling.nearest,
+                                                )
+                                                boundary_mask = mask_dest.astype(bool)
+                                            else:
+                                                boundary_mask = mask_native.astype(bool)
+                                except Exception:
+                                    boundary_mask = None
+
+                            if boundary_mask is not None:
+                                arr = np.where(boundary_mask, arr, np.nan)
+                            arr_local = arr.astype(np.float32, copy=False)
+                            transform_local = transform
+                            crs_local = dest_crs
+
+                            mask_local = _project_mask_to_grid(arr_local.shape, transform_local, crs_local)
+                            if mask_local is not None:
+                                arr_masked_local = np.where(mask_local, arr_local, np.nan)
+                            else:
+                                arr_masked_local = arr_local
+
+                            global_arr = _project_to_overlap_grid(arr_local, transform_local, crs_local, bucket)
+
+                            height, width = arr.shape
+
+                            fig, ax = plt.subplots(figsize=(6, 5))
+                            ax.set_title(f"{feature_name}\n{dataset_id} / {region_name} [{bucket[:-1]}]")
+                            extent = None
+                            try:
+                                left, bottom, right, top = array_bounds(height, width, transform)
+                                extent = (left, right, bottom, top)
+                            except Exception:
+                                extent = None
+
+                            if bucket == "labels":
+                                positives = np.where(arr > 0, 1.0, np.nan)
+                                img = ax.imshow(
+                                    positives,
+                                    origin="upper",
+                                    cmap="Reds",
+                                    vmin=0.0,
+                                    vmax=1.0,
+                                    extent=extent,
+                                )
+                                pos_rows, pos_cols = np.where(arr > 0)
+                                if pos_rows.size and extent is not None:
+                                    xs, ys = xy(transform, pos_rows, pos_cols, offset="center")
+                                    ax.scatter(xs, ys, s=8, c="cyan", edgecolors="black", linewidths=0.3)
+                                elif pos_rows.size:
+                                    ax.scatter(pos_cols + 0.5, pos_rows + 0.5, s=8, c="cyan", edgecolors="black", linewidths=0.3)
+                                for geo_path in geojson_paths:
+                                    try:
+                                        with open(geo_path, "r", encoding="utf-8") as fh:
+                                            geo_doc = json.load(fh)
+                                    except Exception:
+                                        continue
+                                    features = geo_doc.get("features", [])
+                                    for feat in features:
+                                        geom = feat.get("geometry") if isinstance(feat, dict) else None
+                                        if not isinstance(geom, dict):
+                                            continue
+                                        gtype = geom.get("type")
+                                        coords = geom.get("coordinates")
+                                        if coords is None:
+                                            continue
+                                        try:
+                                            if gtype == "Point":
+                                                x_val, y_val = coords
+                                            elif gtype in {"MultiPoint"} and coords:
+                                                x_val, y_val = coords[0]
+                                            elif gtype in {"LineString"} and coords:
+                                                xs_line, ys_line = zip(*coords)
+                                                x_val = float(np.mean(xs_line))
+                                                y_val = float(np.mean(ys_line))
+                                            elif gtype in {"MultiLineString", "Polygon", "MultiPolygon"}:
+                                                flat: List[Tuple[float, float]] = []
+                                                def _accumulate(nodes):
+                                                    if not isinstance(nodes, (list, tuple)):
+                                                        return
+                                                    if len(nodes) >= 2 and not isinstance(nodes[0], (list, tuple)):
+                                                        try:
+                                                            flat.append((float(nodes[0]), float(nodes[1])))
+                                                        except Exception:
+                                                            pass
+                                                        return
+                                                    for node in nodes:
+                                                        _accumulate(node)
+                                                _accumulate(coords)
+                                                if not flat:
+                                                    continue
+                                                xs_poly, ys_poly = zip(*flat)
+                                                x_val = float(np.mean(xs_poly))
+                                                y_val = float(np.mean(ys_poly))
+                                            else:
+                                                continue
+                                            label_points.append((x_val, y_val))
+                                        except Exception:
+                                            continue
+                                if label_points:
+                                    lp_x, lp_y = zip(*label_points)
+                                    ax.scatter(lp_x, lp_y, s=24, c="yellow", marker="*", edgecolors="black", linewidths=0.4, zorder=7)
+                            else:
+                                finite = np.isfinite(arr)
+                                if finite.any():
+                                    valid = arr[finite]
+                                    vmin = float(np.nanpercentile(valid, 2))
+                                    vmax = float(np.nanpercentile(valid, 98))
+                                    if vmin == vmax:
+                                        vmax = vmin + 1.0
+                                else:
+                                    vmin, vmax = 0.0, 1.0
+                                img = ax.imshow(
+                                    arr,
+                                    origin="upper",
+                                    cmap="viridis",
+                                    vmin=vmin,
+                                    vmax=vmax,
+                                    extent=extent,
+                                )
+                            if overlap_geom_dataset is not None and mapping is not None:
+                                def _plot_geom(geom):
+                                    if geom.is_empty:
+                                        return
+                                    if hasattr(geom, "geoms"):
+                                        for sub in geom.geoms:
+                                            _plot_geom(sub)
+                                        return
+                                    exterior = geom.exterior.coords if geom.exterior else []
+                                    if exterior:
+                                        xs, ys = zip(*exterior)
+                                        ax.plot(xs, ys, color="lime", linewidth=1.2, alpha=0.9)
+                                    for interior in geom.interiors:
+                                        xs, ys = zip(*interior.coords)
+                                        ax.plot(xs, ys, color="lime", linewidth=0.8, alpha=0.6, linestyle="--")
+
+                                _plot_geom(overlap_geom_dataset)
+                            if boundary_mask is not None:
+                                try:
+                                    contour_mask = _compute_boundary_mask(boundary_mask)
+                                    if extent is not None:
+                                        x_coords = np.linspace(extent[0], extent[1], contour_mask.shape[1])
+                                        y_coords = np.linspace(extent[3], extent[2], contour_mask.shape[0])
+                                        ax.contour(
+                                            x_coords,
+                                            y_coords,
+                                            contour_mask.astype(np.uint8),
+                                            levels=[0.5],
+                                            colors="black",
+                                            linewidths=1.0,
+                                        )
+                                    else:
+                                        ax.contour(
+                                            contour_mask.astype(np.uint8),
+                                            levels=[0.5],
+                                            colors="black",
+                                            linewidths=1.0,
+                                        )
+                                except Exception:
+                                    pass
+
+                            ax.set_xlabel("X (Equal Earth m)")
+                            ax.set_ylabel("Y (Equal Earth m)")
+
+                            fig.tight_layout()
+                            fig.savefig(dest_png, dpi=200)
+                            plt.close(fig)
+
+                            try:
+                                array_store = arr_local
+                                transform_store = transform_local
+                                crs_store = crs_local
+                                array_global = _project_to_overlap_grid(array_store, transform_store, crs_store, bucket)
+                                bridge_overlap_assets[dataset_id].append(
+                                    {
+                                        "feature": feature_name,
+                                        "bucket": bucket,
+                                        "array": array_store,
+                                        "transform": transform_store,
+                                        "crs": crs_store,
+                                        "masked_array": arr_masked_local,
+                                        "global_array": array_global,
+                                    }
+                                )
+                            except Exception as exc:
+                                print(f"[warn] Failed to cache overlap data for {feature_name}: {exc}")
+                        except Exception as exc:
+                            print(f"[warn] Failed to render {src_path}: {exc}")
+                        located = True
+                        break
+                    if located:
+                        break
+                if not located:
+                    print(f"[warn] Feature '{feature_name}' not found for dataset '{dataset_id}' in bridge {idx}.")
+
+        overlap_base = bridge_dir / "Overlap"
+        combo_dataset_ids = [ds_id for ds_id in mapping.keys() if bridge_overlap_assets.get(ds_id)]
+        if len(combo_dataset_ids) >= 2:
+            combined_name = "-".join(combo_dataset_ids)
+            combined_dir = overlap_base / combined_name
+            combined_dir.mkdir(parents=True, exist_ok=True)
+
+            plot_entries: List[Dict[str, Any]] = []
+            for ds_id in combo_dataset_ids:
+                assets = bridge_overlap_assets.get(ds_id, [])
+                order = mapping.get(ds_id, [])
+                for feature_name in order:
+                    match = next((rec for rec in assets if rec.get("feature") == feature_name), None)
+                    if match:
+                        entry = dict(match)
+                        entry["dataset"] = ds_id
+                        plot_entries.append(entry)
+
+            if plot_entries:
+                boundary_geom = None
+                if overall_overlap_geom is not None:
+                    boundary_geom = overall_overlap_geom
+                elif overlap_geoms:
+                    geoms = [overlap_geoms.get(ds) for ds in combo_dataset_ids if overlap_geoms.get(ds) is not None]
+                    if geoms:
+                        boundary_geom = geoms[0]
+                        for geom in geoms[1:]:
+                            if boundary_geom is None:
+                                boundary_geom = geom
+                            else:
+                                try:
+                                    boundary_geom = boundary_geom.intersection(geom)
+                                except Exception:
+                                    boundary_geom = geom
+
+                try:
+                    import matplotlib.pyplot as plt
+                except Exception as exc:
+                    print(f"[warn] Failed to import matplotlib for combined overlap plot: {exc}")
+                    continue
+
+                n_plots = len(plot_entries)
+                ncols = 2 if n_plots > 1 else 1
+                nrows = int(np.ceil(n_plots / ncols))
+                fig_height = max(4, nrows * 4)
+                fig_width = max(6, ncols * 4)
+                fig, axes = plt.subplots(nrows, ncols, figsize=(fig_width, fig_height))
+                if isinstance(axes, np.ndarray):
+                    axes = axes.flatten()
+                else:
+                    axes = [axes]
+
+                def _plot_boundary(ax_obj, geom, target_crs_obj, clip_crs_obj):
+                    if geom is None or geom.is_empty:
+                        return
+                    geom_to_plot = geom
+                    if (
+                        shapely_transform is not None
+                        and Transformer is not None
+                        and target_crs_obj is not None
+                        and clip_crs_obj is not None
+                    ):
+                        try:
+                            to_clip = Transformer.from_crs(target_crs_obj, clip_crs_obj, always_xy=True)
+                            geom_to_plot = shapely_transform(to_clip.transform, geom)
+                        except Exception:
+                            geom_to_plot = geom
+                    if geom_to_plot is None or geom_to_plot.is_empty:
+                        return
+                    if hasattr(geom_to_plot, "geoms"):
+                        for sub_geom in geom_to_plot.geoms:
+                            _plot_boundary(ax_obj, sub_geom, None, None)
+                        return
+                    exterior = geom_to_plot.exterior.coords if geom_to_plot.exterior else []
+                    if exterior:
+                        xs_b, ys_b = zip(*exterior)
+                        ax_obj.plot(xs_b, ys_b, color="black", linewidth=2.0, alpha=0.95)
+                    for interior in geom_to_plot.interiors:
+                        xs_i, ys_i = zip(*interior.coords)
+                        ax_obj.plot(xs_i, ys_i, color="black", linewidth=1.2, linestyle="--", alpha=0.7)
+
+                global_clipped_entries: List[Tuple[str, np.ndarray, Optional[Tuple[float, float, float, float]], str, Optional[Any]]] = []
+                global_clip_bounds = list(overlap_mask_bounds) if overlap_mask_bounds is not None else None
+
+                for ax, entry in zip(axes, plot_entries):
+                    ds_id = entry.get("dataset")
+                    feature_name = entry.get("feature")
+                    bucket = entry.get("bucket")
+                    arr_clip = entry.get("array")
+                    clip_transform = entry.get("transform")
+                    clip_crs = entry.get("crs")
+                    arr_masked_local = entry.get("masked_array")
+                    arr_global = entry.get("global_array")
+
+                    if arr_clip is None or clip_transform is None:
+                        continue
+
+                    clip_height, clip_width = arr_clip.shape
+                    extent = None
+                    try:
+                        left_c, bottom_c, right_c, top_c = array_bounds(clip_height, clip_width, clip_transform)
+                        extent = (left_c, right_c, bottom_c, top_c)
+                    except Exception:
+                        extent = None
+
+                    ax.set_title(f"{feature_name} ({ds_id})")
+                    if bucket == "labels":
+                        positives_clip = np.where(arr_clip > 0, 1.0, np.nan)
+                        ax.imshow(
+                            positives_clip,
+                            origin="upper",
+                            cmap="Reds",
+                            vmin=0.0,
+                            vmax=1.0,
+                            extent=extent,
+                        )
+                    else:
+                        finite_clip = np.isfinite(arr_clip)
+                        if finite_clip.any():
+                            valid_clip = arr_clip[finite_clip]
+                            vmin_clip = float(np.nanpercentile(valid_clip, 2))
+                            vmax_clip = float(np.nanpercentile(valid_clip, 98))
+                            if vmin_clip == vmax_clip:
+                                vmax_clip = vmin_clip + 1.0
+                        else:
+                            vmin_clip, vmax_clip = 0.0, 1.0
+                        ax.imshow(
+                            arr_clip,
+                            origin="upper",
+                            cmap="viridis",
+                            vmin=vmin_clip,
+                            vmax=vmax_clip,
+                            extent=extent,
+                        )
+
+                    _plot_boundary(ax, boundary_geom, target_crs, clip_crs)
+                    ax.set_xlabel("X")
+                    ax.set_ylabel("Y")
+
+                    masked_local = arr_masked_local if isinstance(arr_masked_local, np.ndarray) else arr_clip
+                    if global_clip_bounds is None and extent is not None:
+                        global_clip_bounds = list(extent)
+                    global_clipped_entries.append(
+                        (
+                            ds_id,
+                            arr_global if isinstance(arr_global, np.ndarray) else masked_local,
+                            extent,
+                            bucket,
+                            overlap_mask_crs if isinstance(arr_global, np.ndarray) else clip_crs,
+                        )
+                    )
+
+                # Hide unused axes if any
+                for leftover_ax in axes[len(plot_entries):]:
+                    leftover_ax.axis("off")
+
+                fig.tight_layout()
+                combined_png = combined_dir / f"bridge_{idx:02d}_combined.png"
+                fig.savefig(combined_png, dpi=200)
+                plt.close(fig)
+
+                if global_clipped_entries:
+                    fig_clip, axes_clip = plt.subplots(nrows, ncols, figsize=(fig_width, fig_height))
+                    if isinstance(axes_clip, np.ndarray):
+                        axes_clip = axes_clip.flatten()
+                    else:
+                        axes_clip = [axes_clip]
+
+                    clip_extent_global = (
+                        tuple(overlap_mask_bounds)
+                        if overlap_mask_bounds is not None
+                        else (tuple(global_clip_bounds) if global_clip_bounds is not None else None)
+                    )
+
+                    for ax_clip, (ds_id, arr_clip, extent_clip, bucket_clip, clip_crs_inner) in zip(
+                        axes_clip, global_clipped_entries
+                    ):
+                        ax_clip.set_title(f"{bucket_clip} ({ds_id}) - clipped")
+                        if bucket_clip == "labels":
+                            positives_clip = np.where(arr_clip > 0, 1.0, np.nan)
+                            ax_clip.imshow(
+                                positives_clip,
+                                origin="upper",
+                                cmap="Reds",
+                                vmin=0.0,
+                                vmax=1.0,
+                                extent=clip_extent_global,
+                            )
+                        else:
+                            finite_clip = np.isfinite(arr_clip)
+                            if finite_clip.any():
+                                valid_clip = arr_clip[finite_clip]
+                                vmin_clip = float(np.nanpercentile(valid_clip, 2))
+                                vmax_clip = float(np.nanpercentile(valid_clip, 98))
+                                if vmin_clip == vmax_clip:
+                                    vmax_clip = vmin_clip + 1.0
+                            else:
+                                vmin_clip, vmax_clip = 0.0, 1.0
+                            ax_clip.imshow(
+                                arr_clip,
+                                origin="upper",
+                                cmap="viridis",
+                                vmin=vmin_clip,
+                                vmax=vmax_clip,
+                                extent=clip_extent_global,
+                            )
+                        _plot_boundary(ax_clip, boundary_geom, target_crs, clip_crs_inner)
+                        ax_clip.set_xlabel("X")
+                        ax_clip.set_ylabel("Y")
+
+                    for leftover_ax in axes_clip[len(global_clipped_entries):]:
+                        leftover_ax.axis("off")
+
+                    fig_clip.tight_layout()
+                    combined_clip_png = combined_dir / f"bridge_{idx:02d}_combined_clipped.png"
+                    fig_clip.savefig(combined_clip_png, dpi=200)
+                    plt.close(fig_clip)

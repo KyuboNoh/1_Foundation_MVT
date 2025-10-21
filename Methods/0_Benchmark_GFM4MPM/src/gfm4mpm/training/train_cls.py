@@ -82,7 +82,7 @@ def _compute_metrics(targets: torch.Tensor, probs: torch.Tensor) -> Dict[str, fl
     return metrics
 
 
-def train_classifier(encoder, mlp, train_loader, val_loader, epochs=50, lr=1e-3, device=None):
+def train_classifier(encoder, mlp, train_loader, val_loader, epochs=50, lr=1e-3, device=None, return_history: bool = False):
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     encoder.eval().to(device)       # IMPORTANT: freeze encoder
@@ -90,6 +90,7 @@ def train_classifier(encoder, mlp, train_loader, val_loader, epochs=50, lr=1e-3,
     opt = torch.optim.AdamW(mlp.parameters(), lr=lr)
     bce = torch.nn.BCELoss()
     best = {"f1": -1, "state_dict": None}
+    history = []
     for ep in range(1, epochs+1):
         mlp.train()
         running_loss = 0.0
@@ -145,8 +146,24 @@ def train_classifier(encoder, mlp, train_loader, val_loader, epochs=50, lr=1e-3,
             f"bacc={val_metrics['balanced_accuracy']:.3f}"
         )
 
+        history.append(
+            {
+                "epoch": int(ep),
+                "train": {
+                    "loss": float(avg_loss),
+                    **{k: float(v) for k, v in train_metrics.items()},
+                },
+                "val": {
+                    "loss": float(val_loss),
+                    **{k: float(v) for k, v in val_metrics.items()},
+                },
+            }
+        )
+
     if best["state_dict"] is not None:
         mlp.load_state_dict(best["state_dict"])
+    if return_history:
+        return mlp, history
     return mlp
 
 def eval_classifier(encoder, mlp, loader, device=None):

@@ -278,6 +278,22 @@ def _load_deposit_pixels_with_regions(geojson_path: str, stack: Any) -> List[Tup
     coords = load_deposit_pixels(geojson_path, stack)
     return [("GLOBAL", int(r), int(c)) for r, c in coords]
 
+
+def _to_serializable(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _to_serializable(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_serializable(v) for v in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _namespace_to_dict(args: argparse.Namespace) -> Dict[str, Any]:
+    return {key: _to_serializable(val) for key, val in vars(args).items()}
+
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--stac-root', help='STAC collection root (table workflow)')
@@ -292,6 +308,9 @@ if __name__ == '__main__':
     ap.add_argument('--validation', action='store_true', help='Generate diagnostic plots for PU negative selection')
     ap.add_argument('--debug', action='store_true', help='Generate debug visualisations of labels and feature rasters')
     args = ap.parse_args()
+
+    args_record = _namespace_to_dict(args)
+    metrics_summary: Dict[str, Any] = {}
 
     modes = [bool(args.bands), bool(args.stac_root), bool(args.stac_table)]
     if sum(modes) != 1:
@@ -324,6 +343,11 @@ if __name__ == '__main__':
     feature_columns = load_result.feature_columns
     training_args_data = load_result.training_args
     training_args_path = load_result.training_args_path
+    metrics_summary["input_mode"] = load_result.mode
+    if training_args_path is not None:
+        metrics_summary["pretrain_args_path"] = str(training_args_path)
+    if stack_root_path is not None:
+        metrics_summary["stack_root"] = str(stack_root_path)
 
     if load_result.mode == 'table':
         patch = _resolve_pretraining_patch(training_args_data, 1)
@@ -332,6 +356,10 @@ if __name__ == '__main__':
         unk_indices = np.where(labels == 0)[0]
         pos = [stack.index_to_coord(int(i)) for i in pos_indices]
         unk = [stack.index_to_coord(int(i)) for i in unk_indices]
+        metrics_summary.update(
+            initial_pos=len(pos),
+            initial_unknown=len(unk),
+        )
     else:
         patch = _resolve_pretraining_patch(training_args_data, 32)
         pos_raw: List[Tuple[str, int, int]] = []
@@ -339,6 +367,7 @@ if __name__ == '__main__':
             pos_raw = _load_label_pixels(load_result.label_paths)
             if pos_raw:
                 print(f"[info] Loaded {len(pos_raw)} positive samples from label rasters.")
+        metrics_summary["initial_pos_raw"] = len(pos_raw)
         if not pos_raw:
             if args.pos_geojson:
                 pos_raw = _load_deposit_pixels_with_regions(args.pos_geojson, stack)
@@ -350,6 +379,7 @@ if __name__ == '__main__':
         pos_clamped, clamp_count_pos = clamp_coords_to_window(pos_raw, stack, patch)
         if clamp_count_pos:
             print(f"[info] Adjusted {clamp_count_pos} positive coordinate(s) to stay within window bounds")
+        metrics_summary["clamp_count_pos"] = int(clamp_count_pos)
 
         default_region = getattr(stack, "default_region", None)
         if default_region is None:
@@ -368,6 +398,7 @@ if __name__ == '__main__':
         pos, dropped_pos = filter_valid_raster_coords(stack, pos, patch, min_valid_fraction=0.05)
         if dropped_pos:
             print(f"[info] Dropped {len(dropped_pos)} positive coordinate(s) lacking sufficient valid pixels")
+        metrics_summary["dropped_pos_invalid"] = len(dropped_pos)
         if not pos:
             raise RuntimeError("No usable positive samples remain after filtering; check label coverage.")
 
@@ -378,10 +409,12 @@ if __name__ == '__main__':
         grid_set = set(grid_coords)
         pos_set = set(pos)
         unk_raw = list(grid_set - pos_set)
+        metrics_summary["initial_unknown_raw"] = len(unk_raw)
         print("[info] Clamping coordinates for unknowns to valid patch windows...")
         unk_clamped, clamp_count_unk = clamp_coords_to_window(unk_raw, stack, patch)
         if clamp_count_unk:
             print(f"[info] Adjusted {clamp_count_unk} unlabeled coordinate(s) to stay within window bounds")
+        metrics_summary["clamp_count_unknown"] = int(clamp_count_unk)
         unk = [
             normalize_region_coord(coord, default_region=default_region)
             for coord in unk_clamped
@@ -392,16 +425,21 @@ if __name__ == '__main__':
         dropped_prefilter = len(unk) - len(prefiltered_unk)
         if dropped_prefilter:
             print(f"[info] Prefiltered {dropped_prefilter} unlabeled coordinate(s) with insufficient window coverage")
+        metrics_summary["prefilter_dropped_unknown"] = int(dropped_prefilter)
         print(f"[info] Filtering invalid raster coordinate(s) starts...")
         unk, dropped_unk = filter_valid_raster_coords(stack, prefiltered_unk, patch, min_valid_fraction=0.05)
         if dropped_unk:
             print(f"[info] Dropped {len(dropped_unk)} candidate negative coordinate(s) lacking sufficient valid pixels")
+        metrics_summary["dropped_unknown_invalid"] = len(dropped_unk)
 
     coords_all = pos + unk
     if not coords_all:
         raise RuntimeError('No coordinates collected to compute embeddings')
     if not pos:
         raise RuntimeError('No positive samples found; check label column or source data')
+    metrics_summary["total_coords"] = len(coords_all)
+    metrics_summary["final_positive_candidates"] = len(pos)
+    metrics_summary["final_unknown_candidates"] = len(unk)
 
     if hasattr(stack, "resolve_region_stack"):
         serialize_default_region = getattr(stack, "default_region", None)
@@ -629,6 +667,7 @@ if __name__ == '__main__':
         raise RuntimeError("Failed to select any negatives; ensure each region has positives and candidate negatives.")
 
     neg_idx = np.concatenate([arr for arr in neg_idx_list if arr.size])
+    metrics_summary["selected_negatives"] = int(neg_idx.size)
 
     splits = {
         'pos': [_serialize_coord_entry(rc) for rc in pos],
@@ -654,6 +693,8 @@ if __name__ == '__main__':
     with out_path.open('w') as f:
         json.dump(splits, f, indent=2)
     print(f"Wrote {len(splits['pos'])} positives and {len(splits['neg'])} negatives to {out_path}")
+    metrics_summary["final_pos"] = len(splits['pos'])
+    metrics_summary["final_neg"] = len(splits['neg'])
 
     if args.validation and debug_info_by_region:
         diag_root = Path(args.out) / 'validation'
@@ -680,3 +721,16 @@ if __name__ == '__main__':
                 cutoff,
                 args.filter_top_pct,
             )
+
+    summary_path = Path(args.out) / "training_args_2_buildsplits.json"
+    summary_payload = {
+        "arguments": args_record,
+        "metrics": _to_serializable(metrics_summary),
+    }
+    try:
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        with summary_path.open("w", encoding="utf-8") as fh:
+            json.dump(summary_payload, fh, indent=2)
+        print(f"[info] Saved build-splits configuration to {summary_path}")
+    except Exception as exc:
+        print(f"[warn] Failed to write build-splits summary to {summary_path}: {exc}")
