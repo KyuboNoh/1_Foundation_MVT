@@ -9,6 +9,8 @@ from sklearn.metrics import f1_score, matthews_corrcoef
 from torchmetrics.classification import BinaryAUROC, BinaryAveragePrecision
 from tqdm import tqdm
 
+from Common.metrics_logger import DEFAULT_METRIC_ORDER, log_metrics, normalize_metrics
+
 
 def _collect_outputs(encoder, mlp, loader, device) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run encoder+MLP over a loader and return stacked labels and probabilities on CPU."""
@@ -82,13 +84,25 @@ def _compute_metrics(targets: torch.Tensor, probs: torch.Tensor) -> Dict[str, fl
     return metrics
 
 
-def train_classifier(encoder, mlp, train_loader, val_loader, epochs=50, lr=1e-3, device=None, return_history: bool = False):
+def train_classifier(
+    encoder,
+    mlp,
+    train_loader,
+    val_loader,
+    epochs: int = 50,
+    lr: float = 1e-3,
+    device: Optional[str] = None,
+    return_history: bool = False,
+    loss_weights: Optional[Dict[str, float]] = None,
+):
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     encoder.eval().to(device)       # IMPORTANT: freeze encoder
     mlp.to(device)
     opt = torch.optim.AdamW(mlp.parameters(), lr=lr)
     bce = torch.nn.BCELoss()
+    if loss_weights is None:
+        loss_weights = {"bce": 1.0}
     best = {"f1": -1, "state_dict": None}
     history = []
     for ep in range(1, epochs+1):
@@ -100,12 +114,13 @@ def train_classifier(encoder, mlp, train_loader, val_loader, epochs=50, lr=1e-3,
             with torch.no_grad():
                 z = encoder.encode(x)
             p = mlp(z)
-            loss = bce(p, y)
+            raw_loss = bce(p, y)
+            weighted_loss = loss_weights.get("bce", 1.0) * raw_loss
             opt.zero_grad()
-            loss.backward()
+            weighted_loss.backward()
             opt.step()
 
-            running_loss += loss.item() * y.size(0)
+            running_loss += raw_loss.item() * y.size(0)
             sample_count += y.size(0)
 
         avg_loss = running_loss / sample_count if sample_count else float('nan')
@@ -125,38 +140,19 @@ def train_classifier(encoder, mlp, train_loader, val_loader, epochs=50, lr=1e-3,
         if comparable_f1 > best["f1"]:
             best = {"f1": comparable_f1, "state_dict": mlp.state_dict()}
 
-        print(
-            "[TRAIN] "
-            f"loss={avg_loss:.4f} "
-            f"f1={train_metrics['f1']:.3f} "
-            f"mcc={train_metrics['mcc']:.3f} "
-            f"auprc={train_metrics['auprc']:.3f} "
-            f"auroc={train_metrics['auroc']:.3f} "
-            f"acc={train_metrics['accuracy']:.3f} "
-            f"bacc={train_metrics['balanced_accuracy']:.3f}"
-        )
-        print(
-            "[VAL] "
-            f"loss={val_loss:.4f} "
-            f"f1={val_metrics['f1']:.3f} "
-            f"mcc={val_metrics['mcc']:.3f} "
-            f"auprc={val_metrics['auprc']:.3f} "
-            f"auroc={val_metrics['auroc']:.3f} "
-            f"acc={val_metrics['accuracy']:.3f} "
-            f"bacc={val_metrics['balanced_accuracy']:.3f}"
-        )
+        train_log = {"loss": float(avg_loss), **train_metrics}
+        val_log = {"loss": float(val_loss), **val_metrics}
+
+        log_metrics("train", train_log, order=DEFAULT_METRIC_ORDER)
+        log_metrics("val", val_log, order=DEFAULT_METRIC_ORDER)
 
         history.append(
             {
                 "epoch": int(ep),
-                "train": {
-                    "loss": float(avg_loss),
-                    **{k: float(v) for k, v in train_metrics.items()},
-                },
-                "val": {
-                    "loss": float(val_loss),
-                    **{k: float(v) for k, v in val_metrics.items()},
-                },
+                "train": normalize_metrics(train_log),
+                "val": normalize_metrics(val_log),
+                "train_weighted_loss": float(weighted_loss.item()),
+                "val_weighted_loss": float(loss_weights.get("bce", 1.0) * val_loss) if not math.isnan(val_loss) else float("nan"),
             }
         )
 
@@ -173,9 +169,11 @@ def eval_classifier(encoder, mlp, loader, device=None):
     mlp.eval().to(device)
     targets, probs = _collect_outputs(encoder, mlp, loader, device)
     metrics = _compute_metrics(targets, probs)
-    return (
-        metrics["f1"],
-        metrics["mcc"],
-        metrics["auprc"],
-        metrics["auroc"],
-    )
+    if targets.numel():
+        raw_loss = torch.nn.functional.binary_cross_entropy(probs, targets.float())
+        metrics["loss"] = float(raw_loss.item())
+        metrics["weighted_loss"] = float(raw_loss.item())
+    else:
+        metrics["loss"] = float("nan")
+        metrics["weighted_loss"] = float("nan")
+    return metrics

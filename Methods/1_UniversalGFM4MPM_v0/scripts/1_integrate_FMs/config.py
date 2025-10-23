@@ -18,6 +18,7 @@ class DatasetConfig:
     name: str
     embedding_path: Path
     metadata_path: Optional[Path] = None
+    pn_split_path: Optional[Path] = None
     region_filter: Optional[List[str]] = None
     class_prior: Optional[float] = None
     weight: float = 1.0
@@ -31,10 +32,15 @@ class DatasetConfig:
         if self.metadata_path is not None:
             meta_path = Path(self.metadata_path)
             metadata_path = meta_path if meta_path.is_absolute() else (base / meta_path).resolve()
+        pn_split_path = None
+        if self.pn_split_path is not None:
+            pn_path_obj = Path(self.pn_split_path)
+            pn_split_path = pn_path_obj if pn_path_obj.is_absolute() else (base / pn_path_obj).resolve()
         return DatasetConfig(
             name=self.name,
             embedding_path=embedding_path,
             metadata_path=metadata_path,
+            pn_split_path=pn_split_path,
             region_filter=list(self.region_filter) if self.region_filter else None,
             class_prior=self.class_prior,
             weight=self.weight,
@@ -65,11 +71,23 @@ class LossWeights:
 
 
 @dataclass
+class InferenceConfig:
+    export_geotiff: bool = True
+    export_png: bool = True
+    export_npz: bool = True
+
+
+@dataclass
 class IntegrateConfig:
     datasets: List[DatasetConfig]
     output_dir: Path
     optimization: OptimizationConfig = field(default_factory=OptimizationConfig)
     loss_weights: LossWeights = field(default_factory=LossWeights)
+    use_previous_negatives: bool = True
+    generate_inference: bool = False
+    inference: Optional[InferenceConfig] = None
+    debug: bool = False
+    debug_log_every: int = 1
     overlap_pairs_path: Optional[Path] = None
     overlap_mask_path: Optional[Path] = None
     log_dir: Optional[Path] = None
@@ -99,6 +117,20 @@ class IntegrateConfig:
             log_dir=log_dir,
             seed=self.seed,
             device=self.device,
+            use_previous_negatives=self.use_previous_negatives,
+            generate_inference=self.generate_inference,
+            inference=self._resolve_inference(base),
+            debug=self.debug,
+            debug_log_every=self.debug_log_every,
+        )
+
+    def _resolve_inference(self, base: Path) -> Optional[InferenceConfig]:
+        if self.inference is None:
+            return None
+        return InferenceConfig(
+            export_geotiff=self.inference.export_geotiff,
+            export_png=self.inference.export_png,
+            export_npz=self.inference.export_npz,
         )
 
 
@@ -106,7 +138,12 @@ def load_config(path: Path) -> IntegrateConfig:
     data = _load_json(path)
     datasets = [DatasetConfig(**ds) for ds in data["datasets"]]
     optimization = OptimizationConfig(**data.get("optimization", {}))
-    loss_weights = LossWeights(**data.get("loss_weights", {}))
+    loss_weights_data = dict(data.get("loss_weights", {}))
+    if "pn_or_nnpu" in loss_weights_data and "nnpu" not in loss_weights_data:
+        loss_weights_data["nnpu"] = loss_weights_data.pop("pn_or_nnpu")
+    loss_weights = LossWeights(**loss_weights_data)
+    inference_block = data.get("inference")
+    inference_cfg = InferenceConfig(**inference_block) if isinstance(inference_block, dict) else None
     cfg = IntegrateConfig(
         datasets=datasets,
         output_dir=Path(data["output_dir"]),
@@ -117,5 +154,10 @@ def load_config(path: Path) -> IntegrateConfig:
         log_dir=Path(data["log_dir"]) if data.get("log_dir") else None,
         seed=data.get("seed", 17),
         device=data.get("device", "cuda"),
+        use_previous_negatives=data.get("use_previous_negatives", True),
+        generate_inference=bool(data.get("generate_inference", False)),
+        inference=inference_cfg,
+        debug=data.get("debug", False),
+        debug_log_every=data.get("debug_log_every", 1),
     )
     return cfg.resolve_paths(path.parent)

@@ -3,6 +3,7 @@
 import argparse
 import glob
 import json
+import sys
 import numpy as np
 import torch
 from pathlib import Path
@@ -12,7 +13,13 @@ from gfm4mpm.data.geo_stack import GeoStack
 from gfm4mpm.data.stac_table import StacTableStack
 from gfm4mpm.models.mae_vit import MAEViT
 from gfm4mpm.models.mlp_dropout import MLPDropout
+_THIS_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _THIS_DIR.parents[3]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 from gfm4mpm.training.train_cls import eval_classifier
+from Common.metrics_logger import DEFAULT_METRIC_ORDER, log_metrics
 
 class LabeledPatches(Dataset):
     def __init__(self, stack, coords, labels, patch=32):
@@ -84,5 +91,5 @@ if __name__ == '__main__':
     mlp = MLPDropout(in_dim=in_dim)
     mlp.load_state_dict(torch.load(args.mlp, map_location='cpu'))
 
-    f1, mcc, auprc, auroc = eval_classifier(enc, mlp, dl)
-    print(f"[SPARSE DROP {args.drop}] f1={f1:.3f} mcc={mcc:.3f} auprc={auprc:.3f} auroc={auroc:.3f}")
+    metrics = eval_classifier(enc, mlp, dl)
+    log_metrics(f"sparse drop {args.drop}", metrics, order=DEFAULT_METRIC_ORDER)

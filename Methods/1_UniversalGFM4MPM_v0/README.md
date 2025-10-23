@@ -12,9 +12,10 @@ Utilities for merging STAC outputs and integrating foundation models across mult
 ```bash
 python -m Methods.1_UniversalGFM4MPM_v0.integrate_stac \
 --collections /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/                /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/Out_Data_Binary_Geophy_Float_Down10/ \
---projectname 2_Integrate_MVT_gcs_bcgs   --output /home/qubuntu25/Desktop/Research/Data/ \
---dataset-ids NA_AU BC   --region-select "{NA; GLOBAL}"   --bridge-guess-number 1 \
---bridge "{Gravity_Bouguer, Gravity_Bouguer_HGM; NEBC_Canada_2_km___GRAV___Bouguer, NEBC_Canada_2_km___GRAV___Horizontal_Gradient}"   --visualize
+--embedding-path /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/work/f21_2_10/2_Labeling_01_10/embeddings.npz /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/Out_Data_Binary_Geophy_Float_Down10/2_Labeling_01_10/embeddings.npz \
+--projectname 2_Integrate_MVT_gcs_bcgs   --output /home/qubuntu25/Desktop/Research/Data \
+--dataset-ids NA_AU BC   --region-select "{NA; GLOBAL}" \
+--bridge-guess-number 1 --bridge "{Gravity_Bouguer, Gravity_Bouguer_HGM; NEBC_Canada_2_km___GRAV___Bouguer, NEBC_Canada_2_km___GRAV___Horizontal_Gradient}"   --visualize
 ```
 
 Running the command writes the blended metadata tree under `/tmp/output/Integrated_Project`, including:
@@ -29,37 +30,10 @@ The FM integration pipeline consumes embeddings derived from pretrained MAE-ViT 
 
 1. Prepare a JSON configuration (example `config_example.json`):
 
-```json
-{
-  "output_dir": "/home/qubuntu25/Desktop/Research/Data/2_Integrate_MVT_gcs_bcgs//experiments/fm_integration",
-  "log_dir": "/home/qubuntu25/Desktop/Research/Data/2_Integrate_MVT_gcs_bcgs//experiments/fm_integration/logs",
-  "datasets": [
-    {
-      "name": "NA_AU",
-      "embedding_path": "/home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/work/f21_2_10/2_Labeling_01_10/embeddings.npy",
-      "metadata_path":  "/home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/training_metadata.json",
-      "region_filter": ["NA"],
-      "class_prior": 0.12
-    },
-    {
-      "name": "BC",
-      "embedding_path": "/home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/Out_Data_Binary_Geophy_Float_Down10/2_Labeling_01_10/embeddings.npy",
-      "metadata_path":  "/home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/Out_Data_Binary_Geophy_Float_Down10/training_metadata.json",
-      "region_filter": ["GLOBAL"],
-      "class_prior": 0.08
-    }
-  ],
-  "overlap_pairs_path": "/home/qubuntu25/Desktop/Research/Data/2_Integrate_MVT_gcs_bcgs//data/BC_NA_AU_overlap_pairs.json",
-  "overlap_mask_path": "/home/qubuntu25/Desktop/Research/Data/2_Integrate_MVT_gcs_bcgs//data/study_area_overlap.tif",
-  "device": "cuda",
-  "optimization": {"batch_size": 256, "epochs": 50, "lr": 1e-4}
-}
-```
-
 2. Launch training:
 
 ```bash
-python Methods/1_UniversalGFM4MPM_v0/scripts/1_integrate_FMs/integrate_fms.py --config /home/qubuntu25/Desktop/Research/Data/2_Integrate_MVT_gcs_bcgs/config.json
+python Methods/1_UniversalGFM4MPM_v0/scripts/1_integrate_FMs/integrate_fms.py --config /home/qubuntu25/Desktop/Research/Data/2_Integrate_MVT_gcs_bcgs/config_fm_integration_debug.json --use-previous-negatives --debug  --inference
 ```
 
 The training loop performs:

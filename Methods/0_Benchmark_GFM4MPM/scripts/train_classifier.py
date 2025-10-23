@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
-import numpy as np
 import torch
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
@@ -32,6 +31,7 @@ from Common.debug_visualization import visualize_debug_features
 from src.gfm4mpm.models.mae_vit import MAEViT
 from src.gfm4mpm.models.mlp_dropout import MLPDropout
 from src.gfm4mpm.training.train_cls import train_classifier, eval_classifier
+from Common.metrics_logger import DEFAULT_METRIC_ORDER, log_metrics, normalize_metrics, save_metrics_json
 from src.gfm4mpm.infer.infer_maps import group_positive_coords, mc_predict_map, write_prediction_outputs
 
 class LabeledPatches(Dataset):
@@ -46,18 +46,6 @@ class LabeledPatches(Dataset):
         x = read_stack_patch(self.stack, coord, self.window)
         y = self.labels[idx]
         return torch.from_numpy(x), torch.tensor(y, dtype=torch.long)
-
-
-def _to_serializable(value: Any) -> Any:
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, dict):
-        return {key: _to_serializable(val) for key, val in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_to_serializable(v) for v in value]
-    if isinstance(value, np.generic):
-        return value.item()
-    return value
 
 
 if __name__ == '__main__':
@@ -268,43 +256,28 @@ if __name__ == '__main__':
         dl_va,
         epochs=args.epochs,
         return_history=True,
+        loss_weights={'bce': 1.0},
     )
     train_eval = eval_classifier(encoder, mlp, dl_tr)
     val_eval = eval_classifier(encoder, mlp, dl_va)
-    metrics_summary["evaluation"] = {
-        "train": {
-            "f1": float(train_eval[0]),
-            "mcc": float(train_eval[1]),
-            "auprc": float(train_eval[2]),
-            "auroc": float(train_eval[3]),
-        },
-        "val": {
-            "f1": float(val_eval[0]),
-            "mcc": float(val_eval[1]),
-            "auprc": float(val_eval[2]),
-            "auroc": float(val_eval[3]),
-        },
-    }
-    metrics_summary["epoch_metrics"] = [
-        {
-            "epoch": rec["epoch"],
-            "train": {k: float(v) for k, v in rec["train"].items()},
-            "val": {k: float(v) for k, v in rec["val"].items()},
-        }
-        for rec in epoch_history
-    ]
+    log_metrics("final train", train_eval, order=DEFAULT_METRIC_ORDER)
+    log_metrics("final val", val_eval, order=DEFAULT_METRIC_ORDER)
 
-    print("[info] Final evaluation metrics:")
-    print(
-        "       Train - "
-        f"F1={train_eval[0]:.3f} | MCC={train_eval[1]:.3f} | "
-        f"AUPRC={train_eval[2]:.3f} | AUROC={train_eval[3]:.3f}"
-    )
-    print(
-        "       Val   - "
-        f"F1={val_eval[0]:.3f} | MCC={val_eval[1]:.3f} | "
-        f"AUPRC={val_eval[2]:.3f} | AUROC={val_eval[3]:.3f}"
-    )
+    metrics_summary["evaluation"] = {
+        "train": normalize_metrics(train_eval),
+        "val": normalize_metrics(val_eval),
+    }
+    history = []
+    for rec in epoch_history:
+        entry = {"epoch": rec["epoch"],
+                 "train": normalize_metrics(rec["train"]),
+                 "val": normalize_metrics(rec["val"])}
+        if "train_weighted_loss" in rec:
+            entry["train_weighted_loss"] = float(rec["train_weighted_loss"])
+        if "val_weighted_loss" in rec:
+            entry["val_weighted_loss"] = float(rec["val_weighted_loss"])
+        history.append(entry)
+    metrics_summary["epoch_metrics"] = history
     out_dir = Path(args.out) if args.out else Path('.')
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / 'mlp_classifier.pth'
@@ -314,6 +287,13 @@ if __name__ == '__main__':
         "classifier_path": str(out_path),
         "saved_prediction_arrays": bool(args.save_prediction),
     }
+
+    metrics_json_path = Path(args.out) / "metrics.json"
+    try:
+        save_metrics_json(metrics_summary, metrics_json_path)
+        print(f"[info] Saved detailed metrics to {metrics_json_path}")
+    except Exception as exc:
+        print(f"[warn] Failed to write metrics JSON to {metrics_json_path}: {exc}")
 
     print("[info] Generating prediction maps with MC-Dropout")
     # TODO: Allow stride override?
@@ -361,13 +341,12 @@ if __name__ == '__main__':
 
     summary_path = Path(args.out) / "training_args_3_cls.json"
     summary_payload = {
-        "metrics": _to_serializable(metrics_summary),
-        "outputs": _to_serializable(outputs_summary),
+        "metrics": metrics_summary,
+        "outputs": outputs_summary,
     }
     try:
         summary_path.parent.mkdir(parents=True, exist_ok=True)
-        with summary_path.open("w", encoding="utf-8") as fh:
-            json.dump(summary_payload, fh, indent=2)
+        save_metrics_json(summary_payload, summary_path)
         print(f"[info] Saved classifier configuration to {summary_path}")
     except Exception as exc:
         print(f"[warn] Failed to write classifier summary to {summary_path}: {exc}")

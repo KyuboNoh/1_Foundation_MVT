@@ -13,20 +13,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 from itertools import combinations
 
-import json
-
 try:
-    from shapely.geometry import MultiPolygon, Polygon, box, mapping, shape as shapely_shape
+    from shapely.geometry import MultiPolygon, Polygon, Point, box, mapping, shape as shapely_shape
     from shapely.ops import transform as shapely_transform, unary_union
 except Exception:  # pragma: no cover - optional dependency guard
     shapely_shape = None  # type: ignore[assignment]
-    Polygon = MultiPolygon = None  # type: ignore[assignment]
+    Polygon = MultiPolygon = Point = None  # type: ignore[assignment]
     shapely_transform = unary_union = None  # type: ignore[assignment]
 
 try:
@@ -37,11 +36,16 @@ except Exception:  # pragma: no cover - optional dependency guard
 try:
     import rasterio
     from rasterio import features as rio_features
-    from rasterio.transform import from_origin
+    from rasterio.transform import from_origin, rowcol
 except Exception:  # pragma: no cover - optional dependency guard
     rasterio = None  # type: ignore[assignment]
     rio_features = None  # type: ignore[assignment]
     from_origin = None  # type: ignore[assignment]
+
+try:
+    from sklearn.neighbors import NearestNeighbors
+except Exception:  # pragma: no cover - optional dependency guard
+    NearestNeighbors = None  # type: ignore[assignment]
 
 # -----------------------------------------------------------------------------
 # Data containers
@@ -124,6 +128,34 @@ def _canonical_path(base: Path, value: str) -> Path:
     if not path_obj.is_absolute():
         return (base / path_obj).resolve()
     return path_obj.resolve()
+
+
+def _pixel_resolution(transform) -> Optional[float]:
+    if transform is None:
+        return None
+    try:
+        res_x = math.sqrt(transform.a * transform.a + transform.b * transform.b)
+        res_y = math.sqrt(transform.d * transform.d + transform.e * transform.e)
+    except AttributeError:
+        return None
+    res_candidates = [res for res in (res_x, res_y) if isinstance(res, (int, float)) and res > 0]
+    if not res_candidates:
+        return None
+    return float(min(res_candidates))
+
+
+def _normalise_tile_id(
+    dataset_id: str,
+    tile: Dict[str, object],
+    row: Optional[int],
+    col: Optional[int],
+    centroid_key: Tuple[float, float],
+) -> str:
+    region = str(tile.get("region") or "GLOBAL").upper()
+    if row is not None and col is not None:
+        return f"{region}_{row}_{col}"
+    centroid_int = (int(round(centroid_key[0] * 1000)), int(round(centroid_key[1] * 1000)))
+    return f"{dataset_id}_CENTROID_{centroid_int[0]}_{centroid_int[1]}"
 
 
 def _augment_record(record: Dict, base: Path) -> Dict:
@@ -583,114 +615,654 @@ def _collect_dataset_geometry(summary: DatasetSummary, dataset_crs: CRS) -> Opti
     return merged
 
 
-def _collect_dataset_tiles(summary: DatasetSummary, target_crs: Optional[CRS]) -> List[Dict[str, object]]:
+def _collect_dataset_tiles_v0(summary: DatasetSummary, target_crs: Optional[CRS]) -> List[Dict[str, object]]:
+    # _collect_dataset_tiles_v0 assumes consistent data coverage (region) per region/dataset.
     if shapely_shape is None or rasterio is None or box is None:
         return []
     tiles: List[Dict[str, object]] = []
     seen_paths: set[Path] = set()
     for region_name, region_info in summary.regions.items():
         feature_entries = region_info.get("features", {}) if isinstance(region_info, dict) else {}
-        for feature_name, entry in feature_entries.items():
-            tifs = entry.get("tifs", []) if isinstance(entry, dict) else []
-            for record in tifs:
-                if not isinstance(record, dict):
-                    continue
-                path_value = record.get("path_resolved") or record.get("path")
-                if not path_value:
-                    continue
-                tile_path = Path(str(path_value))
-                if not tile_path.is_absolute():
-                    tile_path = (summary.root / tile_path).resolve()
+        # use the first feature entry per region as representative coverage
+        representative = None
+        for feat_name, entry in feature_entries.items():
+            if isinstance(entry, dict):
+                representative = (feat_name, entry)
+                break
+        if representative is None:
+            continue
+        feature_name, entry = representative
+        tifs = entry.get("tifs", []) if isinstance(entry, dict) else []
+        for record in tifs:
+            if not isinstance(record, dict):
+                continue
+            path_value = record.get("path_resolved") or record.get("path")
+            if not path_value:
+                continue
+            tile_path = Path(str(path_value))
+            if not tile_path.is_absolute():
+                tile_path = (summary.root / tile_path).resolve()
+            else:
+                tile_path = tile_path.resolve()
+            if tile_path in seen_paths or not tile_path.exists():
+                continue
+            try:
+                with rasterio.open(tile_path) as ds:
+                    if ds.crs is None:
+                        continue
+                    bounds = ds.bounds
+                    geom = box(bounds.left, bounds.bottom, bounds.right, bounds.top)
+                    src_crs = ds.crs
+                    transform = ds.transform
+                    width = ds.width
+                    height = ds.height
+                    resolution = _pixel_resolution(transform)
+                    if target_crs is not None and Transformer is not None and shapely_transform is not None:
+                        if src_crs != target_crs:
+                            transformer = Transformer.from_crs(src_crs, target_crs, always_xy=True)
+                            geom = shapely_transform(transformer.transform, geom)
+                    elif target_crs is not None:
+                        continue
+            except Exception:
+                continue
+            tiles.append(
+                {
+                    "tile_id": record.get("tile_id") or tile_path.stem,
+                    "path": str(tile_path),
+                    "region": region_name,
+                    "feature": feature_name,
+                    "geom": geom,
+                    "crs": src_crs,
+                    "transform": transform,
+                    "width": width,
+                    "height": height,
+                    "pixel_resolution": resolution,
+                }
+            )
+            seen_paths.add(tile_path)
+    return tiles
+
+
+def _load_embedding_windows(bundle_path: Path) -> List[Dict[str, object]]:
+    records: List[Dict[str, object]] = []
+    if not bundle_path.exists():
+        print(f"[warn] Embedding bundle not found at {bundle_path}; skipping.")
+        return records
+    try:
+        with np.load(bundle_path, allow_pickle=True) as data:
+            tile_ids = data.get("tile_ids")
+            coords = data.get("coords")
+            metadata = data.get("metadata")
+            if tile_ids is None or coords is None:
+                print(f"[warn] Embedding bundle {bundle_path} lacks tile_ids/coords; skipping.")
+                return records
+            tile_ids = np.asarray(tile_ids).astype(str)
+            coords_arr = np.asarray(coords, dtype=np.float64)
+            if coords_arr.ndim != 2 or coords_arr.shape[1] < 2:
+                print(f"[warn] Embedding bundle {bundle_path} provides malformed coords array; skipping.")
+                return records
+            meta_entries: Optional[np.ndarray]
+            if metadata is not None:
+                meta_entries = np.asarray(metadata, dtype=object)
+            else:
+                meta_entries = None
+            count = tile_ids.shape[0]
+            for idx in range(count):
+                tile_id = str(tile_ids[idx])
+                coord = coords_arr[idx]
+                if coord.size < 2 or not np.all(np.isfinite(coord[:2])):
+                    coord_tuple: Optional[Tuple[float, float]] = None
                 else:
-                    tile_path = tile_path.resolve()
-                if tile_path in seen_paths or not tile_path.exists():
-                    continue
+                    coord_tuple = (float(coord[0]), float(coord[1]))
+                meta_raw = None
+                if meta_entries is not None:
+                    meta_raw = meta_entries[idx]
+                    if isinstance(meta_raw, np.ndarray) and meta_raw.dtype == object and meta_raw.ndim == 0:
+                        meta_raw = meta_raw.item()
+                    elif hasattr(meta_raw, "item") and not isinstance(meta_raw, dict):
+                        try:
+                            meta_raw = meta_raw.item()
+                        except Exception:
+                            pass
+                meta_dict = meta_raw if isinstance(meta_raw, dict) else {}
+                region = str(meta_dict.get("region") or meta_dict.get("Region") or "GLOBAL")
+                row_val = meta_dict.get("row")
+                col_val = meta_dict.get("col")
                 try:
-                    with rasterio.open(tile_path) as ds:
-                        if ds.crs is None:
-                            continue
-                        bounds = ds.bounds
-                        geom = box(bounds.left, bounds.bottom, bounds.right, bounds.top)
-                        src_crs = ds.crs
-                        if target_crs is not None and Transformer is not None and shapely_transform is not None:
-                            if src_crs != target_crs:
-                                transformer = Transformer.from_crs(src_crs, target_crs, always_xy=True)
-                                geom = shapely_transform(transformer.transform, geom)
-                        elif target_crs is not None:
-                            continue
+                    row_int = int(row_val) if row_val is not None else None
                 except Exception:
-                    continue
-                tiles.append(
+                    row_int = None
+                try:
+                    col_int = int(col_val) if col_val is not None else None
+                except Exception:
+                    col_int = None
+                if row_int is None or col_int is None:
+                    parts = tile_id.split("_")
+                    if len(parts) >= 3:
+                        try:
+                            col_candidate = int(parts[-1])
+                            row_candidate = int(parts[-2])
+                            region_candidate = "_".join(parts[:-2]) or region
+                            row_int = row_int if row_int is not None else row_candidate
+                            col_int = col_int if col_int is not None else col_candidate
+                            region = region_candidate or region
+                        except Exception:
+                            pass
+                pixel_resolution = meta_dict.get("pixel_resolution") or meta_dict.get("resolution")
+                try:
+                    pixel_resolution_float = float(pixel_resolution) if pixel_resolution is not None else None
+                except Exception:
+                    pixel_resolution_float = None
+                records.append(
                     {
-                        "tile_id": record.get("tile_id") or tile_path.stem,
-                        "path": str(tile_path),
-                        "region": region_name,
-                        "feature": feature_name,
-                        "geom": geom,
+                        "tile_id": tile_id,
+                        "coord": coord_tuple,
+                        "region": region,
+                        "row": row_int,
+                        "col": col_int,
+                        "path": meta_dict.get("path") or meta_dict.get("source_path"),
+                        "pixel_resolution": pixel_resolution_float,
+                        "metadata": meta_dict,
                     }
                 )
-                seen_paths.add(tile_path)
-    return tiles
+    except Exception as exc:
+        print(f"[warn] Failed to load embedding bundle {bundle_path}: {exc}")
+    return records
+
+
+def _compute_embedding_spacing_map(windows_map: Dict[str, List[Dict[str, object]]]) -> Dict[str, float]:
+    spacing: Dict[str, float] = {}
+    if NearestNeighbors is None:
+        return spacing
+    for dataset_id, records in windows_map.items():
+        coords = np.asarray(
+            [rec["coord"] for rec in records if rec.get("coord") is not None],
+            dtype=np.float64,
+        )
+        if coords.shape[0] < 2 or coords.shape[1] < 2:
+            continue
+        try:
+            n_neighbors = min(coords.shape[0], 8)
+            model = NearestNeighbors(n_neighbors=n_neighbors, algorithm="ball_tree")
+            model.fit(coords)
+            distances, _ = model.kneighbors(coords)
+            if distances.shape[1] < 2:
+                continue
+            nn_dist = distances[:, 1]
+            nn_dist = nn_dist[np.isfinite(nn_dist) & (nn_dist > 0)]
+            if nn_dist.size == 0:
+                continue
+            spacing[dataset_id] = float(np.median(nn_dist))
+        except Exception:
+            continue
+    return spacing
+
+
+def _determine_alignment_roles(
+    ds_a: str,
+    ds_b: str,
+    spacing_map: Optional[Dict[str, Optional[float]]],
+    dataset_resolutions: Optional[Dict[str, float]] = None,
+) -> Tuple[str, str]:
+    spacing_map = spacing_map or {}
+    spacing_a = spacing_map.get(ds_a)
+    spacing_b = spacing_map.get(ds_b)
+    if spacing_a is None and dataset_resolutions is not None:
+        spacing_a = dataset_resolutions.get(ds_a)
+    if spacing_b is None and dataset_resolutions is not None:
+        spacing_b = dataset_resolutions.get(ds_b)
+    if spacing_a is not None and spacing_b is not None and spacing_a != spacing_b:
+        return (ds_a, ds_b) if spacing_a <= spacing_b else (ds_b, ds_a)
+    return (ds_a, ds_b) if ds_a.lower() <= ds_b.lower() else (ds_b, ds_a)
+
+
+def _build_embedding_pair_record(
+    ds_a: str,
+    ds_b: str,
+    fine_ds: str,
+    coarse_ds: str,
+    fine_rec: Dict[str, object],
+    coarse_rec: Dict[str, object],
+    centroid_list: List[float],
+) -> Dict[str, object]:
+    rec_map = {
+        fine_ds: fine_rec,
+        coarse_ds: coarse_rec,
+    }
+
+    rec_a = rec_map.get(ds_a)
+    rec_b = rec_map.get(ds_b)
+
+    def _row_col(rec: Optional[Dict[str, object]]) -> Optional[List[int]]:
+        if rec is None:
+            return None
+        row = rec.get("row")
+        col = rec.get("col")
+        try:
+            row_int = int(row) if row is not None else None
+            col_int = int(col) if col is not None else None
+        except Exception:
+            row_int = col_int = None
+        if row_int is None or col_int is None:
+            return None
+        return [row_int, col_int]
+
+    def _native_point(rec: Optional[Dict[str, object]]) -> Optional[List[float]]:
+        if rec is None:
+            return None
+        coord = rec.get("coord")
+        if coord is None:
+            return None
+        try:
+            return [float(coord[0]), float(coord[1])]
+        except Exception:
+            return None
+
+    def _lookup(rec: Optional[Dict[str, object]]) -> Optional[str]:
+        if rec is None:
+            return None
+        val = rec.get("tile_id")
+        return str(val) if val is not None else None
+
+    return {
+        "dataset_0_row_col": _row_col(rec_a),
+        "dataset_0_native_point": _native_point(rec_a),
+        "dataset_0_lookup": _lookup(rec_a),
+        "dataset_1_row_col": _row_col(rec_b),
+        "dataset_1_native_point": _native_point(rec_b),
+        "dataset_1_lookup": _lookup(rec_b),
+        "overlap_centerloid": centroid_list,
+    }
+
+
+def _generate_embedding_overlap_pairs(
+    ds_a: str,
+    ds_b: str,
+    embedding_windows: Dict[str, List[Dict[str, object]]],
+    spacing_map: Dict[str, Optional[float]],
+    dataset_resolutions: Dict[str, float],
+) -> Optional[Tuple[List[Dict[str, object]], Dict[str, object]]]:
+    if NearestNeighbors is None:
+        return None
+    if ds_a not in embedding_windows or ds_b not in embedding_windows:
+        return None
+
+    fine_ds, coarse_ds = _determine_alignment_roles(ds_a, ds_b, spacing_map, dataset_resolutions)
+    fine_records = [rec for rec in embedding_windows.get(fine_ds, []) if rec.get("coord") is not None]
+    coarse_records = [rec for rec in embedding_windows.get(coarse_ds, []) if rec.get("coord") is not None]
+    if not fine_records or not coarse_records:
+        return None
+
+    coords_fine = np.asarray([rec["coord"] for rec in fine_records], dtype=np.float64)
+    coords_coarse = np.asarray([rec["coord"] for rec in coarse_records], dtype=np.float64)
+    if coords_fine.shape[0] == 0 or coords_coarse.shape[0] == 0:
+        return None
+
+    spacing_fine = spacing_map.get(fine_ds)
+    spacing_coarse = spacing_map.get(coarse_ds)
+    radius_candidates = [val for val in (spacing_coarse, spacing_fine) if val is not None and np.isfinite(val) and val > 0]
+    if not radius_candidates:
+        for dataset_id in (fine_ds, coarse_ds):
+            val = dataset_resolutions.get(dataset_id)
+            if val is not None and np.isfinite(val) and val > 0:
+                radius_candidates.append(val)
+    base_radius = float(np.median(radius_candidates)) if radius_candidates else 1.0
+    search_radius = float(max(base_radius * 0.75, 1.0))
+
+    try:
+        radius_model = NearestNeighbors(radius=search_radius, algorithm="ball_tree")
+        radius_model.fit(coords_coarse)
+        neighbors_radius = radius_model.radius_neighbors(coords_fine, return_distance=False)
+        nearest_model = NearestNeighbors(n_neighbors=1, algorithm="ball_tree")
+        nearest_model.fit(coords_coarse)
+        nearest_dist, nearest_idx = nearest_model.kneighbors(coords_fine, return_distance=True)
+    except Exception as exc:
+        print(f"[warn] Failed to compute embedding-based overlaps for {ds_a}-{ds_b}: {exc}")
+        return None
+
+    aggregated: Dict[Tuple[str, str], Dict[str, object]] = {}
+    raw_candidates = 0
+    for fine_idx, coarse_candidates in enumerate(neighbors_radius):
+        candidate_indices = np.array(coarse_candidates, dtype=int)
+        if candidate_indices.size == 0:
+            candidate_indices = nearest_idx[fine_idx]
+        candidate_indices = np.unique(candidate_indices)
+        for coarse_idx in candidate_indices:
+            raw_candidates += 1
+            distance_val = None
+            if isinstance(nearest_dist, np.ndarray) and nearest_dist.size > fine_idx:
+                distance_val = float(nearest_dist[fine_idx][0])
+            else:
+                distance_val = float(np.linalg.norm(coords_fine[fine_idx] - coords_coarse[coarse_idx]))
+            fine_rec = fine_records[fine_idx]
+            coarse_rec = coarse_records[int(coarse_idx)]
+            key = (str(fine_rec.get("tile_id")), str(coarse_rec.get("tile_id")))
+            if key in aggregated:
+                continue
+            centroid_coords = fine_rec.get("coord") or coarse_rec.get("coord")
+            if centroid_coords is not None:
+                try:
+                    centroid_list = [float(centroid_coords[0]), float(centroid_coords[1])]
+                except Exception:
+                    centroid_list = [float("nan"), float("nan")]
+            else:
+                centroid_list = [float("nan"), float("nan")]
+            aggregated[key] = _build_embedding_pair_record(
+                ds_a,
+                ds_b,
+                fine_ds,
+                coarse_ds,
+                fine_rec,
+                coarse_rec,
+                centroid_list,
+            )
+
+    records = list(aggregated.values())
+    if not records:
+        return None
+
+    doc_meta: Dict[str, object] = {
+        "alignment_roles": {
+            "fine": fine_ds,
+            "coarse": coarse_ds,
+            ds_a: "fine" if ds_a == fine_ds else "coarse",
+            ds_b: "fine" if ds_b == fine_ds else "coarse",
+        },
+        "approx_spacing": {
+            ds_a: spacing_map.get(ds_a),
+            ds_b: spacing_map.get(ds_b),
+        },
+        "search_radius": search_radius,
+        "raw_pair_candidates": raw_candidates,
+        "generated_from": "embedding_windows",
+        "dataset_pair": [ds_a, ds_b],
+    }
+    return records, doc_meta
+
+
+def _generate_raster_overlap_pairs(
+    ds_a: str,
+    ds_b: str,
+    tile_geoms: Dict[str, List[Dict[str, object]]],
+    overlap_geom: Optional[Polygon],
+    target_crs: Optional[CRS],
+    dataset_resolutions: Dict[str, float],
+) -> Optional[Tuple[List[Dict[str, object]], Dict[str, object]]]:
+    tiles_a = tile_geoms.get(ds_a, [])
+    tiles_b = tile_geoms.get(ds_b, [])
+    if not tiles_a or not tiles_b or shapely_shape is None:
+        return None
+
+    raw_pairs = 0
+    aggregated: Dict[Tuple[str, str], Dict[str, object]] = {}
+
+    def _native_representative_point(tile: Dict[str, object], geom_equal: Polygon) -> Optional[Point]:
+        if geom_equal.is_empty or shapely_transform is None or Transformer is None:
+            return None
+        crs_src = tile.get("crs")
+        if crs_src is None or target_crs is None or crs_src == target_crs:
+            try:
+                return geom_equal.representative_point()
+            except Exception:
+                return None
+        try:
+            transformer = Transformer.from_crs(target_crs, crs_src, always_xy=True)
+        except Exception:
+            return None
+        try:
+            native_geom = shapely_transform(transformer.transform, geom_equal)
+        except Exception:
+            return None
+        if native_geom.is_empty:
+            return None
+        try:
+            return native_geom.representative_point()
+        except Exception:
+            return None
+
+    def _locate_pixel(
+        tile: Dict[str, object],
+        native_point: Optional[Point],
+        fallback_centroid: Tuple[float, float],
+    ) -> Tuple[Optional[int], Optional[int], Optional[Tuple[float, float]]]:
+        if rowcol is None:
+            return None, None, None
+        transform = tile.get("transform")
+        crs_src = tile.get("crs")
+        width = tile.get("width")
+        height = tile.get("height")
+        if transform is None or crs_src is None or width is None or height is None:
+            return None, None, None
+        if native_point is not None and not native_point.is_empty:
+            x_native = float(native_point.x)
+            y_native = float(native_point.y)
+        else:
+            x_native, y_native = fallback_centroid
+            if target_crs is not None and Transformer is not None and crs_src != target_crs:
+                try:
+                    transformer = Transformer.from_crs(target_crs, crs_src, always_xy=True)
+                    x_native, y_native = transformer.transform(*fallback_centroid)
+                except Exception:
+                    return None, None, None
+        try:
+            inv_transform = ~transform
+            col_float, row_float = inv_transform * (x_native, y_native)
+        except Exception:
+            try:
+                col_float, row_float = rowcol(transform, x_native, y_native, op=float)
+            except Exception:
+                return None, None, (x_native, y_native)
+        if any(math.isnan(val) for val in (row_float, col_float)):
+            return None, None, (x_native, y_native)
+        width_int = int(width)
+        height_int = int(height)
+        row = int(round(row_float))
+        col = int(round(col_float))
+        if not (0 <= row < height_int and 0 <= col < width_int):
+            pixel_tol = tile.get("pixel_resolution") or 0.0
+            tol_rows = max(0.5, float(pixel_tol) / max(abs(transform.e), 1e-6))
+            tol_cols = max(0.5, float(pixel_tol) / max(abs(transform.a), 1e-6))
+            if (-tol_rows <= row_float <= height_int - 1 + tol_rows) and (
+                -tol_cols <= col_float <= width_int - 1 + tol_cols
+            ):
+                row = min(max(int(round(row_float)), 0), height_int - 1)
+                col = min(max(int(round(col_float)), 0), width_int - 1)
+            else:
+                return None, None, (x_native, y_native)
+        return row, col, (x_native, y_native)
+
+    for tile_a in tiles_a:
+        geom_a = tile_a.get("geom")
+        if geom_a is None:
+            continue
+        area_a = float(geom_a.area) if geom_a.area else None
+        for tile_b in tiles_b:
+            geom_b = tile_b.get("geom")
+            if geom_b is None:
+                continue
+            inter = geom_a.intersection(geom_b)
+            if overlap_geom is not None:
+                inter = inter.intersection(overlap_geom)
+            if inter.is_empty:
+                continue
+            area = float(inter.area)
+            if area <= 0:
+                continue
+            raw_pairs += 1
+            centroid = inter.centroid
+            centroid_x = float(centroid.x)
+            centroid_y = float(centroid.y)
+            rep_a = _native_representative_point(tile_a, inter)
+            rep_b = _native_representative_point(tile_b, inter)
+            row_a, col_a, native_a = _locate_pixel(tile_a, rep_a, (centroid_x, centroid_y))
+            row_b, col_b, native_b = _locate_pixel(tile_b, rep_b, (centroid_x, centroid_y))
+
+            def _tile_identifier(tile: Dict[str, object], row: Optional[int], col: Optional[int]) -> Optional[str]:
+                if row is not None and col is not None:
+                    region = str(tile.get("region") or "GLOBAL").upper()
+                    return f"{region}_{row}_{col}"
+                value = tile.get("tile_id")
+                return str(value) if value is not None else None
+
+            tile_id_a = _tile_identifier(tile_a, row_a, col_a)
+            tile_id_b = _tile_identifier(tile_b, row_b, col_b)
+            key = (str(tile_id_a), str(tile_id_b))
+            if key in aggregated:
+                continue
+
+            def _row_col(row_val: Optional[int], col_val: Optional[int]) -> Optional[List[int]]:
+                if row_val is None or col_val is None:
+                    return None
+                return [int(row_val), int(col_val)]
+
+            def _native_list(point: Optional[Tuple[float, float]]) -> Optional[List[float]]:
+                if point is None:
+                    return None
+                try:
+                    return [float(point[0]), float(point[1])]
+                except Exception:
+                    return None
+
+            aggregated[key] = {
+                "dataset_0_row_col": _row_col(row_a, col_a),
+                "dataset_0_native_point": _native_list(native_a),
+                "dataset_0_lookup": tile_id_a,
+                "dataset_1_row_col": _row_col(row_b, col_b),
+                "dataset_1_native_point": _native_list(native_b),
+                "dataset_1_lookup": tile_id_b,
+                "overlap_centerloid": [centroid_x, centroid_y],
+            }
+
+    if not aggregated:
+        return None
+
+    records = list(aggregated.values())
+    doc_meta = {
+        "alignment_roles": {
+            "fine": ds_a,
+            "coarse": ds_b,
+            ds_a: "fine",
+            ds_b: "coarse",
+        },
+        "approx_spacing": {
+            ds_a: dataset_resolutions.get(ds_a),
+            ds_b: dataset_resolutions.get(ds_b),
+        },
+        "search_radius": None,
+        "raw_pair_candidates": raw_pairs,
+        "generated_from": "tile_bounds",
+        "dataset_pair": [ds_a, ds_b],
+    }
+    return records, doc_meta
+
+def _compute_dataset_resolutions(tile_geoms: Dict[str, List[Dict[str, object]]]) -> Dict[str, float]:
+    resolutions: Dict[str, float] = {}
+    for dataset_id, tiles in tile_geoms.items():
+        candidates: List[float] = []
+        for tile in tiles:
+            value = tile.get("pixel_resolution")
+            if isinstance(value, (int, float)) and value > 0:
+                candidates.append(float(value))
+        if candidates:
+            resolutions[dataset_id] = min(candidates)
+    return resolutions
 
 
 def _write_overlap_pairs(
     tile_geoms: Dict[str, List[Dict[str, object]]],
     overlap_geom: Optional[Polygon],
     target_dir: Path,
+    target_crs: Optional[CRS],
+    dataset_resolutions: Optional[Dict[str, float]] = None,
+    embedding_windows: Optional[Dict[str, List[Dict[str, object]]]] = None,
+    embedding_spacing: Optional[Dict[str, Optional[float]]] = None,
 ) -> Dict[str, str]:
-    if shapely_shape is None or not tile_geoms:
-        return {}
+    if dataset_resolutions is None:
+        dataset_resolutions = _compute_dataset_resolutions(tile_geoms)
     data_dir = target_dir / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
+
+    embedding_windows = embedding_windows or {}
+    embedding_spacing = embedding_spacing or {}
+
     pair_outputs: Dict[str, str] = {}
-    for ds_a, ds_b in combinations(sorted(tile_geoms.keys()), 2):
-        records: List[Dict[str, object]] = []
-        for tile_a in tile_geoms[ds_a]:
-            geom_a = tile_a.get("geom")
-            if geom_a is None:
-                continue
-            for tile_b in tile_geoms[ds_b]:
-                geom_b = tile_b.get("geom")
-                if geom_b is None:
-                    continue
-                inter = geom_a.intersection(geom_b)
-                if overlap_geom is not None:
-                    inter = inter.intersection(overlap_geom)
-                if inter.is_empty:
-                    continue
-                area = float(inter.area)
-                if area <= 0:
-                    continue
-                centroid = inter.centroid
-                area_a = float(geom_a.area) if geom_a.area else None
-                area_b = float(geom_b.area) if geom_b.area else None
-                records.append(
-                    {
-                        "dataset_a": ds_a,
-                        "dataset_a_tile": tile_a.get("tile_id"),
-                        "dataset_a_feature": tile_a.get("feature"),
-                        "dataset_a_region": tile_a.get("region"),
-                        "dataset_a_path": tile_a.get("path"),
-                        "dataset_b": ds_b,
-                        "dataset_b_tile": tile_b.get("tile_id"),
-                        "dataset_b_feature": tile_b.get("feature"),
-                        "dataset_b_region": tile_b.get("region"),
-                        "dataset_b_path": tile_b.get("path"),
-                        "overlap_area": area,
-                        "overlap_fraction_a": (area / area_a) if area_a else None,
-                        "overlap_fraction_b": (area / area_b) if area_b else None,
-                        "overlap_centroid": [float(centroid.x), float(centroid.y)],
+
+    all_dataset_ids = sorted(set(tile_geoms.keys()) | set(embedding_windows.keys()))
+
+    for ds_a, ds_b in combinations(all_dataset_ids, 2):
+        use_embedding = (
+            ds_a in embedding_windows
+            and ds_b in embedding_windows
+            and NearestNeighbors is not None
+        )
+
+        result: Optional[Tuple[List[Dict[str, object]], Dict[str, object]]]
+        if use_embedding:
+            result = _generate_embedding_overlap_pairs(
+                ds_a,
+                ds_b,
+                embedding_windows,
+                embedding_spacing,
+                dataset_resolutions,
+            )
+        else:
+            result = _generate_raster_overlap_pairs(
+                ds_a,
+                ds_b,
+                tile_geoms,
+                overlap_geom,
+                target_crs,
+                dataset_resolutions,
+            )
+
+        if not result:
+            continue
+
+        records, meta = result
+        if not records:
+            continue
+
+        raw_candidates = int(meta.get("raw_pair_candidates") or len(records))
+        alignment_roles = meta.get("alignment_roles") if isinstance(meta.get("alignment_roles"), dict) else None
+        approx_spacing = meta.get("approx_spacing") if isinstance(meta.get("approx_spacing"), dict) else None
+        search_radius = meta.get("search_radius") if isinstance(meta.get("search_radius"), (int, float)) else None
+        generated_from = meta.get("generated_from") if isinstance(meta.get("generated_from"), str) else None
+
+        pair_name = f"{ds_a}_{ds_b}_overlap_pairs.json"
+        output_path = data_dir / pair_name
+        try:
+            with output_path.open("w", encoding="utf-8") as fh:
+                overlap_info = None
+                if overlap_geom is not None and mapping is not None and not overlap_geom.is_empty:
+                    try:
+                        geom_mapping = mapping(overlap_geom)
+                    except Exception:
+                        geom_mapping = None
+                    overlap_info = {
+                        "crs": target_crs.to_string() if target_crs is not None else None,
+                        "area": float(overlap_geom.area),
+                        "bounds": list(overlap_geom.bounds),
+                        "geometry": geom_mapping,
                     }
-                )
-        if records:
-            pair_name = f"{ds_a}_{ds_b}_overlap_pairs.json"
-            output_path = data_dir / pair_name
-            try:
-                with output_path.open("w", encoding="utf-8") as fh:
-                    json.dump(records, fh, indent=2)
+                doc = {
+                    "dataset_pair": meta.get("dataset_pair", [ds_a, ds_b]),
+                    "alignment_roles": alignment_roles,
+                    "dataset_resolutions": {
+                        ds_a: float(dataset_resolutions.get(ds_a)) if ds_a in dataset_resolutions else None,
+                        ds_b: float(dataset_resolutions.get(ds_b)) if ds_b in dataset_resolutions else None,
+                    },
+                    "approx_spacing": approx_spacing,
+                    "search_radius": search_radius,
+                    "raw_pair_candidates": raw_candidates,
+                    "generated_from": generated_from or ("embedding_windows" if use_embedding else "tile_bounds"),
+                    "overlap": overlap_info,
+                    "pairs": records,
+                }
+                json.dump(doc, fh, indent=2)
                 pair_outputs[f"{ds_a}-{ds_b}"] = str(output_path)
-            except Exception as exc:
-                print(f"[warn] Failed to write overlap pairs for {ds_a}-{ds_b}: {exc}")
+        except Exception as exc:
+            print(f"[warn] Failed to write overlap pairs for {ds_a}-{ds_b}: {exc}")
+
     return pair_outputs
 
 
@@ -716,6 +1288,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-ids", nargs="*",
         default=None,
         help="Optional friendly IDs corresponding to --collections (must match in length).",
+    )
+    parser.add_argument(
+        "--embedding-path",
+        nargs="+",
+        required=True,
+        help=".npz embedding bundles aligned with --collections order for window-level overlap detection.",
     )
     parser.add_argument(
         "--projectname",
@@ -767,12 +1345,28 @@ def main() -> None:
         dataset_ids = list(args.dataset_ids)
     else:
         dataset_ids = [None] * len(root_paths)
+    if len(args.embedding_path) != len(root_paths):
+        raise ValueError("--embedding-path must match the number of --collections")
+    embedding_bundle_paths: List[Path] = [
+        Path(p).expanduser().resolve() for p in args.embedding_path
+    ]
+
     datasets: List[DatasetSummary] = []
     dataset_crs_map: Dict[str, Optional[CRS]] = {}
-    for root, ds_id in zip(root_paths, dataset_ids):
+    embedding_windows_map: Dict[str, List[Dict[str, object]]] = {}
+    embedding_path_map: Dict[str, Path] = {}
+
+    for idx, (root, ds_id) in enumerate(zip(root_paths, dataset_ids)):
         summary = _summarise_dataset(root, ds_id)
         datasets.append(summary)
         dataset_crs_map[summary.dataset_id] = None
+        bundle_path = embedding_bundle_paths[idx]
+        windows = _load_embedding_windows(bundle_path)
+        if windows:
+            embedding_windows_map[summary.dataset_id] = windows
+        else:
+            print(f"[warn] Embedding bundle {bundle_path} produced no window entries for dataset {summary.dataset_id}")
+        embedding_path_map[summary.dataset_id] = bundle_path
 
     ordered_dataset_ids = [ds.dataset_id for ds in datasets]
 
@@ -905,9 +1499,12 @@ def main() -> None:
     tile_geoms_index: Dict[str, List[Dict[str, object]]] = {}
     if shapely_shape is not None and rasterio is not None:
         for ds in datasets:
-            tiles = _collect_dataset_tiles(ds, target_crs)
+            tiles = _collect_dataset_tiles_v0(ds, target_crs)
             if tiles:
                 tile_geoms_index[ds.dataset_id] = tiles
+
+    dataset_resolution_map = _compute_dataset_resolutions(tile_geoms_index) if tile_geoms_index else {}
+    embedding_spacing_map = _compute_embedding_spacing_map(embedding_windows_map) if embedding_windows_map else {}
 
     label_union = sorted({label for ds in datasets for label in ds.label_names})
     region_union = sorted({region for ds in datasets for region in ds.region_keys})
@@ -915,6 +1512,12 @@ def main() -> None:
     payload = {
         "dataset_count": len(datasets),
         "region_union": region_union,
+        "dataset_min_resolution": {key: float(value) for key, value in dataset_resolution_map.items()},
+        "dataset_window_spacing": {
+            key: float(value)
+            for key, value in embedding_spacing_map.items()
+            if value is not None
+        },
         "bridge_guess_number": int(args.bridge_guess_number or len(bridge_mappings)),
         "bridge_guesses": bridge_mappings,
         "datasets": [
@@ -922,6 +1525,7 @@ def main() -> None:
                 "dataset_id": ds.dataset_id,
                 "collection_id": ds.collection_id,
                 "root": str(ds.root),
+                "embedding_path": str(embedding_path_map.get(ds.dataset_id)) if ds.dataset_id in embedding_path_map else None,
                 "feature_names": ds.feature_names,
                 "label_names": ds.label_names,
                 "is_multi_region": ds.is_multi_region,
@@ -1029,6 +1633,7 @@ def main() -> None:
             }
             overlap_boundary_path.write_text(json.dumps(geojson_doc, indent=2), encoding="utf-8")
             payload["study_area_overlap_boundary"] = str(overlap_boundary_path)
+            print(f"[info] Wrote study area overlap boundary to {overlap_boundary_path}")
         except Exception as exc:
             print(f"[warn] Failed to write overlap boundary GeoJSON: {exc}")
             payload["study_area_overlap_boundary"] = None
@@ -1038,7 +1643,13 @@ def main() -> None:
             try:
                 minx, miny, maxx, maxy = overlap_geom_equal.bounds
                 if maxx > minx and maxy > miny:
-                    resolution = 500.0
+                    resolution_candidates = [
+                        float(val)
+                        for val in dataset_resolution_map.values()
+                        if isinstance(val, (int, float)) and val > 0
+                    ]
+                    resolution = min(resolution_candidates) if resolution_candidates else 500.0
+                    resolution = max(resolution, 1.0)
                     width = max(1, int(np.ceil((maxx - minx) / resolution)))
                     height = max(1, int(np.ceil((maxy - miny) / resolution)))
                     transform = from_origin(minx, maxy, resolution, resolution)
@@ -1064,6 +1675,7 @@ def main() -> None:
                     ) as dst:
                         dst.write(mask_array, 1)
                     payload["study_area_overlap_mask"] = str(overlap_mask_path)
+                    print(f"[info] Wrote study area overlap raster to {overlap_mask_path}")
             except Exception as exc:
                 print(f"[warn] Failed to write overlap boundary GeoTIFF: {exc}")
                 if overlap_mask_path.exists():
@@ -1081,18 +1693,30 @@ def main() -> None:
 
     pair_output_root = visual_base if visual_base is not None else Path.cwd()
     overlap_pairs_outputs: Dict[str, str] = {}
-    if tile_geoms_index:
-        overlap_pairs_outputs = _write_overlap_pairs(tile_geoms_index, overlap_geom_equal, pair_output_root)
+    if tile_geoms_index or embedding_windows_map:
+        overlap_pairs_outputs = _write_overlap_pairs(
+            tile_geoms_index,
+            overlap_geom_equal,
+            pair_output_root,
+            target_crs,
+            dataset_resolution_map,
+            embedding_windows_map,
+            embedding_spacing_map,
+        )
+        if overlap_pairs_outputs:
+            for pair_label, pair_path in sorted(overlap_pairs_outputs.items()):
+                print(f"[info] Wrote overlap pair summary for {pair_label} to {pair_path}")
     payload["study_area_overlap_pairs"] = overlap_pairs_outputs
 
     if args.visualize:
         if visual_base is None:
             visual_base = Path.cwd() / "integrate_stac_output"
         generate_bridge_visualizations = _load_bridge_visualizer()
+        bridge_output_dir = visual_base / "bridge_visualizations"
         generate_bridge_visualizations(
             bridge_mappings,
             dataset_lookup,
-            visual_base / "bridge_visualizations",
+            bridge_output_dir,
             label_geojson_map,
             overlap_geoms_dataset if overlap_geoms_dataset else None,
             dataset_crs_map,
@@ -1100,6 +1724,7 @@ def main() -> None:
             overlap_geom_equal,
             overlap_mask_path,
         )
+        print(f"[info] Wrote bridge visualizations to {bridge_output_dir}")
 
     if output_file is not None:
         output_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")

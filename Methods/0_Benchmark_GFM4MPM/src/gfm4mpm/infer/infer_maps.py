@@ -434,9 +434,9 @@ def write_prediction_outputs(
             summary_png,
             masked_mean,
             cmap=blue_yellow,
+            vmin=0.0,
             valid_mask=valid_mask,
             boundary_mask=boundary_mask,
-            std_array=masked_std,
             pos_coords=region_positions,
         )
         std_png = std_path.with_suffix('.png')
@@ -475,6 +475,29 @@ def save_geotiff(path, array, ref_src, valid_mask: np.ndarray = None, nodata: fl
     with rasterio.open(path, 'w', **profile) as dst:
         dst.write(arr, 1)
 
+def analyze_array_stats(name, arr):
+    arr = np.asarray(arr)
+    finite_mask = np.isfinite(arr)
+    total = arr.size
+    n_nan = np.count_nonzero(~finite_mask)
+    n_zero = np.count_nonzero(arr == 0)
+    finite_vals = arr[finite_mask]
+    if finite_vals.size > 0:
+        val_min, val_max, val_mean = (
+            np.nanmin(finite_vals),
+            np.nanmax(finite_vals),
+            np.nanmean(finite_vals),
+        )
+    else:
+        val_min = val_max = val_mean = np.nan
+    print(f"--- {name} ---")
+    print(f"Shape: {arr.shape}")
+    print(f"Total elements: {total}")
+    print(f"NaN count: {n_nan} ({100*n_nan/total:.2f}%)")
+    print(f"Zero count: {n_zero} ({100*n_zero/total:.2f}%)")
+    print(f"Finite range: [{val_min:.5f}, {val_max:.5f}], mean={val_mean:.5f}")
+    print()
+
 def save_png(
     path,
     array,
@@ -483,7 +506,6 @@ def save_png(
     vmax: float = None,
     valid_mask: np.ndarray = None,
     boundary_mask: np.ndarray = None,
-    std_array: np.ndarray = None,
     pos_coords: Sequence[Tuple[int, int]] = None,
 ):
     import matplotlib
@@ -492,18 +514,49 @@ def save_png(
     from matplotlib import pyplot as plt
     from matplotlib.colors import Colormap
     import numpy as np
+    from skimage.restoration import inpaint_biharmonic
+    from scipy.ndimage import gaussian_filter
 
+    # -------------------------------------------------------------------------
+    # Helper: interpolate NaNs only inside the boundary
+    # -------------------------------------------------------------------------
+    def fill_nans_inside_boundary(arr, boundary_mask):
+        arr = np.asarray(arr, dtype=np.float32)
+        mask_inside = boundary_mask.astype(bool)
+        missing_inside = np.isnan(arr) & mask_inside
+
+        # Replace NaNs with zeros before inpainting
+        filled = np.nan_to_num(arr, nan=0.0)
+
+        # Apply inpainting only inside boundary
+        filled_interp = inpaint_biharmonic(filled, missing_inside, channel_axis=None)
+
+        # Keep outside boundary NaN
+        filled_interp[~mask_inside] = np.nan
+
+        # Optional light smoothing for continuity
+        filled_interp = gaussian_filter(filled_interp, sigma=0.8)
+
+        return filled_interp
+
+    # -------------------------------------------------------------------------
+    # Prepare data
+    # -------------------------------------------------------------------------
     data = np.asarray(array, dtype=np.float32)
     display = data.copy()
 
-    # Apply valid mask (set invalid pixels to NaN)
-    if valid_mask is not None and valid_mask.shape == data.shape:
-        display = np.where(valid_mask, display, np.nan)
+    if boundary_mask is not None:
+        display = fill_nans_inside_boundary(display, boundary_mask)
 
-    # Replace fully NaN map with zeros
-    if not np.isfinite(display).any():
-        display = np.zeros_like(display)
+    # Compute automatic scaling limits
+    if vmin is None:
+        vmin = np.nanmin(display)
+    if vmax is None:
+        vmax = np.nanmax(display)
 
+    # -------------------------------------------------------------------------
+    # Figure setup
+    # -------------------------------------------------------------------------
     height, width = display.shape
     dpi = 100
     fig_w = max(width / dpi, 1e-2)
@@ -512,56 +565,42 @@ def save_png(
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
     ax.axis("off")
 
-
-    # Resolve colormap properly
+    # Resolve colormap
     if isinstance(cmap, str):
         cmap_obj: Colormap = plt.get_cmap(cmap).copy()
     else:
         cmap_obj: Colormap = cmap.copy()
+    cmap_obj.set_bad(color="white")  # white outside boundary
 
-    # Make invalid (NaN) pixels white instead of black
-    cmap_obj.set_bad(color="white")
-
+    # -------------------------------------------------------------------------
+    # Plot raster
+    # -------------------------------------------------------------------------
     im = ax.imshow(
         np.ma.masked_invalid(display),
         cmap=cmap_obj,
         vmin=vmin,
         vmax=vmax,
-        interpolation="bilinear",
+        interpolation="gaussian",  # smooth spatially
         origin="upper",
     )
 
-    # Overlay std array (if provided)
-    if std_array is not None:
-        std_data = np.asarray(std_array, dtype=np.float32)
-        if valid_mask is not None and valid_mask.shape == std_data.shape:
-            std_data = np.where(valid_mask, std_data, np.nan)
-        std_vals = std_data[np.isfinite(std_data)]
-        if std_vals.size:
-            std_vmax = np.nanpercentile(std_vals, 95)
-            std_clipped = np.clip(std_data, 0, std_vmax)
-            ax.imshow(
-                std_clipped,
-                cmap="gray",
-                vmin=0,
-                vmax=std_vmax,
-                alpha=0.25,
-                interpolation="bilinear",  # 🔹 smooth overlay
+    # -------------------------------------------------------------------------
+    # Overlay positive sample coordinates
+    # -------------------------------------------------------------------------
+    if pos_coords:
+        coords_arr = np.asarray(pos_coords, np.float32)
+        if coords_arr.ndim == 2 and coords_arr.size:
+            ys = np.clip(coords_arr[:, 0] + 0.5, 0, height - 0.5)
+            xs = np.clip(coords_arr[:, 1] + 0.5, 0, width - 0.5)
+            ax.scatter(
+                xs, ys, s=18, c="cyan",
+                edgecolors="black", linewidths=0.4,
+                marker="o", zorder=5
             )
 
-    # Cyan deposit markers
-        if pos_coords:
-            coords_arr = np.asarray(pos_coords, np.float32)
-            if coords_arr.ndim == 2 and coords_arr.size:
-                ys = np.clip(coords_arr[:, 0] + 0.5, 0, height - 0.5)
-                xs = np.clip(coords_arr[:, 1] + 0.5, 0, width - 0.5)
-                ax.scatter(
-                    xs, ys, s=18, c="cyan",
-                    edgecolors="black", linewidths=0.4,
-                    marker="o", zorder=5
-                )
-
+    # -------------------------------------------------------------------------
     # Boundary outline
+    # -------------------------------------------------------------------------
     if boundary_mask is not None and boundary_mask.shape == display.shape and boundary_mask.any():
         ax.contour(
             boundary_mask.astype(np.uint8),
@@ -574,12 +613,132 @@ def save_png(
     ax.set_ylim(height - 0.5, -0.5)
     ax.set_aspect("equal")
 
-
-    # Optional: add colorbar for quick checks
+    # -------------------------------------------------------------------------
+    # Add colorbar
+    # -------------------------------------------------------------------------
     fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
 
+    # -------------------------------------------------------------------------
+    # Save
+    # -------------------------------------------------------------------------
     fig.savefig(path, bbox_inches="tight", pad_inches=0, dpi=dpi)
     plt.close(fig)
+
+# def fill_nans_inside_boundary(array, boundary_mask):
+#     from skimage.restoration import inpaint_biharmonic
+    
+#     """Interpolate NaNs only inside the boundary mask region."""
+#     arr = np.asarray(array, dtype=np.float32)
+#     mask_inside = boundary_mask.astype(bool)
+
+#     # Define where interpolation should happen:
+#     #  - only NaNs INSIDE the boundary
+#     missing_inside = np.isnan(arr) & mask_inside
+
+#     # Fill NaNs with 0 before inpainting (required)
+#     filled = np.nan_to_num(arr, nan=0.0)
+
+#     # Apply biharmonic inpainting inside the boundary only
+#     filled_interp = inpaint_biharmonic(filled, missing_inside, channel_axis=None)
+
+#     # Keep values outside the boundary as NaN (do not fill them)
+#     filled_interp[~mask_inside] = np.nan
+
+#     return filled_interp
+
+# def save_png(
+#     path,
+#     array,
+#     cmap: str = "viridis",
+#     vmin: float = None,
+#     vmax: float = None,
+#     valid_mask: np.ndarray = None,
+#     boundary_mask: np.ndarray = None,
+#     pos_coords: Sequence[Tuple[int, int]] = None,
+# ):
+#     import matplotlib
+#     if matplotlib.get_backend().lower() != "agg":
+#         matplotlib.use("Agg", force=True)
+#     from matplotlib import pyplot as plt
+#     from matplotlib.colors import Colormap
+#     import numpy as np
+
+#     # # Example usage before interpolation:
+#     # analyze_array_stats("array", array)
+#     # if valid_mask is not None:
+#     #     analyze_array_stats("valid_mask", valid_mask)
+#     # if boundary_mask is not None:
+#     #     analyze_array_stats("boundary_mask", boundary_mask)
+
+
+#     data = np.asarray(array, dtype=np.float32)
+#     display = data.copy()
+#     if boundary_mask is not None:
+#         display = fill_nans_inside_boundary(display, boundary_mask)
+
+#     height, width = display.shape
+    
+#     dpi = 100
+#     fig_w = max(width / dpi, 1e-2)
+#     fig_h = max(height / dpi, 1e-2)
+
+#     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
+#     ax.axis("off")
+
+
+#     # Resolve colormap properly
+#     if isinstance(cmap, str):
+#         cmap_obj: Colormap = _resolve_cmap(cmap, fallback="viridis")
+#         cmap_obj = cmap_obj.copy()
+#     else:
+#         cmap_obj: Colormap = cmap.copy()
+
+#     # # Make invalid (NaN) pixels white instead of black
+#     # cmap_obj.set_bad(color="white")
+
+#     im = ax.imshow(
+#         # np.ma.masked_invalid(display),
+#         display, 
+#         cmap=cmap_obj,
+#         vmin=vmin,
+#         vmax=vmax,
+#         # interpolation="bilinear",
+#         interpolation="gaussian",
+#         origin="upper",
+#     )
+
+#     # Overlay positive deposit markers
+#     # Cyan deposit markers
+#     if pos_coords:
+#         coords_arr = np.asarray(pos_coords, np.float32)
+#         if coords_arr.ndim == 2 and coords_arr.size:
+#             ys = np.clip(coords_arr[:, 0] + 0.5, 0, height - 0.5)
+#             xs = np.clip(coords_arr[:, 1] + 0.5, 0, width - 0.5)
+#             ax.scatter(
+#                 xs, ys, s=18, c="cyan",
+#                 edgecolors="black", linewidths=0.4,
+#                 marker="o", zorder=5
+#             )
+
+#     # Boundary outline
+#     if boundary_mask is not None and boundary_mask.shape == display.shape and boundary_mask.any():
+#         ax.contour(
+#             boundary_mask.astype(np.uint8),
+#             levels=[0.5],
+#             colors="black",
+#             linewidths=2.0,
+#         )
+
+#     ax.set_xlim(-0.5, width - 0.5)
+#     ax.set_ylim(height - 0.5, -0.5)
+#     ax.set_aspect("equal")
+
+
+#     # Optional: add colorbar for quick checks
+#     fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
+
+#     fig.savefig(path, bbox_inches="tight", pad_inches=0, dpi=dpi)
+#     plt.close(fig)
 
 def _resolve_cmap(name: Optional[str], fallback: str):
     from matplotlib import pyplot as plt
@@ -636,11 +795,11 @@ def save_png2(
         std = np.where(valid_mask, std, np.nan)
 
     if isinstance(cmap1, str):
-        cmap_mean = plt.get_cmap(cmap1)
+        cmap_mean = _resolve_cmap(cmap1, fallback="plasma")
     else:
         cmap_mean = cmap1
     if isinstance(cmap2, str):
-        cmap_std = plt.get_cmap(cmap2)
+        cmap_std = _resolve_cmap(cmap2, fallback="gray")
     else:
         cmap_std = cmap2
 
