@@ -450,6 +450,7 @@ def write_prediction_outputs(
             pos_coords=region_positions,
         )
         mean_std_png = mean_std_path.with_suffix('.png')
+        mean_std_scale_png = mean_std_png.with_name(f"{mean_std_png.stem}_scale.png")
         save_png2(
             mean_std_png, 
             masked_mean,
@@ -460,8 +461,9 @@ def write_prediction_outputs(
             valid_mask=valid_mask,
             boundary_mask=boundary_mask,
             pos_coords=region_positions,
+            scale_path=mean_std_scale_png,
         )
-        print(f"Wrote {mean_path}, {std_path}, {mean_std_path}, mean PNG {summary_png}, std PNG {std_png}, and mean-std PNG {mean_std_png}.")
+        print(f"Wrote {mean_path}, {std_path}, {mean_std_path}, mean PNG {summary_png}, std PNG {std_png}, mean-std PNG {mean_std_png}, and legend PNG {mean_std_scale_png}.")
 
 
 def save_geotiff(path, array, ref_src, valid_mask: np.ndarray = None, nodata: float = np.nan):
@@ -778,13 +780,13 @@ def save_png2(
     valid_mask: np.ndarray = None,
     boundary_mask: np.ndarray = None,
     pos_coords: Sequence[Tuple[int, int]] = None,
+    scale_path: Optional[Path] = None,
 ):
     import matplotlib
     if matplotlib.get_backend().lower() != "agg":
         matplotlib.use("Agg", force=True)
     from matplotlib import pyplot as plt
     from matplotlib import colors as mcolors
-    from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
     mean = np.asarray(mean_array, np.float32)
     std = np.asarray(std_array, np.float32)
@@ -850,52 +852,58 @@ def save_png2(
         )
 
     # Positive positions
-        if pos_coords:
-            coords = np.asarray(pos_coords)
-            try:
-                xs, ys = xy(
-                    transform,
-                    coords[:, 0],
-                    coords[:, 1],
-                    offset="center",
-                )
-                ax.scatter(xs, ys, s=18, c="cyan", edgecolors="black", linewidths=0.4, zorder=5)
-            except Exception:
-                ys = np.clip(coords[:, 0] + 0.5, 0, h - 0.5)
-                xs = np.clip(coords[:, 1] + 0.5, 0, w - 0.5)
-                ax.scatter(xs, ys, s=18, c="cyan", edgecolors="black", linewidths=0.4, zorder=5)
-
-    # --- Add colorbars ---
-    # Likelihood bar
-    cax1 = inset_axes(ax, width="2%", height="35%", loc="upper right", borderpad=0.6)
-    if norm_mean is not None:
-        cb1 = plt.colorbar(
-            plt.cm.ScalarMappable(norm=norm_mean, cmap=cmap_mean),
-            cax=cax1,
-            orientation="vertical",
-            fraction=0.05,
-        )
-        cb1.set_label("Likelihood", fontsize=8)
-        cb1.ax.tick_params(labelsize=7)
-    else:
-        cax1.set_visible(False)
-
-    # Uncertainty bar (below)
-    cax2 = inset_axes(ax, width="2%", height="35%", loc="lower right", borderpad=0.6)
-    if norm_std is not None:
-        cb2 = plt.colorbar(
-            plt.cm.ScalarMappable(norm=norm_std, cmap=cmap_std),
-            cax=cax2,
-            orientation="vertical",
-            fraction=0.05,
-        )
-        cb2.set_label("Uncertainty", fontsize=8)
-        cb2.ax.tick_params(labelsize=7)
-    else:
-        cax2.set_visible(False)
+    if pos_coords:
+        coords = np.asarray(pos_coords)
+        try:
+            xs, ys = xy(
+                transform,
+                coords[:, 0],
+                coords[:, 1],
+                offset="center",
+            )
+            ax.scatter(xs, ys, s=50, c="red", edgecolors="black", linewidths=0.4, zorder=5)
+        except Exception:
+            ys = np.clip(coords[:, 0] + 0.5, 0, h - 0.5)
+            xs = np.clip(coords[:, 1] + 0.5, 0, w - 0.5)
+            ax.scatter(xs, ys, s=50, c="red", edgecolors="black", linewidths=0.4, zorder=5)
 
     fig.savefig(mean_std_path, bbox_inches="tight", pad_inches=0)
     plt.close(fig)
+
+    if scale_path is not None and (norm_mean is not None or norm_std is not None):
+        scale_fig, axes = plt.subplots(
+            nrows=2,
+            ncols=1,
+            figsize=(2.2, 4.0),
+            dpi=150,
+            gridspec_kw={"hspace": 0.45},
+        )
+        likelihood_ax = axes[0]
+        if norm_mean is not None:
+            cb1 = scale_fig.colorbar(
+                plt.cm.ScalarMappable(norm=norm_mean, cmap=cmap_mean),
+                cax=likelihood_ax,
+                orientation="vertical",
+            )
+            cb1.set_label("Likelihood", fontsize=9)
+            cb1.ax.tick_params(labelsize=8)
+        else:
+            likelihood_ax.axis("off")
+
+        uncertainty_ax = axes[1]
+        if norm_std is not None:
+            cb2 = scale_fig.colorbar(
+                plt.cm.ScalarMappable(norm=norm_std, cmap=cmap_std),
+                cax=uncertainty_ax,
+                orientation="vertical",
+            )
+            cb2.set_label("Uncertainty", fontsize=9)
+            cb2.ax.tick_params(labelsize=8)
+        else:
+            uncertainty_ax.axis("off")
+
+        scale_fig.savefig(scale_path, bbox_inches="tight", pad_inches=0.15)
+        plt.close(scale_fig)
 
 
 def _load_boundary_mask(

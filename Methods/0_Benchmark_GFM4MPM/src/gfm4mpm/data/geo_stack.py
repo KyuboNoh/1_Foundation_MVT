@@ -285,8 +285,8 @@ class GeoStack:
             setattr(self, "_valid_window_masks", {})
         self._update_combined_mask(None)
 
-def load_deposit_pixels(geojson_path: str, stack: GeoStack) -> List[Tuple[int,int]]:
-    """Convert deposit points (class=1) into pixel indices (row, col)."""
+def load_label_pixels(geojson_path: str, stack: GeoStack) -> List[Tuple[int,int]]:
+    """Convert label points (class=1) into pixel indices (row, col)."""
     pts = []
     with open(geojson_path, 'r') as f:
         gj = json.load(f)
@@ -297,5 +297,5 @@ def load_deposit_pixels(geojson_path: str, stack: GeoStack) -> List[Tuple[int,in
         if 0 <= row_ < stack.height and 0 <= col_ < stack.width:
             pts.append((int(row_), int(col_)))
     
-    print(f'[info] Loaded {len(pts)} deposit points from {os.path.basename(geojson_path)}')
+    print(f'[info] Loaded {len(pts)} label points from {os.path.basename(geojson_path)}')
     return pts

@@ -1,16 +1,17 @@
+# when positive-augmentation is enabled, then augment positive samples with 45 degree-rotations and half-pixel jitter
+
 # scripts/build_splits.py
 import argparse
-import glob
 import json
 import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, List, Sequence
+import math
 
 import numpy as np
 import torch
 import rasterio
 from tqdm import tqdm
-
 try:
     from pyproj import CRS, Transformer
 except Exception:  # pragma: no cover - optional dependency
@@ -34,7 +35,7 @@ from Common.data_utils import (
     region_coord_to_dict,
 )
 from Common.debug_visualization import visualize_debug_features
-from src.gfm4mpm.data.geo_stack import GeoStack, load_deposit_pixels
+from src.gfm4mpm.data.geo_stack import GeoStack, load_label_pixels
 from src.gfm4mpm.data.stac_table import StacTableStack
 from src.gfm4mpm.models.mae_vit import MAEViT
 from src.gfm4mpm.sampling.likely_negatives import compute_embeddings, pu_select_negatives
@@ -44,7 +45,308 @@ TARGET_CRS_EPSG = 8857
 TARGET_CRS = CRS.from_epsg(TARGET_CRS_EPSG) if CRS is not None else None
 _TRANSFORMER_CACHE: Dict[str, Transformer] = {}
 
+_ONE_PIXEL = 1
+_JITTER_DIRECTIONS: List[Tuple[str, Tuple[int, int]]] = [
+    ("up", (-_ONE_PIXEL, 0)),
+    ("up_right", (-_ONE_PIXEL, _ONE_PIXEL)),
+    ("right", (0, _ONE_PIXEL)),
+    ("down_right", (_ONE_PIXEL, _ONE_PIXEL)),
+    ("down", (_ONE_PIXEL, 0)),
+    ("down_left", (_ONE_PIXEL, -_ONE_PIXEL)),
+    ("left", (0, -_ONE_PIXEL)),
+    ("up_left", (-_ONE_PIXEL, -_ONE_PIXEL)),
+]
+_ROTATION_ANGLES: List[int] = [0, 90, 180, 270]
 
+
+def _rotate_patch(patch: np.ndarray, degrees: int) -> np.ndarray:
+    if degrees % 90 != 0:
+        raise ValueError(f"Rotation angle must be a multiple of 90 degrees; received {degrees}")
+    k = (degrees // 90) % 4
+    if k == 0:
+        return patch
+    return np.rot90(patch, k=k, axes=(1, 2)).copy()
+
+
+def _crop_with_offset(patch: np.ndarray, size: int, delta_rows: int = 0, delta_cols: int = 0) -> np.ndarray:
+    if patch.ndim != 3:
+        raise ValueError(f"Expected patch with shape (C,H,W); received {patch.shape}")
+    _, height, width = patch.shape
+    pad_row = (height - size) // 2
+    pad_col = (width - size) // 2
+    start_row = pad_row + int(delta_rows)
+    start_col = pad_col + int(delta_cols)
+    end_row = start_row + size
+    end_col = start_col + size
+    if start_row < 0 or start_col < 0 or end_row > height or end_col > width:
+        raise ValueError("Jitter exceeds context window bounds; increase context_window.")
+    return patch[:, start_row:end_row, start_col:end_col]
+
+
+def _build_positive_augmentation_bundle(
+    encoder: MAEViT,
+    context_patches: Sequence[np.ndarray],
+    base_patches: Sequence[np.ndarray],
+    tile_ids: Sequence[str],
+    metadata_records: Sequence[Dict[str, Any]],
+    coords_xy: np.ndarray,
+    positive_embeddings: np.ndarray,
+    batch_size: int,
+    source_indices: Sequence[int],
+    crop_size: int,
+) -> Optional[Dict[str, Any]]:
+    if not context_patches or not base_patches:
+        return None
+
+    records: List[Dict[str, Any]] = []
+    augmented_patch_entries: List[Dict[str, Any]] = []
+    for list_idx, context_patch in enumerate(context_patches):
+        base_patch = base_patches[list_idx]
+        base_tile_id = str(tile_ids[list_idx])
+        base_metadata = dict(metadata_records[list_idx]) if isinstance(metadata_records[list_idx], dict) else {}
+        base_coords = np.asarray(coords_xy[list_idx], dtype=np.float32)
+        base_metadata.setdefault("source_tile_id", base_tile_id)
+        base_metadata["is_augmented"] = False
+        src_index = int(source_indices[list_idx]) if source_indices else list_idx
+        records.append(
+            {
+                "tile_data": base_patch.astype(np.float32, copy=False),
+                "tile_id": base_tile_id,
+                "metadata": base_metadata,
+                "coords": base_coords,
+                "is_augmented": False,
+                "augmentation_params": {"type": "original", "rotation_deg": 0.0, "direction": None, "source_tile_id": base_tile_id},
+                "source_index": src_index,
+                "embedding": positive_embeddings[list_idx].astype(np.float32, copy=False),
+            }
+        )
+
+        for angle in _ROTATION_ANGLES:
+            rotated_context = context_patch if angle == 0 else _rotate_patch(context_patch, int(angle))
+            rotated_crop = _crop_with_offset(rotated_context, crop_size, 0, 0)
+            if angle != 0:
+                rot_meta = dict(base_metadata)
+                rot_meta["is_augmented"] = True
+                rot_params = {
+                    "type": "rotation",
+                    "rotation_deg": float(angle),
+                    "direction": None,
+                    "shift_rows": 0,
+                    "shift_cols": 0,
+                    "source_tile_id": base_tile_id,
+                }
+                augmented_patch_entries.append(
+                    {
+                        "tile_data": rotated_crop.astype(np.float32, copy=False),
+                        "tile_id": f"{base_tile_id}__{int(angle)}deg",
+                        "metadata": rot_meta,
+                        "coords": base_coords,
+                        "params": rot_params,
+                        "source_index": src_index,
+                    }
+                )
+            for direction_name, (delta_rows, delta_cols) in _JITTER_DIRECTIONS:
+                jitter_crop = _crop_with_offset(rotated_context, crop_size, int(delta_rows), int(delta_cols))
+                jitter_meta = dict(base_metadata)
+                jitter_meta["is_augmented"] = True
+                jitter_params = {
+                    "type": "rotation+jitter" if angle != 0 else "jitter",
+                    "rotation_deg": float(angle),
+                    "direction": direction_name,
+                    "shift_rows": int(delta_rows),
+                    "shift_cols": int(delta_cols),
+                    "source_tile_id": base_tile_id,
+                }
+                suffix = f"{int(angle)}deg_jitter_{direction_name}"
+                augmented_patch_entries.append(
+                    {
+                        "tile_data": jitter_crop.astype(np.float32, copy=False),
+                        "tile_id": f"{base_tile_id}__{suffix}",
+                        "metadata": jitter_meta,
+                        "coords": base_coords,
+                        "params": jitter_params,
+                        "source_index": src_index,
+                    }
+                )
+
+    if augmented_patch_entries:
+        aug_array = np.stack([entry["tile_data"] for entry in augmented_patch_entries], axis=0)
+        aug_embeddings = compute_embeddings(encoder, aug_array, batch_size=batch_size)
+        for emb, entry in zip(aug_embeddings, augmented_patch_entries):
+            entry["embedding"] = emb.astype(np.float32, copy=False)
+            records.append(
+                {
+                    "tile_data": entry["tile_data"],
+                    "tile_id": entry["tile_id"],
+                    "metadata": entry["metadata"],
+                    "coords": entry["coords"],
+                    "is_augmented": True,
+                    "augmentation_params": entry["params"],
+                    "source_index": entry["source_index"],
+                    "embedding": entry["embedding"],
+                }
+            )
+    else:
+        print("[warn] Positive augmentation requested but no augmented patches were generated.")
+
+    if not records:
+        return None
+
+    return {
+        "embeddings": np.stack([rec["embedding"] for rec in records], axis=0),
+        "tile_data": np.stack([rec["tile_data"] for rec in records], axis=0),
+        "tile_ids": np.asarray([rec["tile_id"] for rec in records], dtype=object),
+        "coords": np.stack([rec["coords"] for rec in records], axis=0),
+        "metadata": np.asarray([rec["metadata"] for rec in records], dtype=object),
+        "is_augmented": np.asarray([rec["is_augmented"] for rec in records], dtype=bool),
+        "augmentation_params": np.asarray([rec["augmentation_params"] for rec in records], dtype=object),
+        "source_index": np.asarray([rec["source_index"] for rec in records], dtype=np.int32),
+        "original_count": len(base_patches),
+        "augmented_count": len(records) - len(base_patches),
+    }
+
+
+def _sanitize_token(value: Any) -> str:
+    text = str(value)
+    return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in text).strip("_") or "sample"
+
+
+def _render_patch_grid(
+    patch: np.ndarray,
+    feature_names: Sequence[str],
+    title: str,
+    out_path: Path,
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # pragma: no cover - plotting guard
+        print(f"[warn] Skipping augmentation plot {out_path.name}; matplotlib unavailable: {exc}")
+        return
+
+    if patch.ndim != 3:
+        raise ValueError(f"Expected patch with shape (C,H,W); received {patch.shape}")
+
+    channels = patch.shape[0]
+    ncols = min(4, channels)
+    nrows = math.ceil(channels / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 3, nrows * 3))
+    if not isinstance(axes, np.ndarray):
+        axes = np.asarray([axes])
+    axes = axes.reshape(nrows, ncols)
+
+    for idx in range(nrows * ncols):
+        row = idx // ncols
+        col = idx % ncols
+        ax = axes[row, col]
+        ax.axis("off")
+        if idx >= channels:
+            continue
+        band = patch[idx]
+        finite_mask = np.isfinite(band)
+        if finite_mask.any():
+            vmin = float(np.nanpercentile(band[finite_mask], 2))
+            vmax = float(np.nanpercentile(band[finite_mask], 98))
+            if math.isclose(vmin, vmax):
+                vmin = float(np.nanmin(band[finite_mask]))
+                vmax = float(np.nanmax(band[finite_mask]))
+        else:
+            vmin, vmax = 0.0, 1.0
+        im = ax.imshow(band, cmap="viridis", vmin=vmin, vmax=vmax)
+        label = feature_names[idx] if idx < len(feature_names) else f"Band {idx}"
+        ax.set_title(label, fontsize=9)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+    fig.suptitle(title, fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
+def _save_positive_aug_debug_plots(
+    bundle: Dict[str, Any],
+    feature_names: Optional[Sequence[str]],
+    out_dir: Path,
+    max_sources: int = 2,
+) -> None:
+    tile_data = bundle.get("tile_data")
+    tile_ids = bundle.get("tile_ids")
+    is_augmented = bundle.get("is_augmented")
+    augmentation_params = bundle.get("augmentation_params")
+    source_index = bundle.get("source_index")
+    if (
+        tile_data is None
+        or tile_ids is None
+        or is_augmented is None
+        or augmentation_params is None
+        or source_index is None
+    ):
+        print("[warn] Positive augmentation bundle missing required fields; skipping debug plots.")
+        return
+
+    tile_data = np.asarray(tile_data)
+    tile_ids = np.asarray(tile_ids)
+    is_augmented = np.asarray(is_augmented)
+    augmentation_params = np.asarray(augmentation_params, dtype=object)
+    source_index = np.asarray(source_index)
+
+    if tile_data.ndim != 4:
+        print("[warn] Positive augmentation tile data has unexpected shape; skipping debug plots.")
+        return
+
+    feature_labels = list(feature_names) if feature_names else []
+    if feature_labels and len(feature_labels) < tile_data.shape[1]:
+        feature_labels = feature_labels + [f"Band {idx}" for idx in range(len(feature_labels), tile_data.shape[1])]
+
+    debug_dir = Path(out_dir) / "debug" / "positive_augmentations"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    unique_sources: List[int] = []
+    for idx, aug_flag in enumerate(is_augmented):
+        src = int(source_index[idx])
+        if not bool(aug_flag) and src not in unique_sources:
+            unique_sources.append(src)
+        if len(unique_sources) >= max_sources:
+            break
+
+    if not unique_sources:
+        print("[warn] No original samples found in augmentation bundle for debug plots.")
+        return
+
+    for src in unique_sources:
+        src_mask = source_index == src
+        indices = np.where(src_mask)[0]
+        if indices.size == 0:
+            continue
+        base_name = None
+        for idx in indices:
+            patch = tile_data[idx]
+            tile_id = tile_ids[idx]
+            aug_flag = bool(is_augmented[idx])
+            params = augmentation_params[idx]
+            if not aug_flag:
+                if base_name is None:
+                    base_name = _sanitize_token(tile_id)
+                tag = "0deg"
+            else:
+                if isinstance(params, dict):
+                    rotation_deg = int(round(float(params.get("rotation_deg", 0.0))))
+                    direction = params.get("direction")
+                    aug_type = params.get("type", "augmented")
+                    if base_name is None:
+                        base_name = _sanitize_token(params.get("source_tile_id", tile_id))
+                    angle_tag = f"{rotation_deg}deg"
+                    if aug_type == "rotation":
+                        tag = angle_tag
+                    elif aug_type in {"jitter", "rotation+jitter"}:
+                        tag = f"{angle_tag}_jitter_{_sanitize_token(direction or 'unknown')}"
+                    else:
+                        tag = _sanitize_token(aug_type)
+                else:
+                    tag = "augmented"
+            safe_base = base_name or _sanitize_token(tile_id)
+            filename = debug_dir / f"source_{src:03d}_{safe_base}_{tag}.png"
+            title = f"Source {src} - {safe_base} ({tag})"
+            _render_patch_grid(patch, feature_labels, title, filename)
 def _project_to_target_crs(x: float, y: float, src_crs) -> Tuple[float, float]:
     if TARGET_CRS is None or Transformer is None or src_crs is None:
         return float(x), float(y)
@@ -166,16 +468,21 @@ def _mae_kwargs_from_training_args(args_dict: Dict) -> Dict:
     return mae_kwargs
 
 
-def _project_embeddings(embeddings: np.ndarray) -> np.ndarray:
+def _project_embeddings(embeddings: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     if embeddings.ndim != 2 or embeddings.shape[1] < 2:
-        return np.pad(embeddings, ((0, 0), (0, max(0, 2 - embeddings.shape[1]))), mode='constant')[:, :2]
-    centered = embeddings - embeddings.mean(axis=0, keepdims=True)
+        padded = np.pad(embeddings, ((0, 0), (0, max(0, 2 - embeddings.shape[1]))), mode='constant')[:, :2]
+        mean = padded.mean(axis=0, keepdims=True)
+        components = np.eye(padded.shape[1], 2, dtype=np.float32)
+        return padded - mean, mean, components
+    mean = embeddings.mean(axis=0, keepdims=True)
+    centered = embeddings - mean
     try:
         _, _, vh = np.linalg.svd(centered, full_matrices=False)
         components = vh[:2].T
     except np.linalg.LinAlgError:
-        components = np.eye(embeddings.shape[1], 2)
-    return centered @ components
+        components = np.eye(embeddings.shape[1], 2, dtype=np.float32)
+    projection = centered @ components
+    return projection, mean, components
 
 
 def _save_validation_plot(
@@ -184,6 +491,7 @@ def _save_validation_plot(
     pos_idx: np.ndarray,
     unk_idx: np.ndarray,
     neg_idx: np.ndarray,
+    aug_projection: Optional[np.ndarray],
     distances: np.ndarray,
     keep_mask: np.ndarray,
     cutoff: Optional[float],
@@ -197,12 +505,13 @@ def _save_validation_plot(
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    proj_pos = projection[pos_idx]
-    proj_unknown = projection[unk_idx]
-    neg_mask = np.isin(unk_idx, neg_idx)
-    proj_neg = proj_unknown[neg_mask]
-    proj_unknown_kept = proj_unknown[~neg_mask & keep_mask]
-    proj_unknown_filtered = proj_unknown[~keep_mask]
+    proj_pos = projection[pos_idx] if pos_idx.size else np.empty((0, projection.shape[1]))
+    proj_unknown = projection[unk_idx] if unk_idx.size else np.empty((0, projection.shape[1]))
+    neg_mask = np.isin(unk_idx, neg_idx) if unk_idx.size else np.array([], dtype=bool)
+    proj_neg = proj_unknown[neg_mask] if neg_mask.size else np.empty((0, projection.shape[1]))
+    proj_unknown_kept = proj_unknown[~neg_mask & keep_mask] if neg_mask.size else np.empty((0, projection.shape[1]))
+    proj_unknown_filtered = proj_unknown[~keep_mask] if keep_mask.size else np.empty((0, projection.shape[1]))
+    proj_aug = aug_projection if aug_projection is not None and aug_projection.size else np.empty((0, projection.shape[1]))
 
     fig, (ax_scatter, ax_hist) = plt.subplots(1, 2, figsize=(12, 5))
 
@@ -239,13 +548,25 @@ def _save_validation_plot(
             label='Selected negatives',
         )
 
+    if len(proj_aug):
+        ax_scatter.scatter(
+            proj_aug[:, 0],
+            proj_aug[:, 1],
+            s=25,
+            facecolors='orange',
+            edgecolors='orange',
+            linewidths=1.0,
+            label='Positives (aug)',
+        )
+
     if len(proj_pos):
         ax_scatter.scatter(
             proj_pos[:, 0],
             proj_pos[:, 1],
-            c='#d62728',
-            s=28,
-            alpha=0.85,
+            facecolors='#d62728',
+            edgecolors='#d62728',
+            linewidths=1.0,
+            s=30,
             label='Positives',
         )
 
@@ -361,15 +682,15 @@ def _load_label_pixels(raster_paths: Dict[str, Sequence[Path]]) -> List[Tuple[st
     return regional_coords
 
 
-def _load_deposit_pixels_with_regions(geojson_path: str, stack: Any) -> List[Tuple[str, int, int]]:
+def _load_label_pixels_with_regions(geojson_path: str, stack: Any) -> List[Tuple[str, int, int]]:
     if hasattr(stack, "resolve_region_stack"):
         coords: List[Tuple[str, int, int]] = []
         for region_name, region_stack in stack.iter_region_stacks():
-            region_coords = load_deposit_pixels(geojson_path, region_stack)
+            region_coords = load_label_pixels(geojson_path, region_stack)
             coords.extend((region_name, int(r), int(c)) for r, c in region_coords)
         return coords
 
-    coords = load_deposit_pixels(geojson_path, stack)
+    coords = load_label_pixels(geojson_path, stack)
     return [("GLOBAL", int(r), int(c)) for r, c in coords]
 
 
@@ -399,7 +720,7 @@ if __name__ == '__main__':
     ap.add_argument('--filter_top_pct', type=float, default=0.50)
     ap.add_argument('--negs_per_pos', type=int, default=5)
     ap.add_argument('--readembedding', action='store_true', help='Load embeddings from cached embeddings.npy in the output directory')
-    ap.add_argument('--validation', action='store_true', help='Generate diagnostic plots for PU negative selection')
+    ap.add_argument('--positive-augmentation', action='store_true', help='Augment positive samples with rotations and half-pixel jitter.')
     ap.add_argument('--debug', action='store_true', help='Generate debug visualisations of labels and feature rasters')
     args = ap.parse_args()
 
@@ -464,7 +785,7 @@ if __name__ == '__main__':
         metrics_summary["initial_pos_raw"] = len(pos_raw)
         if not pos_raw:
             if args.pos_geojson:
-                pos_raw = _load_deposit_pixels_with_regions(args.pos_geojson, stack)
+                pos_raw = _load_label_pixels_with_regions(args.pos_geojson, stack)
             else:
                 raise RuntimeError('No label rasters found in training_metadata.json and --pos_geojson not provided')
 
@@ -534,6 +855,10 @@ if __name__ == '__main__':
     metrics_summary["total_coords"] = len(coords_all)
     metrics_summary["final_positive_candidates"] = len(pos)
     metrics_summary["final_unknown_candidates"] = len(unk)
+
+    if args.positive_augmentation and load_result.mode == "table":
+        print("[warn] --positive-augmentation currently supports raster inputs only; disabling for table data.")
+        args.positive_augmentation = False
 
     labels_array = np.zeros(len(coords_all), dtype=np.int8)
     labels_array[:len(pos)] = 1
@@ -659,7 +984,142 @@ if __name__ == '__main__':
                 batch_size = resolved_size
                 break
     print(f"[info] Using batch size {batch_size} from training_args_1_pretrain.json")
-    
+
+    positive_aug_bundle: Optional[Dict[str, Any]] = None
+    aug_embeddings_by_region_lists: Dict[str, List[np.ndarray]] = {}
+    aug_coords_by_region: Dict[str, List[Tuple[str, int, int]]] = {}
+    if args.positive_augmentation:
+        positive_base_patches: List[np.ndarray] = []
+        positive_context_patches: List[np.ndarray] = []
+        positive_tile_ids: List[str] = []
+        positive_metadata: List[Dict[str, Any]] = []
+        positive_coords_records: List[np.ndarray] = []
+        positive_source_indices: List[int] = []
+        missing_count = 0
+        base_window = int(mae_window if 'mae_window' in locals() else patch_size)
+        max_shift = max(abs(dr) for _, (dr, _) in _JITTER_DIRECTIONS)
+        context_window = base_window + 2 * max_shift
+        if context_window % 2 != 0:
+            context_window += 1
+        for idx, coord in enumerate(pos):
+            try:
+                context_patch = _read_stack_patch(stack, coord, context_window)
+            except Exception as exc:
+                missing_count += 1
+                print(f"[warn] Failed to load patch for positive index {idx}: {exc}")
+                continue
+            base_patch = _crop_with_offset(context_patch, base_window, 0, 0)
+            positive_context_patches.append(context_patch.astype(np.float32, copy=False))
+            positive_base_patches.append(base_patch.astype(np.float32, copy=False))
+            positive_tile_ids.append(str(tile_ids[idx]))
+            positive_metadata.append(dict(metadata_records[idx]) if isinstance(metadata_records[idx], dict) else {})
+            positive_coords_records.append(np.asarray(coords_xy[idx], dtype=np.float32))
+            positive_source_indices.append(idx)
+        if missing_count:
+            print(f"[warn] Skipped {missing_count} positive sample(s) during augmentation due to patch read failures.")
+        if positive_base_patches:
+            pos_array = np.stack(positive_base_patches, axis=0)
+            try:
+                positive_embeddings = compute_embeddings(encoder, pos_array, batch_size=batch_size)
+            except Exception as exc:
+                print(f"[warn] Failed to compute embeddings for positive augmentation: {exc}")
+                positive_embeddings = None
+            if positive_embeddings is not None:
+                aug_dir = Path(args.out).resolve()
+                aug_dir.mkdir(parents=True, exist_ok=True)
+                aug_path = aug_dir / 'positive_augmentation.npz'
+                print(f"[info] Positive augmentation: originals={len(positive_base_patches)} candidates, augmentations pending...")
+                positive_aug_bundle = _build_positive_augmentation_bundle(
+                    encoder,
+                    positive_context_patches,
+                    positive_base_patches,
+                    positive_tile_ids,
+                    positive_metadata,
+                    np.stack(positive_coords_records, axis=0),
+                    positive_embeddings,
+                    batch_size,
+                    positive_source_indices,
+                    base_window,
+                )
+                if positive_aug_bundle is not None:
+                    try:
+                        np.savez_compressed(
+                            aug_path,
+                            embeddings=positive_aug_bundle["embeddings"],
+                            tile_data=positive_aug_bundle["tile_data"],
+                            tile_ids=positive_aug_bundle["tile_ids"],
+                            coords=positive_aug_bundle["coords"],
+                            metadata=positive_aug_bundle["metadata"],
+                            is_augmented=positive_aug_bundle["is_augmented"],
+                            augmentation_params=positive_aug_bundle["augmentation_params"],
+                            source_index=positive_aug_bundle["source_index"],
+                        )
+                        print(f"[info] Saved positive augmentation bundle to {aug_path}")
+                        metrics_summary["positive_aug_original"] = int(positive_aug_bundle["original_count"])
+                        metrics_summary["positive_augmented"] = int(positive_aug_bundle["augmented_count"])
+                        print(
+                            f"[info] Positive augmentation summary: originals={positive_aug_bundle['original_count']} "
+                            f"augmentations={positive_aug_bundle['augmented_count']}"
+                        )
+                        if args.debug:
+                            _save_positive_aug_debug_plots(
+                                positive_aug_bundle,
+                                feature_columns or getattr(stack, "feature_columns", None) or [],
+                                Path(args.out),
+                                max_sources=2,
+                            )
+                    except Exception as exc:
+                        print(f"[warn] Failed to write positive augmentation bundle {aug_path}: {exc}")
+                        positive_aug_bundle = None
+        else:
+            print("[warn] No positive patches available for augmentation; skipping.")
+
+    aug_embeddings_by_region: Dict[str, np.ndarray] = {}
+    if positive_aug_bundle is not None:
+        aug_flags = np.asarray(positive_aug_bundle.get("is_augmented"), dtype=bool)
+        aug_embeddings = np.asarray(positive_aug_bundle.get("embeddings"))
+        aug_metadata = positive_aug_bundle.get("metadata")
+        aug_params = positive_aug_bundle.get("augmentation_params")
+        aug_tile_ids = positive_aug_bundle.get("tile_ids")
+        aug_coords_array = positive_aug_bundle.get("coords")
+        if (
+            aug_flags is not None
+            and aug_embeddings is not None
+            and aug_metadata is not None
+            and aug_params is not None
+        ):
+            for flag, embedding, meta, params, tile_id in zip(
+                aug_flags, aug_embeddings, aug_metadata, aug_params, aug_tile_ids
+            ):
+                if not bool(flag):
+                    continue
+                meta_dict = meta if isinstance(meta, dict) else {}
+                region = str(meta_dict.get("region") or str(tile_id).split("_")[0])
+                row_base = meta_dict.get("row")
+                col_base = meta_dict.get("col")
+                try:
+                    row_base = int(row_base) if row_base is not None else None
+                    col_base = int(col_base) if col_base is not None else None
+                except Exception:
+                    row_base = col_base = None
+                shift_rows = 0
+                shift_cols = 0
+                if isinstance(params, dict):
+                    try:
+                        shift_rows = int(params.get("shift_rows", 0))
+                        shift_cols = int(params.get("shift_cols", 0))
+                    except Exception:
+                        shift_rows = shift_cols = 0
+                if row_base is not None and col_base is not None:
+                    coord = (region, row_base + shift_rows, col_base + shift_cols)
+                    aug_coords_by_region.setdefault(region, []).append(coord)
+                aug_embeddings_by_region_lists.setdefault(region, []).append(
+                    np.asarray(embedding, dtype=np.float32)
+                )
+        aug_embeddings_by_region = {
+            key: np.stack(value, axis=0) for key, value in aug_embeddings_by_region_lists.items() if value
+        }
+
     out_dir = Path(args.out)
     embedding_cache_path = out_dir / 'embeddings.npy'
 
@@ -753,7 +1213,15 @@ if __name__ == '__main__':
         pos_idx_arr = np.asarray(pos_idx_list, dtype=int)
         unk_idx_arr = np.asarray(unk_idx_list, dtype=int)
 
-        if args.validation:
+        extra_embeddings = None
+        if aug_embeddings_by_region:
+            extra_embeddings = aug_embeddings_by_region.get(region)
+            if extra_embeddings is None:
+                extra_embeddings = aug_embeddings_by_region.get(str(region).upper())
+            if extra_embeddings is None:
+                extra_embeddings = aug_embeddings_by_region.get(str(region).lower())
+
+        if args.debug:
             neg_idx_region, info = pu_select_negatives(
                 Z_all,
                 pos_idx_arr,
@@ -783,6 +1251,8 @@ if __name__ == '__main__':
             pos_local = np.asarray([lookup[idx] for idx in pos_idx_list], dtype=int)
             unk_local = np.asarray([lookup[idx] for idx in unk_idx_list], dtype=int)
             neg_local = np.asarray([lookup[idx] for idx in neg_idx_region if idx in lookup], dtype=int)
+            if extra_embeddings is not None:
+                info["aug_embeddings"] = np.asarray(extra_embeddings, dtype=np.float32)
             info.update(
                 pos_local=pos_local,
                 unk_local=unk_local,
@@ -796,6 +1266,9 @@ if __name__ == '__main__':
 
     neg_idx = np.concatenate([arr for arr in neg_idx_list if arr.size])
     metrics_summary["selected_negatives"] = int(neg_idx.size)
+    aug_coords_all: List[Tuple[str, int, int]] = []
+    for coords in aug_coords_by_region.values():
+        aug_coords_all.extend(coords)
 
     splits = {
         'pos': [_serialize_coord_entry(rc) for rc in pos],
@@ -812,6 +1285,7 @@ if __name__ == '__main__':
                 pos,
                 neg_coords_selected,
                 Path(args.out),
+                augmented_coords=aug_coords_all if aug_coords_all else None,
             )
         except Exception as exc:
             print(f"[warn] Failed to generate debug visualisations: {exc}")
@@ -824,13 +1298,25 @@ if __name__ == '__main__':
     metrics_summary["final_pos"] = len(splits['pos'])
     metrics_summary["final_neg"] = len(splits['neg'])
 
-    if args.validation and debug_info_by_region:
-        diag_root = Path(args.out) / 'validation'
+    if args.debug and debug_info_by_region:
+        diag_root = Path(args.out) / 'debug'
         for region, info in debug_info_by_region.items():
             region_embeddings = info.get('region_embeddings')
             if region_embeddings is None or region_embeddings.size == 0:
                 continue
-            projection = _project_embeddings(region_embeddings)
+            projection, proj_mean, proj_components = _project_embeddings(region_embeddings)
+            aug_embeddings_region = info.get('aug_embeddings')
+            aug_projection = None
+            if aug_embeddings_region is not None:
+                aug_arr = np.asarray(aug_embeddings_region, dtype=np.float32)
+                if aug_arr.ndim == 1:
+                    aug_arr = aug_arr.reshape(1, -1)
+                target_dim = proj_components.shape[0]
+                if aug_arr.shape[1] < target_dim:
+                    aug_arr = np.pad(aug_arr, ((0, 0), (0, target_dim - aug_arr.shape[1])), mode='constant')
+                elif aug_arr.shape[1] > target_dim:
+                    aug_arr = aug_arr[:, :target_dim]
+                aug_projection = (aug_arr - proj_mean) @ proj_components
             distances = np.asarray(info.get('distances'))
             keep_mask = np.asarray(info.get('keep_mask'), dtype=bool)
             cutoff = info.get('cutoff')
@@ -844,6 +1330,7 @@ if __name__ == '__main__':
                 pos_local,
                 unk_local,
                 neg_local,
+                aug_projection,
                 distances,
                 keep_mask,
                 cutoff,

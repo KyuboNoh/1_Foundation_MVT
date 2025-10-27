@@ -1,22 +1,12 @@
 # Universal GFM4MPM Toolkit
 
-Utilities for merging STAC outputs and integrating foundation models across multiple mineral prospectivity datasets.
+Integrating foundation models across multiple mineral prospectivity datasets.
 
 ## Contents
 
 - `integrate_stac.py`: tools to merge per-dataset STAC exports into a unified metadata bundle and compute overlap products (GeoJSON/TIFF).
 - `scripts/1_integrate_FMs/`: experimental pipeline for integrating dataset-specific foundation models using pre-computed embeddings.
 
-## STAC Integration
-
-```bash
-python -m Methods.1_UniversalGFM4MPM_v0.integrate_stac \
---collections /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/                /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/Out_Data_Binary_Geophy_Float_Down10/ \
---embedding-path /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021/work/f21_2_10/2_Labeling_01_10/embeddings.npz /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/Out_Data_Binary_Geophy_Float_Down10/2_Labeling_01_10/embeddings.npz \
---projectname 2_Integrate_MVT_gcs_bcgs   --output /home/qubuntu25/Desktop/Research/Data \
---dataset-ids NA_AU BC   --region-select "{NA; GLOBAL}" \
---bridge-guess-number 1 --bridge "{Gravity_Bouguer, Gravity_Bouguer_HGM; NEBC_Canada_2_km___GRAV___Bouguer, NEBC_Canada_2_km___GRAV___Horizontal_Gradient}"   --visualize
-```
 
 Running the command writes the blended metadata tree under `/tmp/output/Integrated_Project`, including:
 
@@ -33,7 +23,9 @@ The FM integration pipeline consumes embeddings derived from pretrained MAE-ViT 
 2. Launch training:
 
 ```bash
-python Methods/1_UniversalGFM4MPM_v0/scripts/1_integrate_FMs/integrate_fms.py --config /home/qubuntu25/Desktop/Research/Data/2_Integrate_MVT_gcs_bcgs/config_fm_integration_debug.json --use-previous-negatives --debug  --inference
+python Methods/1_UniversalGFM4MPM_v0/scripts/1_integrate_FMs/integrate_fms.py \
+--config /home/qubuntu25/Desktop/Research/Data/2_UFM_v0/config_fm_integration_debug.json \
+--use-previous-negatives --debug  --inference
 ```
 
 The training loop performs:

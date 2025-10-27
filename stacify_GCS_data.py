@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-# python stacify_GCS_data.py   --csv /home/qubuntu25/Desktop/Research/Data/2021_Table04_Datacube_selected_Norm.csv   --out /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/   --collection-id gsc-2021   --title "GSC 2021 Table"   --description "GSC 2021 Datacube Table"   --license "CC-BY-4.0"   --keywords GSC Datacube 2021 --features Terrane_Proximity Geology_PassiveMargin_Proximity Geology_BlackShale_Proximity Geology_Fault_Proximity Geology_Paleolatitude_Period_Maximum Geology_Paleolatitude_Period_Minimum Seismic_LAB_Hoggard Seismic_Moho Gravity_GOCE_Differential Gravity_GOCE_MaximumCurve Gravity_GOCE_MinimumCurve Gravity_GOCE_MeanCurve Gravity_GOCE_ShapeIndex Gravity_Bouguer Gravity_Bouguer_HGM Gravity_Bouguer_HGM_Worms_Proximity Gravity_Bouguer_UpCont30km_HGM Gravity_Bouguer_UpCont30km_HGM_Worms_Proximity Magnetic_HGM Magnetic_HGM_Worms_Proximity Magnetic_LongWavelength_HGM Magnetic_LongWavelength_HGM_Worms_Proximity Geology_Period_Maximum_Majority Geology_Period_Minimum_Majority Geology_Lithology_Majority Geology_Lithology_Minority --label Training_MVT_Deposit --validate --check-raster --check-raster-features Magnetic_HGM Training_MVT_Deposit
-# python stacify_GCS_data.py   --csv /home/qubuntu25/Desktop/Research/Data/2021_Table04_Datacube_selected_Norm.csv   --out /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/   --collection-id gsc-2021   --title "GSC 2021 Table"   --description "GSC 2021 Datacube Table"   --license "CC-BY-4.0"   --keywords GSC Datacube 2021 --features Terrane_Proximity Geology_PassiveMargin_Proximity Geology_BlackShale_Proximity Geology_Fault_Proximity Geology_Paleolatitude_Period_Maximum Geology_Paleolatitude_Period_Minimum Seismic_LAB_Hoggard Seismic_Moho Gravity_GOCE_Differential Gravity_GOCE_MaximumCurve Gravity_GOCE_MinimumCurve Gravity_GOCE_MeanCurve Gravity_GOCE_ShapeIndex Gravity_Bouguer Gravity_Bouguer_HGM Gravity_Bouguer_HGM_Worms_Proximity Gravity_Bouguer_UpCont30km_HGM Gravity_Bouguer_UpCont30km_HGM_Worms_Proximity Magnetic_HGM Magnetic_HGM_Worms_Proximity Magnetic_LongWavelength_HGM Magnetic_LongWavelength_HGM_Worms_Proximity Geology_Period_Maximum_Majority Geology_Period_Minimum_Majority Geology_Lithology_Majority Geology_Lithology_Minority --label Training_MVT_Deposit 
+# python stacify_GCS_data.py   --csv /home/qubuntu25/Desktop/Research/Data/GSC/2021_Table04_Datacube_selected_Norm.csv   --out /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/   --collection-id gsc-2021          --title "GSC 2021 Table"   --description "GSC 2021 Datacube Table"   --license "CC-BY-4.0"   --keywords GSC Datacube 2021 --features Terrane_Proximity Geology_PassiveMargin_Proximity Geology_BlackShale_Proximity Geology_Fault_Proximity Geology_Paleolatitude_Period_Maximum Geology_Paleolatitude_Period_Minimum Seismic_LAB_Hoggard Seismic_Moho Gravity_GOCE_Differential Gravity_GOCE_MaximumCurve Gravity_GOCE_MinimumCurve Gravity_GOCE_MeanCurve Gravity_GOCE_ShapeIndex Gravity_Bouguer Gravity_Bouguer_HGM Gravity_Bouguer_HGM_Worms_Proximity Gravity_Bouguer_UpCont30km_HGM Gravity_Bouguer_UpCont30km_HGM_Worms_Proximity Magnetic_HGM Magnetic_HGM_Worms_Proximity Magnetic_LongWavelength_HGM Magnetic_LongWavelength_HGM_Worms_Proximity Geology_Period_Maximum_Majority Geology_Period_Minimum_Majority Geology_Lithology_Majority Geology_Lithology_Minority --label Training_MVT_Deposit --validate --check-raster --check-raster-features Magnetic_HGM Training_MVT_Deposit
+# python stacify_GCS_data.py   --csv /home/qubuntu25/Desktop/Research/Data/GSC/2021_Table04_Datacube_selected_Norm.csv   --out /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/   --collection-id gsc-2021          --title "GSC 2021 Table"   --description "GSC 2021 Datacube Table"   --license "CC-BY-4.0"   --keywords GSC Datacube 2021 --features Terrane_Proximity Geology_PassiveMargin_Proximity Geology_BlackShale_Proximity Geology_Fault_Proximity Geology_Paleolatitude_Period_Maximum Geology_Paleolatitude_Period_Minimum Seismic_LAB_Hoggard Seismic_Moho Gravity_GOCE_Differential Gravity_GOCE_MaximumCurve Gravity_GOCE_MinimumCurve Gravity_GOCE_MeanCurve Gravity_GOCE_ShapeIndex Gravity_Bouguer Gravity_Bouguer_HGM Gravity_Bouguer_HGM_Worms_Proximity Gravity_Bouguer_UpCont30km_HGM Gravity_Bouguer_UpCont30km_HGM_Worms_Proximity Magnetic_HGM Magnetic_HGM_Worms_Proximity Magnetic_LongWavelength_HGM Magnetic_LongWavelength_HGM_Worms_Proximity Geology_Period_Maximum_Majority Geology_Period_Minimum_Majority Geology_Lithology_Majority Geology_Lithology_Minority --label Training_MVT_Deposit 
+# python stacify_GCS_data.py   --csv /home/qubuntu25/Desktop/Research/Data/GSC/2021_Table04_Datacube_selected_Norm.csv   --out /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/   --collection-id gsc-2021-minocc   --title "GSC 2021 Table"   --description "GSC 2021 Datacube Table"   --license "CC-BY-4.0"   --keywords GSC Datacube 2021 --features Terrane_Proximity Geology_PassiveMargin_Proximity Geology_BlackShale_Proximity Geology_Fault_Proximity Geology_Paleolatitude_Period_Maximum Geology_Paleolatitude_Period_Minimum Seismic_LAB_Hoggard Seismic_Moho Gravity_GOCE_Differential Gravity_GOCE_MaximumCurve Gravity_GOCE_MinimumCurve Gravity_GOCE_MeanCurve Gravity_GOCE_ShapeIndex Gravity_Bouguer Gravity_Bouguer_HGM Gravity_Bouguer_HGM_Worms_Proximity Gravity_Bouguer_UpCont30km_HGM Gravity_Bouguer_UpCont30km_HGM_Worms_Proximity Magnetic_HGM Magnetic_HGM_Worms_Proximity Magnetic_LongWavelength_HGM Magnetic_LongWavelength_HGM_Worms_Proximity Geology_Period_Maximum_Majority Geology_Period_Minimum_Majority Geology_Lithology_Majority Geology_Lithology_Minority --label Training_MVT_Occurrence 
 
 """
 Convert a single GSC CSV table into a STAC catalog with tabular + raster assets. 
@@ -179,6 +180,153 @@ def _polygon_centroid(coords: np.ndarray) -> Optional[tuple[float, float]]:
     cx = ((x0 + x1) * cross).sum() / (6.0 * area)
     cy = ((y0 + y1) * cross).sum() / (6.0 * area)
     return float(cx), float(cy)
+
+
+def _reproject_geojson_points(path: Path, target_crs: str) -> bool:
+    """Rewrite a point GeoJSON so that coordinates are expressed in target_crs."""
+    if Transformer is None:
+        logging.warning("pyproj unavailable; cannot reproject %s to %s.", path, target_crs)
+        return False
+
+    path = Path(path)
+    if not path.exists():
+        logging.debug("GeoJSON path %s not found; skipping reprojection.", path)
+        return False
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logging.warning("Failed to read GeoJSON %s: %s", path, exc)
+        return False
+
+    existing_crs = payload.get("gfm:geometry_crs")
+    if isinstance(existing_crs, str) and existing_crs == target_crs:
+        return False
+
+    features = payload.get("features")
+    if not isinstance(features, list) or not features:
+        logging.debug("GeoJSON %s contains no features; skipping reprojection.", path)
+        return False
+
+    try:
+        transformer = Transformer.from_crs("EPSG:4326", target_crs, always_xy=True)
+    except Exception as exc:
+        logging.warning("Failed to build transformer to %s for %s: %s", target_crs, path, exc)
+        return False
+
+    updated = False
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+        geometry = feature.get("geometry")
+        if not isinstance(geometry, dict):
+            continue
+        if geometry.get("type") != "Point":
+            continue
+        coords = geometry.get("coordinates")
+        if not isinstance(coords, (list, tuple)) or len(coords) != 2:
+            continue
+        lon, lat = coords
+        if not (math.isfinite(lon) and math.isfinite(lat)):
+            continue
+        try:
+            x_proj, y_proj = transformer.transform(float(lon), float(lat))
+        except Exception:
+            continue
+        properties = feature.setdefault("properties", {})
+        properties.setdefault("source_lon", float(lon))
+        properties.setdefault("source_lat", float(lat))
+        properties.setdefault("source_crs", "EPSG:4326")
+        geometry["coordinates"] = [float(x_proj), float(y_proj)]
+        updated = True
+
+    if not updated:
+        return False
+
+    payload["gfm:geometry_crs"] = target_crs
+    try:
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception as exc:
+        logging.warning("Failed to write reprojected GeoJSON %s: %s", path, exc)
+        return False
+
+    logging.info("Reprojected %s to %s", path.name, target_crs)
+    return True
+
+
+def _write_label_table_from_geojson(geojson_path: Path, out_dir: Path, label_column: str) -> Optional[Path]:
+    """Persist a Parquet table of positive labels backed by a GeoJSON file."""
+    geojson_path = Path(geojson_path)
+    if not geojson_path.exists():
+        logging.debug("GeoJSON %s missing; skipping label table export.", geojson_path)
+        return None
+    try:
+        payload = json.loads(geojson_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logging.warning("Failed to read GeoJSON %s for table export: %s", geojson_path, exc)
+        return None
+
+    features = payload.get("features")
+    if not isinstance(features, list) or not features:
+        logging.info("GeoJSON %s contains no features; skipping label table export.", geojson_path.name)
+        return None
+
+    records: List[Dict[str, object]] = []
+    geometry_crs = payload.get("gfm:geometry_crs")
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+        geometry = feature.get("geometry")
+        properties = feature.get("properties") or {}
+        if not isinstance(geometry, dict) or geometry.get("type") != "Point":
+            continue
+        coords = geometry.get("coordinates")
+        if not isinstance(coords, (list, tuple)) or len(coords) != 2:
+            continue
+        x, y = coords
+        if not (math.isfinite(x) and math.isfinite(y)):
+            continue
+        label_value = properties.get("label", 1.0)
+        try:
+            label_numeric = float(label_value)
+        except Exception:
+            label_numeric = 1.0
+        row_id = properties.get("row")
+        try:
+            row_numeric = int(row_id) if row_id is not None else None
+        except Exception:
+            row_numeric = None
+        record = {
+            label_column: float(label_numeric),
+            "row": row_numeric,
+            "x": float(x),
+            "y": float(y),
+        }
+        if "source_lon" in properties and "source_lat" in properties:
+            record["source_lon"] = float(properties["source_lon"])
+            record["source_lat"] = float(properties["source_lat"])
+        if "source_crs" in properties:
+            record["source_crs"] = str(properties["source_crs"])
+        if geometry_crs:
+            record["geometry_crs"] = str(geometry_crs)
+        records.append(record)
+
+    if not records:
+        logging.info("No valid point records extracted from %s; skipping label table export.", geojson_path.name)
+        return None
+
+    df = pd.DataFrame.from_records(records)
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    ensure_dir(out_dir)
+    table_path = out_dir / f"{_slugify_column(label_column)}.parquet"
+    try:
+        pq.write_table(table, table_path)
+    except Exception as exc:
+        logging.warning("Failed to write label table %s: %s", table_path, exc)
+        return None
+
+    logging.info("Wrote label table with %d records -> %s", len(records), table_path)
+    return table_path
 
 
 @dataclass
@@ -984,17 +1132,24 @@ def _generate_raster_assets(
         rasterio = _require_rasterio()
 
     raw_raster_dir = assets_dir / "tmp_rasters"
+    label_raw_raster_dir = assets_dir / "labels" / "tmp_rasters"
     target_asset_dir = assets_dir / "rasters"
+    label_target_asset_dir = assets_dir / "labels"
     ensure_dir(raw_raster_dir)
+    ensure_dir(label_raw_raster_dir)
     ensure_dir(target_asset_dir)
+    ensure_dir(label_target_asset_dir)
 
-    quicklook_dir: Optional[Path] = None
+    quicklook_dir_features: Optional[Path] = None
+    quicklook_dir_labels: Optional[Path] = None
     feature_allow: Optional[set[str]] = None
     slug_allow: Optional[set[str]] = None
     if check_raster:
         if check_features:
-            quicklook_dir = assets_dir / "quicklooks"
-            ensure_dir(quicklook_dir)
+            quicklook_dir_features = assets_dir / "quicklooks"
+            ensure_dir(quicklook_dir_features)
+            quicklook_dir_labels = assets_dir / "labels" / "thumbnails"
+            ensure_dir(quicklook_dir_labels)
             feature_allow = {_normalize_column_key(name) for name in check_features}
             slug_allow = {_slugify_column(name) for name in check_features}
         else:
@@ -1003,8 +1158,10 @@ def _generate_raster_assets(
             )
 
     column_cache: dict[str, np.ndarray] = {}
-    raster_paths: List[Path] = []
-    raster_details: dict[Path, dict] = {}
+    feature_raster_paths: List[Path] = []
+    label_raster_paths: List[Path] = []
+    feature_raster_details: dict[Path, dict] = {}
+    label_raster_details: dict[Path, dict] = {}
     existing_products: List[Dict[str, Any]] = []
 
     for spec in grid_specs:
@@ -1134,9 +1291,14 @@ def _generate_raster_assets(
 
             grid_suffix = f"{grid_width}x{grid_height}{region_tag}"
             raw_filename = f"{parquet_path.stem}_{_slugify_column(feature_name)}_{grid_suffix}.tif"
-            out_path = raw_raster_dir / raw_filename
+            raw_dir = label_raw_raster_dir if is_label_feature else raw_raster_dir
+            ensure_dir(raw_dir)
+            out_path = raw_dir / raw_filename
             asset_filename = f"{parquet_path.stem}_{_slugify_column(feature_name)}_{grid_suffix}_cog.tif"
-            asset_path = target_asset_dir / asset_filename
+            asset_dir_current = label_target_asset_dir if is_label_feature else target_asset_dir
+            ensure_dir(asset_dir_current)
+            asset_path = asset_dir_current / asset_filename
+            quicklook_dir_current = quicklook_dir_labels if is_label_feature else quicklook_dir_features
 
             if asset_path.exists():
                 print(
@@ -1157,8 +1319,8 @@ def _generate_raster_assets(
                 metadata_path_existing = assetization_dir / f"{asset_path.stem}.json"
                 if metadata_path_existing.exists():
                     product_stub["metadata_path"] = metadata_path_existing
-                if quicklook_dir is not None:
-                    quicklook_existing = quicklook_dir / f"{parquet_path.stem}_{_slugify_column(feature_name)}_{grid_suffix}.png"
+                if quicklook_dir_current is not None:
+                    quicklook_existing = quicklook_dir_current / f"{parquet_path.stem}_{_slugify_column(feature_name)}_{grid_suffix}.png"
                     if quicklook_existing.exists():
                         product_stub["quicklook_path"] = quicklook_existing
                 existing_products.append(product_stub)
@@ -1270,8 +1432,9 @@ def _generate_raster_assets(
                 max_val,
             )
 
+            quicklook_dir_active = quicklook_dir_labels if is_label_feature else quicklook_dir_features
             quicklook_requested = False
-            if quicklook_dir is not None and feature_allow is not None and slug_allow is not None:
+            if quicklook_dir_active is not None and feature_allow is not None and slug_allow is not None:
                 key = _normalize_column_key(feature_name)
                 slug = _slugify_column(feature_name)
                 quicklook_requested = key in feature_allow or slug in slug_allow
@@ -1303,14 +1466,13 @@ def _generate_raster_assets(
                         )
 
             quicklook_path_obj: Optional[Path] = None
-            if quicklook_requested and quicklook_dir is not None and stack.size:
+            if quicklook_requested and quicklook_dir_active is not None and stack.size:
                 band_title = band_categories[0] if band_categories else band_display[0]
                 quicklook_title = f"{feature_name} ({band_title})"
-                quicklook_path_obj = quicklook_dir / f"{parquet_path.stem}_{_slugify_column(feature_name)}_{grid_suffix}.png"
+                quicklook_path_obj = quicklook_dir_active / f"{parquet_path.stem}_{_slugify_column(feature_name)}_{grid_suffix}.png"
                 _save_quicklook(stack[0], quicklook_title, quicklook_path_obj)
                 logging.info("Saved raster quicklook for %s [%s] -> %s", feature_name, region_name, quicklook_path_obj)
 
-            raster_paths.append(out_path)
             raster_detail = {
                 "region": region_name,
                 "feature": feature_name,
@@ -1323,33 +1485,52 @@ def _generate_raster_assets(
             if categories:
                 raster_detail["categories"] = categories
                 raster_detail["band_display"] = categories
-            raster_details[out_path] = raster_detail
+            target_paths = label_raster_paths if is_label_feature else feature_raster_paths
+            target_details = label_raster_details if is_label_feature else feature_raster_details
+            target_paths.append(out_path)
+            target_details[out_path] = raster_detail
             logging.info(
                 "Built raster diagnostic for feature %s (region %s) -> %s",
                 feature_name,
                 region_name,
                 out_path.name,
             )
-    if not raster_paths:
+    if not feature_raster_paths and not label_raster_paths:
         logging.info("No raster grids were generated; skipping asset registration.")
         return [], assetization_dir
 
     products: List[Dict[str, Any]] = []
     try:
-        products = add_raster_assets(
-            collection,
-            raster_paths,
-            target_asset_dir,
-            cogify=True,
-            downsample_factor=downsample_factor,
-            upsample_factor=upsample_factor,
-        )
-        for product in products:
-            detail = raster_details.get(product.get("source_path"))
-            if detail:
-                product.update(detail)
+        if feature_raster_paths:
+            feature_products = add_raster_assets(
+                collection,
+                feature_raster_paths,
+                target_asset_dir,
+                cogify=True,
+                downsample_factor=downsample_factor,
+                upsample_factor=upsample_factor,
+            )
+            for product in feature_products:
+                detail = feature_raster_details.get(product.get("source_path"))
+                if detail:
+                    product.update(detail)
+            products.extend(feature_products)
+        if label_raster_paths:
+            label_products = add_raster_assets(
+                collection,
+                label_raster_paths,
+                label_target_asset_dir,
+                cogify=True,
+                downsample_factor=downsample_factor,
+                upsample_factor=upsample_factor,
+            )
+            for product in label_products:
+                detail = label_raster_details.get(product.get("source_path"))
+                if detail:
+                    product.update(detail)
+            products.extend(label_products)
     finally:
-        for path in raster_paths:
+        for path in feature_raster_paths + label_raster_paths:
             try:
                 path.unlink(missing_ok=True)
             except Exception:
@@ -1521,6 +1702,10 @@ def main() -> None:
     ensure_dir(assets_dir)
     tables_dir = assets_dir / "tables"
     ensure_dir(tables_dir)
+    labels_dir = assets_dir / "labels"
+    label_geojson_root = labels_dir / "geojson"
+    label_tables_dir = labels_dir / "tables"
+    ensure_dir(label_geojson_root)
     schema_hints = parse_schema_hints(args.schema)
     parquet_path = tables_dir / (csv_path.stem + ".parquet")
     csv_to_parquet(csv_path, parquet_path, schema_hints=schema_hints)
@@ -1530,7 +1715,7 @@ def main() -> None:
         try:
             label_geojson_paths = generate_label_geojson(
                 parquet_path,
-                assets_dir,
+                label_geojson_root,
                 label_column=args.label,
                 lat_column=args.lat_column,
                 lon_column=args.lon_column,
@@ -1636,6 +1821,57 @@ def main() -> None:
             logging.exception("Failed to generate raster assets: %s", exc)
             assetization_dir = assets_dir / "assetization"
             ensure_dir(assetization_dir)
+
+    if label_geojson_paths:
+        label_region_crs: Dict[str, str] = {}
+        default_label_crs: Optional[str] = None
+        for prod in raster_products:
+            if not isinstance(prod, dict):
+                continue
+            if not prod.get("is_label"):
+                continue
+            profile = prod.get("profile")
+            crs_obj = None
+            if isinstance(profile, dict):
+                crs_obj = profile.get("crs")
+            if crs_obj is None:
+                continue
+            if hasattr(crs_obj, "to_string"):
+                crs_str = crs_obj.to_string()
+            else:
+                crs_str = str(crs_obj)
+            if not crs_str:
+                continue
+            region_name = prod.get("region")
+            region_key = "GLOBAL"
+            if isinstance(region_name, str) and region_name.strip():
+                region_key = region_name.strip().upper()
+            label_region_crs[region_key] = crs_str
+            if default_label_crs is None or region_key == "GLOBAL":
+                default_label_crs = crs_str
+
+        if default_label_crs is None:
+            default_label_crs = "EPSG:6933"
+
+        region_keys_lower = {key.lower(): value for key, value in label_region_crs.items() if key != "GLOBAL"}
+        aggregated_geojson: Optional[Path] = None
+        for geo_path in label_geojson_paths:
+            stem_lower = geo_path.stem.lower()
+            target_crs = None
+            for region_lower, crs_str in region_keys_lower.items():
+                if stem_lower.endswith(f"_{region_lower}"):
+                    target_crs = crs_str
+                    break
+            if target_crs is None:
+                target_crs = default_label_crs
+                if aggregated_geojson is None:
+                    aggregated_geojson = geo_path
+            if target_crs:
+                _reproject_geojson_points(geo_path, target_crs)
+
+        if args.label and label_tables_dir:
+            table_source = aggregated_geojson or label_geojson_paths[0]
+            _write_label_table_from_geojson(table_source, label_tables_dir, args.label)
 
     coll.summaries = pystac.Summaries({"table:columns": columns})
 

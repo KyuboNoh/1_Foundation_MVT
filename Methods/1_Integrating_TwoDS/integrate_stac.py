@@ -770,6 +770,70 @@ def _load_embedding_windows(bundle_path: Path) -> List[Dict[str, object]]:
     return records
 
 
+def _load_augmented_embedding_windows(bundle_path: Path) -> List[Dict[str, object]]:
+    records: List[Dict[str, object]] = []
+    if not bundle_path.exists():
+        print(f"[warn] Augmentation bundle not found at {bundle_path}; skipping.")
+        return records
+    try:
+        with np.load(bundle_path, allow_pickle=True) as data:
+            tile_ids = data.get("tile_ids")
+            coords = data.get("coords")
+            metadata = data.get("metadata")
+            flags = data.get("is_augmented")
+            if tile_ids is None or coords is None or metadata is None or flags is None:
+                print(f"[warn] Augmentation bundle {bundle_path} lacks required arrays; skipping.")
+                return records
+            tile_ids = np.asarray(tile_ids).astype(str)
+            coords_arr = np.asarray(coords, dtype=np.float64)
+            flags = np.asarray(flags, dtype=bool)
+            meta_entries = np.asarray(metadata, dtype=object)
+            count = tile_ids.shape[0]
+            for idx in range(count):
+                if not bool(flags[idx]):
+                    continue
+                coord = coords_arr[idx]
+                if coord.size < 2 or not np.all(np.isfinite(coord[:2])):
+                    continue
+                coord_tuple = (float(coord[0]), float(coord[1]))
+                meta_raw = meta_entries[idx]
+                if isinstance(meta_raw, np.ndarray) and meta_raw.dtype == object and meta_raw.ndim == 0:
+                    meta_raw = meta_raw.item()
+                elif hasattr(meta_raw, "item") and not isinstance(meta_raw, dict):
+                    try:
+                        meta_raw = meta_raw.item()
+                    except Exception:
+                        pass
+                meta_dict = meta_raw if isinstance(meta_raw, dict) else {}
+                region = str(meta_dict.get("region") or meta_dict.get("Region") or "GLOBAL")
+                row_val = meta_dict.get("row")
+                col_val = meta_dict.get("col")
+                try:
+                    row_int = int(row_val) if row_val is not None else None
+                except Exception:
+                    row_int = None
+                try:
+                    col_int = int(col_val) if col_val is not None else None
+                except Exception:
+                    col_int = None
+                source_tile_id = meta_dict.get("source_tile_id") or tile_ids[idx].split("__")[0]
+                records.append(
+                    {
+                        "tile_id": str(tile_ids[idx]),
+                        "coord": coord_tuple,
+                        "region": region,
+                        "row": row_int,
+                        "col": col_int,
+                        "source_tile_id": source_tile_id,
+                        "is_augmented": True,
+                    }
+                )
+    except Exception as exc:
+        print(f"[warn] Failed to parse augmentation bundle {bundle_path}: {exc}")
+        return []
+    return records
+
+
 def _compute_embedding_spacing_map(windows_map: Dict[str, List[Dict[str, object]]]) -> Dict[str, float]:
     spacing: Dict[str, float] = {}
     if NearestNeighbors is None:
@@ -1176,6 +1240,8 @@ def _write_overlap_pairs(
     dataset_resolutions: Optional[Dict[str, float]] = None,
     embedding_windows: Optional[Dict[str, List[Dict[str, object]]]] = None,
     embedding_spacing: Optional[Dict[str, Optional[float]]] = None,
+    suffix: str = "",
+    variant_label: Optional[str] = None,
 ) -> Dict[str, str]:
     if dataset_resolutions is None:
         dataset_resolutions = _compute_dataset_resolutions(tile_geoms)
@@ -1186,6 +1252,10 @@ def _write_overlap_pairs(
     embedding_spacing = embedding_spacing or {}
 
     pair_outputs: Dict[str, str] = {}
+    suffix_token = suffix or ""
+    if suffix_token and not suffix_token.startswith("_"):
+        suffix_token = f"_{suffix_token}"
+    label_suffix = suffix_token
 
     all_dataset_ids = sorted(set(tile_geoms.keys()) | set(embedding_windows.keys()))
 
@@ -1228,7 +1298,7 @@ def _write_overlap_pairs(
         search_radius = meta.get("search_radius") if isinstance(meta.get("search_radius"), (int, float)) else None
         generated_from = meta.get("generated_from") if isinstance(meta.get("generated_from"), str) else None
 
-        pair_name = f"{ds_a}_{ds_b}_overlap_pairs.json"
+        pair_name = f"{ds_a}_{ds_b}_overlap_pairs{suffix_token}.json"
         output_path = data_dir / pair_name
         try:
             with output_path.open("w", encoding="utf-8") as fh:
@@ -1258,8 +1328,10 @@ def _write_overlap_pairs(
                     "overlap": overlap_info,
                     "pairs": records,
                 }
+                if variant_label is not None:
+                    doc["pair_variant"] = variant_label
                 json.dump(doc, fh, indent=2)
-                pair_outputs[f"{ds_a}-{ds_b}"] = str(output_path)
+                pair_outputs[f"{ds_a}-{ds_b}{label_suffix}"] = str(output_path)
         except Exception as exc:
             print(f"[warn] Failed to write overlap pairs for {ds_a}-{ds_b}: {exc}")
 
@@ -1285,54 +1357,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Integrate multiple STAC collections into a unified metadata summary.")
     parser.add_argument("--collections", nargs="+", required=True, help="Paths to STAC collection roots produced by stacify_*.",)
     parser.add_argument("--output", type=str, default=None, help="Optional path to write combined metadata JSON. If omitted, prints to stdout.",)
-    parser.add_argument("--dataset-ids", nargs="*",
-        default=None,
-        help="Optional friendly IDs corresponding to --collections (must match in length).",
-    )
-    parser.add_argument(
-        "--embedding-path",
-        nargs="+",
-        required=True,
-        help=".npz embedding bundles aligned with --collections order for window-level overlap detection.",
-    )
-    parser.add_argument(
-        "--projectname",
-        type=str,
-        default=None,
-        help="Optional project name. When provided with --output, the combined metadata "
-             "is written to <output>/<projectname>/combined_metadata.json",
-    )
-    parser.add_argument(
-        "--bridge-guess-number",
-        type=int,
-        default=0,
-        help="Optional count of heuristic feature bridges supplied via --bridge.",
-    )
-    parser.add_argument(
-        "--bridge",
-        action="append",
-        default=[],
-        help=(
-            "Feature bridge specification across datasets. Use braces with segments separated by ';', "
-            "one segment per dataset, e.g. \"{featA1, featA2; featB1}\" for two datasets. "
-            "Repeat the flag for multiple bridge guesses."
-        ),
-    )
-    parser.add_argument(
-        "--region-select",
-        type=str,
-        default=None,
-        help=(
-            "Optional region selection string matching the number of datasets, e.g. \"{NA,AU; GLOBAL}\" "
-            "to keep regions NA and AU from dataset 1 and region GLOBAL from dataset 2. "
-            "Use ALL or * to retain every region for a dataset."
-        ),
-    )
-    parser.add_argument(
-        "--visualize",
-        action="store_true",
-        help="Generate preview PNG/TIF copies for bridge features/labels.",
-    )
+    parser.add_argument("--dataset-ids", nargs="*", default=None, help="Optional friendly IDs corresponding to --collections (must match in length).",)
+    parser.add_argument("--embedding-path", nargs="+", required=True, help=".npz embedding bundles aligned with --collections order for window-level overlap detection.",)
+    parser.add_argument("--use-positive-augmentation", action="store_true", help="Include positive augmentation bundles when computing overlap pairs.")
+    parser.add_argument("--pos-aug-path", nargs="*", default=None, help="Optional positive augmentation .npz paths aligned with --collections order.")
+    parser.add_argument("--projectname", type=str, default=None, help="Optional project name. When provided with --output, the combined metadata is written to <output>/<projectname>/combined_metadata.json"    )
+    parser.add_argument("--bridge-guess-number", type=int, default=0, help="Optional count of heuristic feature bridges supplied via --bridge.",)
+    parser.add_argument("--bridge", action="append", default=[], help=( "Feature bridge specification across datasets. Use braces with segments separated by ';', one segment per dataset, e.g. \"{featA1, featA2; featB1}\" for two datasets. Repeat the flag for multiple bridge guesses."), )
+    parser.add_argument("--region-select", type=str, default=None,help=("Optional region selection string matching the number of datasets, e.g. \"{NA,AU; GLOBAL}\" to keep regions NA and AU from dataset 1 and region GLOBAL from dataset 2. Use ALL or * to retain every region for a dataset."),)
+    parser.add_argument("--visualize", action="store_true", help="Generate preview PNG/TIF copies for bridge features/labels.",)
     return parser.parse_args()
 
 
@@ -1351,10 +1384,17 @@ def main() -> None:
         Path(p).expanduser().resolve() for p in args.embedding_path
     ]
 
+    requested_aug_paths = list(args.pos_aug_path or [])
+    use_positive_augmentation = bool(args.use_positive_augmentation or requested_aug_paths)
+    if requested_aug_paths and len(requested_aug_paths) != len(root_paths):
+        raise ValueError("--pos-aug-path must align with the number of --collections")
+
     datasets: List[DatasetSummary] = []
     dataset_crs_map: Dict[str, Optional[CRS]] = {}
     embedding_windows_map: Dict[str, List[Dict[str, object]]] = {}
     embedding_path_map: Dict[str, Path] = {}
+    augmentation_windows_map: Dict[str, List[Dict[str, object]]] = {}
+    augmentation_stats: Dict[str, Dict[str, object]] = {}
 
     for idx, (root, ds_id) in enumerate(zip(root_paths, dataset_ids)):
         summary = _summarise_dataset(root, ds_id)
@@ -1362,11 +1402,52 @@ def main() -> None:
         dataset_crs_map[summary.dataset_id] = None
         bundle_path = embedding_bundle_paths[idx]
         windows = _load_embedding_windows(bundle_path)
+        base_window_count = len(windows)
         if windows:
             embedding_windows_map[summary.dataset_id] = windows
         else:
             print(f"[warn] Embedding bundle {bundle_path} produced no window entries for dataset {summary.dataset_id}")
         embedding_path_map[summary.dataset_id] = bundle_path
+
+        if use_positive_augmentation:
+            raw_aug_entry = requested_aug_paths[idx] if idx < len(requested_aug_paths) else None
+            resolved_aug_path: Optional[Path] = None
+            aug_records: List[Dict[str, object]] = []
+            if raw_aug_entry:
+                token = str(raw_aug_entry).strip()
+                if token and token.lower() not in {"none", "null"}:
+                    candidate = Path(token).expanduser()
+                    if not candidate.is_absolute():
+                        candidate = _canonical_path(root, token)
+                    try:
+                        resolved_aug_path = candidate.resolve()
+                    except Exception:
+                        resolved_aug_path = candidate
+            else:
+                resolved_aug_path = (bundle_path.parent / "positive_augmentation.npz").resolve()
+
+            if resolved_aug_path is not None:
+                aug_records = _load_augmented_embedding_windows(resolved_aug_path)
+                if aug_records:
+                    augmentation_windows_map[summary.dataset_id] = aug_records
+                    print(
+                        f"[info] Positive augmentation: dataset {summary.dataset_id} -> {len(aug_records)} augmented windows ({resolved_aug_path})"
+                    )
+                elif resolved_aug_path.exists():
+                    print(
+                        f"[info] Positive augmentation bundle {resolved_aug_path} contains no augmented records for dataset {summary.dataset_id}"
+                    )
+            else:
+                print(
+                    f"[warn] Positive augmentation requested but no bundle path configured for dataset {summary.dataset_id}; skipping."
+                )
+
+            augmentation_stats[summary.dataset_id] = {
+                "bundle_path": str(resolved_aug_path) if resolved_aug_path is not None else None,
+                "base_windows": base_window_count,
+                "augmented_windows": len(aug_records),
+                "total_windows_with_augmented": base_window_count + len(aug_records),
+            }
 
     ordered_dataset_ids = [ds.dataset_id for ds in datasets]
 
@@ -1505,6 +1586,18 @@ def main() -> None:
 
     dataset_resolution_map = _compute_dataset_resolutions(tile_geoms_index) if tile_geoms_index else {}
     embedding_spacing_map = _compute_embedding_spacing_map(embedding_windows_map) if embedding_windows_map else {}
+    embedding_windows_with_aug: Optional[Dict[str, List[Dict[str, object]]]] = None
+    embedding_spacing_with_aug: Optional[Dict[str, float]] = None
+    if use_positive_augmentation and augmentation_windows_map:
+        embedding_windows_with_aug = {
+            key: list(records) for key, records in embedding_windows_map.items()
+        }
+        for dataset_id, aug_records in augmentation_windows_map.items():
+            combined = embedding_windows_with_aug.setdefault(dataset_id, [])
+            combined.extend(aug_records)
+        embedding_spacing_with_aug = (
+            _compute_embedding_spacing_map(embedding_windows_with_aug) if embedding_windows_with_aug else {}
+        )
 
     label_union = sorted({label for ds in datasets for label in ds.label_names})
     region_union = sorted({region for ds in datasets for region in ds.region_keys})
@@ -1568,6 +1661,22 @@ def main() -> None:
         ],
         "label_union": label_union,
     }
+
+    if use_positive_augmentation:
+        payload["positive_augmentation"] = {
+            "enabled": True,
+            "datasets": {
+                dataset_id: {
+                    "bundle_path": stats.get("bundle_path"),
+                    "base_windows": int(stats.get("base_windows", 0)),
+                    "augmented_windows": int(stats.get("augmented_windows", 0)),
+                    "total_windows_with_augmented": int(stats.get("total_windows_with_augmented", 0)),
+                }
+                for dataset_id, stats in augmentation_stats.items()
+            },
+        }
+    else:
+        payload["positive_augmentation"] = {"enabled": False}
 
     overlap_boundary_path: Optional[Path] = None
     if overlap_geom_equal is not None and shapely_shape is not None and mapping is not None and not overlap_geom_equal.is_empty:
@@ -1707,6 +1816,24 @@ def main() -> None:
             for pair_label, pair_path in sorted(overlap_pairs_outputs.items()):
                 print(f"[info] Wrote overlap pair summary for {pair_label} to {pair_path}")
     payload["study_area_overlap_pairs"] = overlap_pairs_outputs
+
+    augmented_overlap_pairs_outputs: Dict[str, str] = {}
+    if use_positive_augmentation and embedding_windows_with_aug:
+        augmented_overlap_pairs_outputs = _write_overlap_pairs(
+            tile_geoms_index,
+            overlap_geom_equal,
+            pair_output_root,
+            target_crs,
+            dataset_resolution_map,
+            embedding_windows_with_aug,
+            embedding_spacing_with_aug,
+            suffix="_augmented",
+            variant_label="positive_augmentation",
+        )
+        if augmented_overlap_pairs_outputs:
+            for pair_label, pair_path in sorted(augmented_overlap_pairs_outputs.items()):
+                print(f"[info] Wrote overlap pair summary (augmented) for {pair_label} to {pair_path}")
+    payload["study_area_overlap_pairs_augmented"] = augmented_overlap_pairs_outputs if augmented_overlap_pairs_outputs else None
 
     if args.visualize:
         if visual_base is None:

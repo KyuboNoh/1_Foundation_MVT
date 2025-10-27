@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
@@ -35,17 +36,30 @@ from Common.metrics_logger import DEFAULT_METRIC_ORDER, log_metrics, normalize_m
 from src.gfm4mpm.infer.infer_maps import group_positive_coords, mc_predict_map, write_prediction_outputs
 
 class LabeledPatches(Dataset):
-    def __init__(self, stack, coords, labels, window=32):
-        self.stack, self.coords, self.labels, self.window = stack, coords, labels, window
+    def __init__(self, stack, coords, labels, window=32, extra_samples: Optional[Sequence[Tuple[np.ndarray, int]]] = None):
+        self.stack = stack
+        self.coords = list(coords)
+        self.labels = list(labels)
+        self.window = window
+        self.extra: List[Tuple[np.ndarray, int]] = []
+        if extra_samples:
+            for patch, label in extra_samples:
+                arr = np.asarray(patch, dtype=np.float32)
+                self.extra.append((arr, int(label)))
 
     def __len__(self):
-        return len(self.coords)
+        return len(self.coords) + len(self.extra)
 
     def __getitem__(self, idx):
-        coord = self.coords[idx]
-        x = read_stack_patch(self.stack, coord, self.window)
-        y = self.labels[idx]
-        return torch.from_numpy(x), torch.tensor(y, dtype=torch.long)
+        if idx < len(self.coords):
+            coord = self.coords[idx]
+            x = read_stack_patch(self.stack, coord, self.window)
+            y = self.labels[idx]
+        else:
+            patch, label = self.extra[idx - len(self.coords)]
+            x = patch
+            y = label
+        return torch.from_numpy(x).float(), torch.tensor(y, dtype=torch.long)
 
 
 if __name__ == '__main__':
@@ -53,8 +67,8 @@ if __name__ == '__main__':
     ap.add_argument('--bands', help='glob to raster bands (e.g. /data/*.tif)')
     ap.add_argument('--stac-root', help='STAC collection root (table workflow)')
     ap.add_argument('--stac-table', help='Direct path to STAC Parquet table asset')
-    ap.add_argument('--splits', required=True)
-    ap.add_argument('--encoder', required=True)
+    ap.add_argument('--step1', required=True)
+    ap.add_argument('--step2', required=True)
     ap.add_argument('--out', required=True)
     ap.add_argument('--batch', type=int, default=32)
     ap.add_argument('--epochs', type=int, default=60)
@@ -62,6 +76,7 @@ if __name__ == '__main__':
     ap.add_argument('--stride', type=int, default=None, help='Stride for sliding window inference (in pixels)')
     ap.add_argument('--passes', type=int, default=10, help='Number of stochastic forward passes for MC-Dropout')
     ap.add_argument('--debug', action='store_true', help='Generate debug plots for labels and feature rasters')
+    ap.add_argument('--positive-augmentation', action='store_true', help='Include augmented positive patches from the encoder directory.')
 
     ap.add_argument('--test-ratio', type=float, default=0.3, help='Fraction of data to use for validation')
     ap.add_argument('--random-seed', type=int, default=42, help='Random seed for data splits and shuffling')
@@ -78,19 +93,32 @@ if __name__ == '__main__':
     metrics_summary["save_prediction"] = bool(args.save_prediction)
     metrics_summary["plot_prediction"] = bool(args.plot_prediction)
     metrics_summary["passes"] = int(args.passes)
+    metrics_summary["positive_augmentation"] = bool(args.positive_augmentation)
 
     modes = [bool(args.bands), bool(args.stac_root), bool(args.stac_table)]
     if sum(modes) != 1:
         ap.error('Provide either --bands or one of --stac-root/--stac-table (exactly one input source)')
 
-    encoder_path = Path(args.encoder).resolve()
+    encoder_input_path = Path(args.step1).resolve()
+    if encoder_input_path.is_dir():
+        encoder_dir = encoder_input_path
+        weight_candidates = sorted(encoder_dir.glob('mae_encoder*.pth'))
+        if not weight_candidates:
+            raise FileNotFoundError(f"No mae_encoder*.pth found inside {encoder_dir}")
+        encoder_weights_path = weight_candidates[0]
+    else:
+        encoder_weights_path = encoder_input_path
+        encoder_dir = encoder_weights_path.parent
+    if not encoder_weights_path.exists():
+        raise FileNotFoundError(f"Encoder weights not found at {encoder_weights_path}")
+    metrics_summary["encoder_weights"] = str(encoder_weights_path)
     label_column = 'Training_MVT_Deposit'
 
     load_result = load_split_stack(
         args.stac_root,
         args.stac_table,
         args.bands,
-        encoder_path,
+        encoder_weights_path,
         label_column,
         load_training_args,
         load_training_metadata,
@@ -100,6 +128,63 @@ if __name__ == '__main__':
     )
 
     stack = load_result.stack
+    augmented_patches_all: Optional[np.ndarray] = None
+    augmented_sources_all: Optional[np.ndarray] = None
+    augmented_embeddings_all: Optional[np.ndarray] = None
+    augmented_plot_coords: List[Tuple[str, int, int]] = []
+
+    if args.positive_augmentation:
+        aug_path = Path(args.step2) / 'positive_augmentation.npz'
+        if not aug_path.exists():
+            print(f'[warn] positive_augmentation.npz not found at {aug_path}; disabling --positive-augmentation.')
+            args.positive_augmentation = False
+        else:
+            try:
+                with np.load(aug_path, allow_pickle=True) as aug_npz:
+                    tile_data_all = np.asarray(aug_npz['tile_data'], dtype=object)
+                    is_augmented = np.asarray(aug_npz['is_augmented'], dtype=bool)
+                    if not is_augmented.any():
+                        print('[warn] positive_augmentation.npz contains no augmented samples; disabling --positive-augmentation.')
+                        args.positive_augmentation = False
+                    else:
+                        source_index_all = np.asarray(aug_npz['source_index'], dtype=int)
+                        embeddings_all = np.asarray(aug_npz['embeddings'], dtype=np.float32)
+                        tile_data_masked = tile_data_all[is_augmented]
+                        augmented_patches_all = np.stack([np.asarray(arr, dtype=np.float32) for arr in tile_data_masked], axis=0)
+                        augmented_sources_all = source_index_all[is_augmented]
+                        augmented_embeddings_all = embeddings_all[is_augmented]
+                        metadata_all = aug_npz.get('metadata')
+                        augmentation_params_all = aug_npz.get('augmentation_params')
+                        if metadata_all is not None and augmentation_params_all is not None:
+                            meta_masked = np.asarray(metadata_all, dtype=object)[is_augmented]
+                            params_masked = np.asarray(augmentation_params_all, dtype=object)[is_augmented]
+                            for meta, params in zip(meta_masked, params_masked):
+                                if not isinstance(meta, dict):
+                                    continue
+                                region = str(meta.get('region') or meta.get('Region') or 'GLOBAL')
+                                row = meta.get('row')
+                                col = meta.get('col')
+                                try:
+                                    row = int(row)
+                                    col = int(col)
+                                except Exception:
+                                    continue
+                                if isinstance(params, dict):
+                                    try:
+                                        row += int(params.get('shift_rows', 0))
+                                        col += int(params.get('shift_cols', 0))
+                                    except Exception:
+                                        pass
+                                augmented_plot_coords.append((region, row, col))
+                        metrics_summary['positive_augmented_total'] = int(augmented_patches_all.shape[0])
+            except Exception as exc:
+                print(f'[warn] Failed to load positive_augmentation.npz: {exc}')
+                args.positive_augmentation = False
+                augmented_patches_all = None
+                augmented_sources_all = None
+                augmented_embeddings_all = None
+    else:
+        args.positive_augmentation = False
     training_args_data = load_result.training_args
     metrics_summary["input_mode"] = load_result.mode
     if load_result.training_args_path is not None:
@@ -125,7 +210,7 @@ if __name__ == '__main__':
     stride = args.stride if args.stride is not None else window_size
     metrics_summary["stride"] = int(stride)
 
-    state_dict = torch.load(encoder_path, map_location='cpu')
+    state_dict = torch.load(encoder_weights_path, map_location='cpu')
     patch_proj = state_dict.get('patch.proj.weight')
     if isinstance(patch_proj, torch.Tensor):
         expected_channels = patch_proj.shape[1]
@@ -149,7 +234,7 @@ if __name__ == '__main__':
     else:
         default_region = "GLOBAL"
 
-    with open(args.splits) as f:
+    with open(Path(args.step2)/"splits.json") as f:
         sp = json.load(f)
     pos_coords = [normalize_region_coord(entry, default_region=default_region) for entry in sp['pos']]
     neg_coords = [normalize_region_coord(entry, default_region=default_region) for entry in sp['neg']]
@@ -193,6 +278,7 @@ if __name__ == '__main__':
     coords = [coord for coord, _ in coords_with_labels]
     labels = [lab for _, lab in coords_with_labels]
     pos_coords_final = [coord for coord, lab in coords_with_labels if lab == 1]
+    pos_coord_to_index = {tuple(coord): idx for idx, coord in enumerate(pos_coords_final)}
     neg_coords_final = [coord for coord, lab in coords_with_labels if lab == 0]
 
     if not coords_with_labels:
@@ -215,6 +301,7 @@ if __name__ == '__main__':
                     pos_coords_final,
                     neg_coords_final,
                     Path(args.out),
+                    augmented_coords=augmented_plot_coords if (args.positive_augmentation and augmented_plot_coords) else None,
                 )
             except Exception as exc:
                 print(f"[warn] Failed to generate debug visualisations: {exc}")
@@ -231,8 +318,33 @@ if __name__ == '__main__':
     metrics_summary["val_pos"] = val_pos
     metrics_summary["val_neg"] = len(Xval) - val_pos
 
-    ds_tr = LabeledPatches(stack, Xtr, ytr, window=window_size)
+    extra_train_samples: List[Tuple[np.ndarray, int]] = []
+    train_aug_sources = np.array([], dtype=int)
+    if args.positive_augmentation and augmented_patches_all is not None and augmented_sources_all is not None:
+        train_pos_indices: set[int] = set()
+        for coord, label in zip(Xtr, ytr):
+            if label == 1:
+                idx = pos_coord_to_index.get(tuple(coord))
+                if idx is not None:
+                    train_pos_indices.add(idx)
+        if train_pos_indices:
+            mask_train_aug = np.isin(augmented_sources_all, list(train_pos_indices))
+            if mask_train_aug.any():
+                train_aug_patches = augmented_patches_all[mask_train_aug]
+                train_aug_sources = augmented_sources_all[mask_train_aug]
+                extra_train_samples = [(patch, 1) for patch in train_aug_patches]
+                metrics_summary['train_augmented'] = int(len(train_aug_sources))
+        else:
+            train_aug_sources = np.array([], dtype=int)
+    else:
+        train_aug_sources = np.array([], dtype=int)
+    if 'train_augmented' not in metrics_summary:
+        metrics_summary['train_augmented'] = int(len(extra_train_samples))
+    metrics_summary['train_samples_with_aug'] = len(Xtr) + len(extra_train_samples)
+    ds_tr = LabeledPatches(stack, Xtr, ytr, window=window_size, extra_samples=extra_train_samples)
     ds_va = LabeledPatches(stack, Xval, yval, window=window_size)
+    if extra_train_samples:
+        print(f'[info] Added {len(extra_train_samples)} augmented positive samples to training loader.')
     worker_count = 0 if getattr(stack, 'kind', None) == 'raster' else 8
     if worker_count == 0:
         print('[info] Using single-process data loading for raster stack')
@@ -287,6 +399,48 @@ if __name__ == '__main__':
         "classifier_path": str(out_path),
         "saved_prediction_arrays": bool(args.save_prediction),
     }
+    if args.positive_augmentation and augmented_patches_all is not None and augmented_patches_all.size:
+        try:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            encoder.eval().to(device)
+            mlp.eval().to(device)
+            preds_list: List[np.ndarray] = []
+            for start_idx in range(0, augmented_patches_all.shape[0], batch_size):
+                patch_chunk = torch.from_numpy(augmented_patches_all[start_idx:start_idx + batch_size]).float().to(device)
+                with torch.no_grad():
+                    z_chunk = encoder.encode(patch_chunk)
+                    p_chunk = mlp(z_chunk).cpu().numpy().reshape(-1)
+                preds_list.append(p_chunk)
+            if preds_list:
+                aug_probs = np.concatenate(preds_list, axis=0)
+            else:
+                aug_probs = np.empty(0, dtype=np.float32)
+            metrics_summary['augmented_predictions'] = {
+                'count': int(aug_probs.size),
+                'mean': float(np.mean(aug_probs)) if aug_probs.size else float('nan'),
+                'min': float(np.min(aug_probs)) if aug_probs.size else float('nan'),
+                'max': float(np.max(aug_probs)) if aug_probs.size else float('nan'),
+            }
+            try:
+                fig, ax = plt.subplots(figsize=(9, 4))
+                jitter = np.random.uniform(-0.1, 0.1, size=aug_probs.size) if aug_probs.size else np.array([])
+                ax.scatter(augmented_sources_all + jitter, aug_probs, s=30, facecolors='none', edgecolors='orange', linewidths=0.8)
+                ax.set_xlabel('Original positive index')
+                ax.set_ylabel('Augmented prediction probability')
+                ax.set_ylim(0, 1)
+                ax.set_title('Augmented Positive Predictions')
+                aug_plot_path = out_dir / 'augmented_positive_predictions.png'
+                fig.tight_layout()
+                fig.savefig(aug_plot_path, dpi=200)
+                plt.close(fig)
+                outputs_summary['augmented_prediction_plot'] = str(aug_plot_path)
+            except Exception as plot_exc:
+                print(f'[warn] Failed to plot augmented predictions: {plot_exc}')
+        except Exception as aug_exc:
+            print(f'[warn] Failed to compute augmented predictions: {aug_exc}')
+            metrics_summary['augmented_predictions'] = {'count': 0, 'mean': float('nan'), 'min': float('nan'), 'max': float('nan')}
+    elif args.positive_augmentation:
+        print('[warn] Positive augmentation was requested but no augmented samples were available after preprocessing.')
 
     metrics_json_path = Path(args.out) / "metrics.json"
     try:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -48,6 +48,8 @@ def visualize_debug_features(
     pos_coords: Sequence[Tuple[str, int, int]],
     neg_coords: Sequence[Tuple[str, int, int]],
     out_dir: Path,
+    *,
+    augmented_coords: Optional[Sequence[Tuple[str, int, int]]] = None,
 ) -> None:
     """Persist debug plots showing label locations and feature rasters per region."""
     if xy is None or array_bounds is None:
@@ -64,6 +66,11 @@ def visualize_debug_features(
     neg_by_region: Dict[str, List[Tuple[int, int]]] = {}
     for region, row, col in neg_coords:
         neg_by_region.setdefault(str(region), []).append((int(row), int(col)))
+
+    aug_by_region: Dict[str, List[Tuple[int, int]]] = {}
+    if augmented_coords:
+        for region, row, col in augmented_coords:
+            aug_by_region.setdefault(str(region), []).append((int(row), int(col)))
 
     feature_labels = list(feature_names) if feature_names else []
 
@@ -83,9 +90,11 @@ def visualize_debug_features(
 
         region_pos = pos_by_region.get(region_name, [])
         region_neg = neg_by_region.get(region_name, [])
+        region_aug = aug_by_region.get(region_name, [])
 
         pos_x, pos_y = _coords_to_xy(transform, region_pos)
         neg_x, neg_y = _coords_to_xy(transform, region_neg)
+        aug_x, aug_y = _coords_to_xy(transform, region_aug)
 
         fig, ax = plt.subplots(figsize=(8, 6))
         ax.set_title(f"Label Distribution - {region_name}")
@@ -93,11 +102,23 @@ def visualize_debug_features(
         ax.set_ylim(extent[2], extent[3])
         ax.set_xlabel("Longitude")
         ax.set_ylabel("Latitude")
+        if aug_x.size:
+            ax.scatter(
+                aug_x,
+                aug_y,
+                s=15,
+                # facecolors="none",
+                facecolors="orange",
+                edgecolors="orange",
+                marker="o",
+                linewidths=1.0,
+                label="Positive (aug)",
+            )
         if neg_x.size:
             ax.scatter(neg_x, neg_y, s=10, c="gold", marker="x", label="Negative")
         if pos_x.size:
-            ax.scatter(pos_x, pos_y, s=14, c="red", marker="o", label="Positive", edgecolors="white", linewidths=0.3)
-        if pos_x.size or neg_x.size:
+            ax.scatter(pos_x, pos_y, s=20, facecolors="none", marker="o", label="Positive", edgecolors="red", linewidths=1.0)
+        if pos_x.size or neg_x.size or aug_x.size:
             ax.legend(loc="upper right")
         span_x = extent[1] - extent[0]
         span_y = extent[3] - extent[2]
@@ -158,7 +179,18 @@ def visualize_debug_features(
                 ax.scatter(neg_x, neg_y, s=10, c="gold", marker="x", label="Negative")
             if pos_x.size:
                 ax.scatter(pos_x, pos_y, s=14, c="red", marker="o", edgecolors="white", linewidths=0.3, label="Positive")
-            if pos_x.size or neg_x.size:
+            if aug_x.size:
+                ax.scatter(
+                    aug_x,
+                    aug_y,
+                    s=15,
+                    facecolors="none",
+                    edgecolors="orange",
+                    marker="o",
+                    linewidths=1.0,
+                    label="Positive (aug)",
+                )
+            if pos_x.size or neg_x.size or aug_x.size:
                 ax.legend(loc="upper right")
             ax.set_xlabel("Longitude")
             ax.set_ylabel("Latitude")

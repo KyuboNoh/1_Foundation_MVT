@@ -84,42 +84,9 @@ def load_npz_embeddings(path: Path, positive_label: int = 1) -> List[EmbeddingRe
 
 def load_records(embedding_path: Path, metadata_path: Optional[Path] = None, region_filter: Optional[Iterable[str]] = None) -> List[EmbeddingRecord]:
     suffix = embedding_path.suffix.lower()
-    if suffix == ".npz":
-        records = load_npz_embeddings(embedding_path)
-        if len(records) <= 1:
-            base_dir = embedding_path.parent
-            npy_path = embedding_path.with_suffix(".npy")
-            if npy_path.exists():
-                lbl = base_dir / "labels.npy"
-                tids = base_dir / "tile_ids.npy"
-                coords = base_dir / "coords.npy"
-                if lbl.exists():
-                    try:
-                        records = load_npy_embeddings(
-                            npy_path,
-                            lbl,
-                            tids if tids.exists() else None,
-                            coords if coords.exists() else None,
-                        )
-                        print(f"[info] load_records: npz fallback loaded {len(records)} entries from {npy_path}")
-                    except Exception as exc:
-                        print(f"[warn] load_records: failed to load fallback {npy_path}: {exc}")
-    elif suffix == ".npy":
-        base_dir = embedding_path.parent
-        lbl = labels_path if labels_path is not None else (base_dir / "labels.npy")
-        tids = tile_ids_path if tile_ids_path is not None else (base_dir / "tile_ids.npy")
-        coords = coords_path if coords_path is not None else (base_dir / "coords.npy")
-        if isinstance(lbl, Path) and lbl.exists():
-            records = load_npy_embeddings(
-                embedding_path,
-                lbl,
-                tids if isinstance(tids, Path) and tids.exists() else None,
-                coords if isinstance(coords, Path) and coords.exists() else None,
-            )
-        else:
-            raise ValueError(f"labels array required when loading {embedding_path}")
-    else:
-        raise ValueError(f"Unsupported embedding file extension for {embedding_path}")
+    if suffix != ".npz":
+        raise ValueError(f"Unsupported embedding file extension for {embedding_path}. Expected '.npz'.")
+    records = load_npz_embeddings(embedding_path)
 
     original_count = len(records)
     if metadata_path is None:
