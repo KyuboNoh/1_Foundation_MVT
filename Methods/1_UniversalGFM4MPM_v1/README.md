@@ -37,13 +37,17 @@ The stage-1 trainer freezes encoder features and optimises only the projection
 heads using a positive-only, negative-free alignment loss.
 
 ```bash
-python -m Methods.1_UniversalGFM4MPM_v1.overlap_alignment.train --config /home/qubuntu25/Desktop/Research/Data/2_UFM_v1/config_ufm_v1_debug.json --debug --use-positive-only --use-positive-augmentation
+python -m Methods.1_UniversalGFM4MPM_v1.overlap_alignment.train --config /home/qubuntu25/Desktop/Research/Data/2_UFM_v1/config_ufm_v1_debug.json --debug 
 ```
+
+```bash
+python -m Methods.1_UniversalGFM4MPM_v1.overlap_alignment.train --config /home/qubuntu25/Desktop/Research/Data/2_UFM_v1/config_ufm_v1_debug.json --debug --projection-dim 512 --use-positive-only --use-positive-augmentation
+```
+
 
 By default the trainer:
 
-- Groups fine-scale tiles into coarse windows via weighted pooling (settable
-  with `--aggregator`).
+- Groups fine-scale tiles into coarse windows via weighted pooling (settable with `--aggregator`).
 - Optimises a Deep CCA objective (overrideable via `--objective`; `barlow`
   raises a “not implemented” placeholder) and reports per-epoch loss / mean
   correlation with a progress bar when `tqdm` is available.
@@ -55,11 +59,9 @@ By default the trainer:
   requires matplotlib) alongside the standard logs.
 
 Outputs:
-- `overlap_alignment_stage1.pt` – projection-head weights plus an experiment
-  summary.
+- `overlap_alignment_stage1.pt` – projection-head weights plus an experiment summary.
 - `overlap_alignment_stage1_metrics.json` – JSON dump of the summary and the
-  full epoch history (loss, mean canonical correlation) for downstream
-  analysis.
+  full epoch history (loss, mean canonical correlation) for downstream analysis.
 
 ## Next steps
 

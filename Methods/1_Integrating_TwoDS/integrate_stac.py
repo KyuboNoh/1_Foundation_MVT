@@ -17,7 +17,9 @@ import math
 import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
+from Common.overlap_debug_plot import save_overlap_debug_plot
 from itertools import combinations
 
 try:
@@ -753,6 +755,11 @@ def _load_embedding_windows(bundle_path: Path) -> List[Dict[str, object]]:
                     pixel_resolution_float = float(pixel_resolution) if pixel_resolution is not None else None
                 except Exception:
                     pixel_resolution_float = None
+                label_val = meta_dict.get("label") if isinstance(meta_dict, dict) else None
+                try:
+                    label_int = int(label_val) if label_val is not None else None
+                except Exception:
+                    label_int = None
                 records.append(
                     {
                         "tile_id": tile_id,
@@ -763,6 +770,8 @@ def _load_embedding_windows(bundle_path: Path) -> List[Dict[str, object]]:
                         "path": meta_dict.get("path") or meta_dict.get("source_path"),
                         "pixel_resolution": pixel_resolution_float,
                         "metadata": meta_dict,
+                        "label": label_int,
+                        "is_augmented": False,
                     }
                 )
     except Exception as exc:
@@ -817,6 +826,11 @@ def _load_augmented_embedding_windows(bundle_path: Path) -> List[Dict[str, objec
                 except Exception:
                     col_int = None
                 source_tile_id = meta_dict.get("source_tile_id") or tile_ids[idx].split("__")[0]
+                label_val = meta_dict.get("label") if isinstance(meta_dict, dict) else None
+                try:
+                    label_int = int(label_val) if label_val is not None else 1
+                except Exception:
+                    label_int = 1
                 records.append(
                     {
                         "tile_id": str(tile_ids[idx]),
@@ -826,6 +840,7 @@ def _load_augmented_embedding_windows(bundle_path: Path) -> List[Dict[str, objec
                         "col": col_int,
                         "source_tile_id": source_tile_id,
                         "is_augmented": True,
+                        "label": label_int,
                     }
                 )
     except Exception as exc:
@@ -880,6 +895,30 @@ def _determine_alignment_roles(
     return (ds_a, ds_b) if ds_a.lower() <= ds_b.lower() else (ds_b, ds_a)
 
 
+def _record_label_value(record: Optional[Dict[str, object]]) -> Optional[int]:
+    if not isinstance(record, dict):
+        return None
+    label_val = record.get("label")
+    if label_val is None and isinstance(record.get("metadata"), dict):
+        meta = record["metadata"]
+        label_val = meta.get("label") or meta.get("Label")
+    try:
+        return int(label_val) if label_val is not None else None
+    except Exception:
+        return None
+
+
+def _record_is_augmented(record: Optional[Dict[str, object]]) -> bool:
+    if not isinstance(record, dict):
+        return False
+    flag = record.get("is_augmented")
+    if isinstance(flag, bool):
+        return flag
+    if flag in {1, "1", "true", "True"}:
+        return True
+    return False
+
+
 def _build_embedding_pair_record(
     ds_a: str,
     ds_b: str,
@@ -928,14 +967,26 @@ def _build_embedding_pair_record(
         val = rec.get("tile_id")
         return str(val) if val is not None else None
 
+    native_a = _native_point(rec_a)
+    native_b = _native_point(rec_b)
+    centroid_override = None
+    if native_a is not None and native_b is not None:
+        centroid_override = [
+            float((native_a[0] + native_b[0]) / 2.0),
+            float((native_a[1] + native_b[1]) / 2.0),
+        ]
     return {
         "dataset_0_row_col": _row_col(rec_a),
-        "dataset_0_native_point": _native_point(rec_a),
+        "dataset_0_native_point": native_a,
         "dataset_0_lookup": _lookup(rec_a),
+        "dataset_0_label": _record_label_value(rec_a),
+        "dataset_0_is_augmented": _record_is_augmented(rec_a),
         "dataset_1_row_col": _row_col(rec_b),
-        "dataset_1_native_point": _native_point(rec_b),
+        "dataset_1_native_point": native_b,
         "dataset_1_lookup": _lookup(rec_b),
-        "overlap_centerloid": centroid_list,
+        "dataset_1_label": _record_label_value(rec_b),
+        "dataset_1_is_augmented": _record_is_augmented(rec_b),
+        "overlap_centerloid": centroid_override or centroid_list,
     }
 
 
@@ -1187,14 +1238,27 @@ def _generate_raster_overlap_pairs(
                 except Exception:
                     return None
 
+            native_list_a = _native_list(native_a)
+            native_list_b = _native_list(native_b)
+            centroid_override = None
+            if native_list_a is not None and native_list_b is not None:
+                centroid_override = [
+                    float((native_list_a[0] + native_list_b[0]) / 2.0),
+                    float((native_list_a[1] + native_list_b[1]) / 2.0),
+                ]
+
             aggregated[key] = {
                 "dataset_0_row_col": _row_col(row_a, col_a),
-                "dataset_0_native_point": _native_list(native_a),
+                "dataset_0_native_point": native_list_a,
                 "dataset_0_lookup": tile_id_a,
+                "dataset_0_label": None,
+                "dataset_0_is_augmented": False,
                 "dataset_1_row_col": _row_col(row_b, col_b),
-                "dataset_1_native_point": _native_list(native_b),
+                "dataset_1_native_point": native_list_b,
                 "dataset_1_lookup": tile_id_b,
-                "overlap_centerloid": [centroid_x, centroid_y],
+                "dataset_1_label": None,
+                "dataset_1_is_augmented": False,
+                "overlap_centerloid": centroid_override or [centroid_x, centroid_y],
             }
 
     if not aggregated:
@@ -1232,6 +1296,14 @@ def _compute_dataset_resolutions(tile_geoms: Dict[str, List[Dict[str, object]]])
     return resolutions
 
 
+@dataclass
+class _PairVariantSpec:
+    key: str
+    suffix: str = ""
+    pair_label: Optional[str] = None
+    filter_fn: Optional[Callable[[Dict[str, object]], bool]] = None
+
+
 def _write_overlap_pairs(
     tile_geoms: Dict[str, List[Dict[str, object]]],
     overlap_geom: Optional[Polygon],
@@ -1240,9 +1312,8 @@ def _write_overlap_pairs(
     dataset_resolutions: Optional[Dict[str, float]] = None,
     embedding_windows: Optional[Dict[str, List[Dict[str, object]]]] = None,
     embedding_spacing: Optional[Dict[str, Optional[float]]] = None,
-    suffix: str = "",
-    variant_label: Optional[str] = None,
-) -> Dict[str, str]:
+    variants: Optional[Sequence[_PairVariantSpec]] = None,
+) -> Dict[str, Dict[str, str]]:
     if dataset_resolutions is None:
         dataset_resolutions = _compute_dataset_resolutions(tile_geoms)
     data_dir = target_dir / "data"
@@ -1250,12 +1321,9 @@ def _write_overlap_pairs(
 
     embedding_windows = embedding_windows or {}
     embedding_spacing = embedding_spacing or {}
-
-    pair_outputs: Dict[str, str] = {}
-    suffix_token = suffix or ""
-    if suffix_token and not suffix_token.startswith("_"):
-        suffix_token = f"_{suffix_token}"
-    label_suffix = suffix_token
+    if not variants:
+        variants = [_PairVariantSpec(key="default", suffix="", pair_label=None, filter_fn=None)]
+    outputs: Dict[str, Dict[str, str]] = {spec.key: {} for spec in variants}
 
     all_dataset_ids = sorted(set(tile_geoms.keys()) | set(embedding_windows.keys()))
 
@@ -1298,44 +1366,54 @@ def _write_overlap_pairs(
         search_radius = meta.get("search_radius") if isinstance(meta.get("search_radius"), (int, float)) else None
         generated_from = meta.get("generated_from") if isinstance(meta.get("generated_from"), str) else None
 
-        pair_name = f"{ds_a}_{ds_b}_overlap_pairs{suffix_token}.json"
-        output_path = data_dir / pair_name
-        try:
-            with output_path.open("w", encoding="utf-8") as fh:
-                overlap_info = None
-                if overlap_geom is not None and mapping is not None and not overlap_geom.is_empty:
-                    try:
-                        geom_mapping = mapping(overlap_geom)
-                    except Exception:
-                        geom_mapping = None
-                    overlap_info = {
-                        "crs": target_crs.to_string() if target_crs is not None else None,
-                        "area": float(overlap_geom.area),
-                        "bounds": list(overlap_geom.bounds),
-                        "geometry": geom_mapping,
+        for spec in variants:
+            filtered_records = records
+            if spec.filter_fn is not None:
+                filtered_records = [rec for rec in records if spec.filter_fn(rec)]
+            if not filtered_records:
+                continue
+            suffix_token = spec.suffix or ""
+            if suffix_token and not suffix_token.startswith("_"):
+                suffix_token = f"_{suffix_token}"
+            label_suffix = suffix_token
+            pair_name = f"{ds_a}_{ds_b}_overlap_pairs{suffix_token}.json"
+            output_path = data_dir / pair_name
+            try:
+                with output_path.open("w", encoding="utf-8") as fh:
+                    overlap_info = None
+                    if overlap_geom is not None and mapping is not None and not overlap_geom.is_empty:
+                        try:
+                            geom_mapping = mapping(overlap_geom)
+                        except Exception:
+                            geom_mapping = None
+                        overlap_info = {
+                            "crs": target_crs.to_string() if target_crs is not None else None,
+                            "area": float(overlap_geom.area),
+                            "bounds": list(overlap_geom.bounds),
+                            "geometry": geom_mapping,
+                        }
+                    doc = {
+                        "dataset_pair": meta.get("dataset_pair", [ds_a, ds_b]),
+                        "alignment_roles": alignment_roles,
+                        "dataset_resolutions": {
+                            ds_a: float(dataset_resolutions.get(ds_a)) if ds_a in dataset_resolutions else None,
+                            ds_b: float(dataset_resolutions.get(ds_b)) if ds_b in dataset_resolutions else None,
+                        },
+                        "approx_spacing": approx_spacing,
+                        "search_radius": search_radius,
+                        "raw_pair_candidates": raw_candidates,
+                        "generated_from": generated_from or ("embedding_windows" if use_embedding else "tile_bounds"),
+                        "overlap": overlap_info,
+                        "pairs": filtered_records,
                     }
-                doc = {
-                    "dataset_pair": meta.get("dataset_pair", [ds_a, ds_b]),
-                    "alignment_roles": alignment_roles,
-                    "dataset_resolutions": {
-                        ds_a: float(dataset_resolutions.get(ds_a)) if ds_a in dataset_resolutions else None,
-                        ds_b: float(dataset_resolutions.get(ds_b)) if ds_b in dataset_resolutions else None,
-                    },
-                    "approx_spacing": approx_spacing,
-                    "search_radius": search_radius,
-                    "raw_pair_candidates": raw_candidates,
-                    "generated_from": generated_from or ("embedding_windows" if use_embedding else "tile_bounds"),
-                    "overlap": overlap_info,
-                    "pairs": records,
-                }
-                if variant_label is not None:
-                    doc["pair_variant"] = variant_label
-                json.dump(doc, fh, indent=2)
-                pair_outputs[f"{ds_a}-{ds_b}{label_suffix}"] = str(output_path)
-        except Exception as exc:
-            print(f"[warn] Failed to write overlap pairs for {ds_a}-{ds_b}: {exc}")
+                    if spec.pair_label is not None:
+                        doc["pair_variant"] = spec.pair_label
+                    json.dump(doc, fh, indent=2)
+                    outputs.setdefault(spec.key, {})[f"{ds_a}-{ds_b}{label_suffix}"] = str(output_path)
+            except Exception as exc:
+                print(f"[warn] Failed to write overlap pairs for {ds_a}-{ds_b} ({spec.key}): {exc}")
 
-    return pair_outputs
+    return outputs
 
 
 def _build_union_feature_table(datasets: Sequence[DatasetSummary]) -> Dict[str, List[str]]:
@@ -1347,6 +1425,117 @@ def _build_union_feature_table(datasets: Sequence[DatasetSummary]) -> Dict[str, 
     for feature, owners in table.items():
         owners.sort()
     return dict(sorted(table.items(), key=lambda kv: kv[0].lower()))
+
+
+def _pair_label(record: Dict[str, object], index: int) -> Optional[int]:
+    key = f"dataset_{index}_label"
+    value = record.get(key)
+    try:
+        return int(value) if value is not None else None
+    except Exception:
+        return None
+
+
+def _pair_is_augmented(record: Dict[str, object], index: int) -> bool:
+    key = f"dataset_{index}_is_augmented"
+    value = record.get(key)
+    if isinstance(value, bool):
+        return value
+    if value in {1, "1", "true", "True"}:
+        return True
+    return False
+
+
+def _filter_positive_pair(record: Dict[str, object]) -> bool:
+    return _pair_label(record, 0) == 1 and _pair_label(record, 1) == 1
+
+
+def _filter_positive_non_augmented(record: Dict[str, object]) -> bool:
+    if not _filter_positive_pair(record):
+        return False
+    return (not _pair_is_augmented(record, 0)) and (not _pair_is_augmented(record, 1))
+
+
+def _filter_positive_augmented(record: Dict[str, object]) -> bool:
+    if not _filter_positive_pair(record):
+        return False
+    return _pair_is_augmented(record, 0) or _pair_is_augmented(record, 1)
+
+
+def _extract_overlap_samples(doc: Dict[str, object]) -> Tuple[List[Dict[str, object]], List[Dict[str, object]], List[Tuple[float, float]], str, str]:
+    dataset_pair = doc.get("dataset_pair") or ["dataset_0", "dataset_1"]
+    anchor_label = str(dataset_pair[0])
+    target_label = str(dataset_pair[1])
+    anchor_samples: List[Dict[str, object]] = []
+    target_samples: List[Dict[str, object]] = []
+    centroids: List[Tuple[float, float]] = []
+    for entry in doc.get("pairs", []):
+        for idx, container in ((0, anchor_samples), (1, target_samples)):
+            coord = entry.get(f"dataset_{idx}_native_point")
+            if coord is None:
+                continue
+            try:
+                x, y = float(coord[0]), float(coord[1])
+            except Exception:
+                continue
+            container.append(
+                {
+                    "coord": (x, y),
+                    "dataset": anchor_label if idx == 0 else target_label,
+                    "is_augmented": bool(entry.get(f"dataset_{idx}_is_augmented")),
+                }
+            )
+        centroid = entry.get("overlap_centerloid")
+        if centroid is not None:
+            try:
+                cx, cy = float(centroid[0]), float(centroid[1])
+                centroids.append((cx, cy))
+            except Exception:
+                pass
+    return anchor_samples, target_samples, centroids, anchor_label, target_label
+
+
+def _render_debug_plots(
+    path_map: Dict[str, str],
+    boundary_geometry: Optional[Dict[str, object]],
+    output_dir: Path,
+    base_filename: str,
+    title_prefix: str,
+    *,
+    include_centroids: bool = False,
+) -> None:
+    if not path_map:
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    entries = sorted(path_map.items())
+    multi = len(entries) > 1
+    for label, path_str in entries:
+        path = Path(path_str)
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                doc = json.load(handle)
+        except Exception:
+            continue
+        anchor_samples, target_samples, centroids, anchor_label, target_label = _extract_overlap_samples(doc)
+        if not anchor_samples and not target_samples:
+            continue
+        if multi:
+            safe_label = label.replace("/", "_").replace(" ", "_")
+            filename = f"{Path(base_filename).stem}_{safe_label}.png"
+        else:
+            filename = f"{Path(base_filename).stem}.png"
+        output_path = output_dir / filename
+        title = f"{title_prefix}: {anchor_label} vs {target_label}"
+        save_overlap_debug_plot(
+            output_path,
+            boundary_geometry,
+            anchor_samples,
+            target_samples,
+            title=title,
+            anchor_label=anchor_label,
+            target_label=target_label,
+            centroid_points=centroids if include_centroids else None,
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -1366,6 +1555,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bridge", action="append", default=[], help=( "Feature bridge specification across datasets. Use braces with segments separated by ';', one segment per dataset, e.g. \"{featA1, featA2; featB1}\" for two datasets. Repeat the flag for multiple bridge guesses."), )
     parser.add_argument("--region-select", type=str, default=None,help=("Optional region selection string matching the number of datasets, e.g. \"{NA,AU; GLOBAL}\" to keep regions NA and AU from dataset 1 and region GLOBAL from dataset 2. Use ALL or * to retain every region for a dataset."),)
     parser.add_argument("--visualize", action="store_true", help="Generate preview PNG/TIF copies for bridge features/labels.",)
+    parser.add_argument("--debug", action="store_true", dest="debug_overlap", help="Generate overlap debug plots for positive pairs.")
     return parser.parse_args()
 
 
@@ -1802,8 +1992,18 @@ def main() -> None:
 
     pair_output_root = visual_base if visual_base is not None else Path.cwd()
     overlap_pairs_outputs: Dict[str, str] = {}
+    overlap_pairs_positive: Dict[str, str] = {}
     if tile_geoms_index or embedding_windows_map:
-        overlap_pairs_outputs = _write_overlap_pairs(
+        base_variants = [
+            _PairVariantSpec(key="default", suffix="", pair_label=None, filter_fn=None),
+            _PairVariantSpec(
+                key="positive",
+                suffix="_positive",
+                pair_label="positive_only",
+                filter_fn=_filter_positive_non_augmented,
+            ),
+        ]
+        base_outputs = _write_overlap_pairs(
             tile_geoms_index,
             overlap_geom_equal,
             pair_output_root,
@@ -1811,15 +2011,30 @@ def main() -> None:
             dataset_resolution_map,
             embedding_windows_map,
             embedding_spacing_map,
+            variants=base_variants,
         )
+        overlap_pairs_outputs = base_outputs.get("default", {})
+        overlap_pairs_positive = base_outputs.get("positive", {})
         if overlap_pairs_outputs:
             for pair_label, pair_path in sorted(overlap_pairs_outputs.items()):
                 print(f"[info] Wrote overlap pair summary for {pair_label} to {pair_path}")
+        if overlap_pairs_positive:
+            for pair_label, pair_path in sorted(overlap_pairs_positive.items()):
+                print(f"[info] Wrote positive-overlap summary for {pair_label} to {pair_path}")
     payload["study_area_overlap_pairs"] = overlap_pairs_outputs
+    payload["study_area_overlap_pairs_positive"] = overlap_pairs_positive if overlap_pairs_positive else None
 
-    augmented_overlap_pairs_outputs: Dict[str, str] = {}
+    overlap_pairs_positive_aug: Dict[str, str] = {}
     if use_positive_augmentation and embedding_windows_with_aug:
-        augmented_overlap_pairs_outputs = _write_overlap_pairs(
+        aug_variants = [
+            _PairVariantSpec(
+                key="positive_aug",
+                suffix="_positive_aug",
+                pair_label="positive_augmentation",
+                filter_fn=_filter_positive_augmented,
+            )
+        ]
+        augmented_outputs = _write_overlap_pairs(
             tile_geoms_index,
             overlap_geom_equal,
             pair_output_root,
@@ -1827,13 +2042,39 @@ def main() -> None:
             dataset_resolution_map,
             embedding_windows_with_aug,
             embedding_spacing_with_aug,
-            suffix="_augmented",
-            variant_label="positive_augmentation",
+            variants=aug_variants,
         )
-        if augmented_overlap_pairs_outputs:
-            for pair_label, pair_path in sorted(augmented_overlap_pairs_outputs.items()):
-                print(f"[info] Wrote overlap pair summary (augmented) for {pair_label} to {pair_path}")
-    payload["study_area_overlap_pairs_augmented"] = augmented_overlap_pairs_outputs if augmented_overlap_pairs_outputs else None
+        overlap_pairs_positive_aug = augmented_outputs.get("positive_aug", {})
+        if overlap_pairs_positive_aug:
+            for pair_label, pair_path in sorted(overlap_pairs_positive_aug.items()):
+                print(f"[info] Wrote positive-aug overlap summary for {pair_label} to {pair_path}")
+    payload["study_area_overlap_pairs_positive_aug"] = overlap_pairs_positive_aug if overlap_pairs_positive_aug else None
+    payload["study_area_overlap_pairs_augmented"] = payload["study_area_overlap_pairs_positive_aug"]
+
+    if getattr(args, "debug_overlap", False):
+        boundary_geometry = None
+        if overlap_geom_equal is not None and mapping is not None and not overlap_geom_equal.is_empty:
+            try:
+                boundary_geometry = mapping(overlap_geom_equal)
+            except Exception:
+                boundary_geometry = None
+        debug_output_root = visual_base if visual_base is not None else Path.cwd()
+        debug_dir = debug_output_root / "overlap_debug"
+        _render_debug_plots(
+            overlap_pairs_positive,
+            boundary_geometry,
+            debug_dir,
+            "debug_positive_overlap.png",
+            "Positive overlap",
+        )
+        _render_debug_plots(
+            overlap_pairs_positive_aug,
+            boundary_geometry,
+            debug_dir,
+            "debug_positive_aug_overlap.png",
+            "Positive overlap (augmented)",
+            include_centroids=True,
+        )
 
     if args.visualize:
         if visual_base is None:

@@ -161,8 +161,20 @@ def load_config(path: Path) -> AlignmentConfig:
         if isinstance(entry, dict)
     ]
 
-    training_payload = payload.get("training", {})
+    optimization_payload = payload.get("optimization")
+    projection_override = None
+    if isinstance(optimization_payload, dict):
+        training_payload = dict(optimization_payload)
+        projection_override = training_payload.pop("projection_dim", None)
+    else:
+        maybe_training = payload.get("training", {})
+        training_payload = dict(maybe_training) if isinstance(maybe_training, dict) else {}
     training_cfg = TrainingConfig(**training_payload) if isinstance(training_payload, dict) else TrainingConfig()
+    projection_value = payload.get("projection_dim")
+    if projection_value is None:
+        projection_value = projection_override
+    if projection_value is None:
+        projection_value = 256
 
     config = AlignmentConfig(
         datasets=datasets,
@@ -175,7 +187,7 @@ def load_config(path: Path) -> AlignmentConfig:
         seed=int(payload.get("seed", 17)),
         device=str(payload.get("device", "cuda")),
         training=training_cfg,
-        projection_dim=int(payload.get("projection_dim", 256)),
+        projection_dim=int(projection_value),
         alignment_objective=str(payload.get("alignment_objective", "dcca")).lower(),
         aggregator=str(payload.get("aggregator", "weighted_pool")).lower(),
         gaussian_sigma=float(payload.get("gaussian_sigma")) if payload.get("gaussian_sigma") is not None else None,

@@ -31,6 +31,7 @@ except ImportError:  # pragma: no cover - optional dependency
 from .config import AlignmentConfig, load_config
 from .workspace import OverlapAlignmentPair, OverlapAlignmentWorkspace
 from .datasets import auto_coord_error
+from Common.overlap_debug_plot import save_overlap_debug_plot
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stage-1 overlap alignment trainer (positive-only)")
@@ -38,13 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-positive-only", action="store_true", help="Restrict training pairs to positive tiles.")
     parser.add_argument("--use-positive-augmentation", action="store_true", help="Enable positive augmentation vectors if provided.")
     parser.add_argument("--objective", choices=["dcca", "barlow"], default=None, help="Alignment objective to optimise (default: dcca).")
-    parser.add_argument("--projection-dim", type=int, default=None, help="Override projection head output dimension.")
-
     parser.add_argument("--aggregator", choices=["weighted_pool"], default=None, help="Aggregation strategy for fine-grained tiles (default: weighted_pool).")
-    parser.add_argument("--epochs", type=int, default=None, help="Override training epochs.")
-    parser.add_argument("--batch-size", type=int, default=None, help="Override training batch size.")
-    parser.add_argument("--lr", type=float, default=None, help="Override learning rate.")
-    parser.add_argument("--device", type=str, default=None, help="Override device (cpu/cuda).")
     parser.add_argument("--debug", action="store_true", help="Enable debug diagnostics and save overlap figures.")
     return parser.parse_args()
 
@@ -103,16 +98,6 @@ def main() -> None:
     if torch is None or nn is None or DataLoader is None:
         raise ImportError("Overlap alignment training requires PyTorch; install torch before running the trainer.")
 
-    if args.device is not None:
-        cfg.device = args.device
-    if args.epochs is not None:
-        cfg.training.epochs = max(1, int(args.epochs))
-    if args.batch_size is not None:
-        cfg.training.batch_size = max(1, int(args.batch_size))
-    if args.lr is not None:
-        cfg.training.lr = float(args.lr)
-    if args.projection_dim is not None:
-        cfg.projection_dim = max(1, int(args.projection_dim))
     if args.objective is not None:
         cfg.alignment_objective = args.objective.lower()
     if args.aggregator is not None:
@@ -130,31 +115,12 @@ def main() -> None:
     max_coord_error = auto_coord_error(workspace, anchor_name, target_name)
 
     pairs = list(workspace.iter_pairs(max_coord_error=max_coord_error))
-    if debug_mode:
-        overlap_tiles: Dict[str, set] = {anchor_name: set(), target_name: set()}
-        positive_tiles: Dict[str, set] = {anchor_name: set(), target_name: set()}
-        overlapping_positive_pairs = 0
-        for pair in pairs:
-            for dataset_name, record in (
-                (pair.anchor_dataset, pair.anchor_record),
-                (pair.target_dataset, pair.target_record),
-            ):
-                marker = record.tile_id if record.tile_id is not None else record.index
-                overlap_tiles.setdefault(dataset_name, set()).add(marker)
-                if int(record.label) == 1:
-                    positive_tiles.setdefault(dataset_name, set()).add(marker)
-            if int(pair.anchor_record.label) == 1 and int(pair.target_record.label) == 1:
-                overlapping_positive_pairs += 1
-        print(
-            "[debug] overlap positives: "
-            f"{anchor_name}={len(positive_tiles.get(anchor_name, set()))} / {len(overlap_tiles.get(anchor_name, set()))}, "
-            f"{target_name}={len(positive_tiles.get(target_name, set()))} / {len(overlap_tiles.get(target_name, set()))}, "
-            f"positive-overlap-pairs={overlapping_positive_pairs}"
-        )
+    debug_overlap_stats = _compute_overlap_debug(pairs, anchor_name, target_name) if debug_mode else None
     if not pairs:
         raise RuntimeError("No overlap pairs were resolved; cannot start training.")
 
     augmentation_by_dataset: Dict[str, Dict[str, List[np.ndarray]]] = {}
+    augmentation_loaded_counts: Dict[str, int] = {}
     if cfg.use_positive_augmentation:
         for dataset_cfg in cfg.datasets:
             if dataset_cfg.pos_aug_path is None:
@@ -162,6 +128,7 @@ def main() -> None:
             aug_map, aug_count = _load_augmented_embeddings(dataset_cfg.pos_aug_path, dataset_cfg.region_filter)
             if aug_map:
                 augmentation_by_dataset[dataset_cfg.name] = aug_map
+                augmentation_loaded_counts[dataset_cfg.name] = aug_count
                 print(
                     f"[info] Loaded {aug_count} augmented embeddings for dataset {dataset_cfg.name} "
                     f"from {dataset_cfg.pos_aug_path}"
@@ -173,7 +140,7 @@ def main() -> None:
                 )
 
     dataset_meta_map = getattr(workspace, "integration_dataset_meta", {}) or {}
-    anchor_vecs, target_vecs, label_hist, debug_data = _build_positive_aligned_pairs(
+    anchor_vecs, target_vecs, label_hist, debug_data, augmentation_stats = _build_positive_aligned_pairs(
         pairs,
         anchor_name=anchor_name,
         target_name=target_name,
@@ -185,7 +152,9 @@ def main() -> None:
         anchor_augment_map=augmentation_by_dataset.get(anchor_name),
         target_augment_map=augmentation_by_dataset.get(target_name),
     )
+    print(f"[dev] label_histogram={dict(label_hist)}")
 
+    
     if not anchor_vecs:
         print("[warn] No qualifying overlap groups were found for training.")
         if debug_mode:
@@ -200,6 +169,24 @@ def main() -> None:
             _maybe_save_debug_figures(cfg, debug_data)
             _persist_metrics(cfg, {"objective": cfg.alignment_objective.lower(), "max_coord_error": max_coord_error}, [], debug_data)
         return
+
+    dataset_positive_summary = _dataset_positive_counts(cfg, workspace)
+    if cfg.use_positive_augmentation:
+        _print_augmentation_usage(
+            anchor_name,
+            target_name,
+            augmentation_loaded_counts,
+            augmentation_stats,
+            total_pairs=len(anchor_vecs),
+        )
+
+    if debug_overlap_stats is not None:
+        print(
+            "[debug] overlap positives: "
+            f"{anchor_name}={debug_overlap_stats['anchor_positive']} / {debug_overlap_stats['anchor_overlap']}, "
+            f"{target_name}={debug_overlap_stats['target_positive']} / {debug_overlap_stats['target_overlap']}, "
+            f"positive-overlap-pairs={debug_overlap_stats['positive_pairs']}"
+        )
 
     anchor_tensor = torch.stack(anchor_vecs)
     target_tensor = torch.stack(target_vecs)
@@ -266,16 +253,13 @@ def main() -> None:
             print(f"[info] DCCA updates collapsed (loss≈0, corr≈0) at epoch {epoch+1}; stopping early.")
             break
 
-    debug_anchor_count = len(debug_data.get("anchor_positive", [])) if debug_mode and debug_data else 0
-    debug_target_count = len(debug_data.get("target_positive", [])) if debug_mode and debug_data else 0
-    debug_pair_count = len(debug_data.get("selected_pairs", [])) if debug_mode and debug_data else 0
-
     last_history = epoch_history[-1] if epoch_history else {"loss": None, "mean_correlation": None}
 
     summary = {
         "objective": objective,
         "aggregator": cfg.aggregator,
         "use_positive_only": cfg.use_positive_only,
+        "use_positive_augmentation": cfg.use_positive_augmentation,
         "projection_dim": proj_out,
         "label_histogram": dict(label_hist),
         "num_pairs": len(anchor_vecs),
@@ -285,10 +269,11 @@ def main() -> None:
         "max_coord_error": max_coord_error,
         "final_loss": last_history.get("loss"),
         "final_mean_correlation": last_history.get("mean_correlation"),
-        "debug_positive_anchor": debug_anchor_count,
-        "debug_positive_target": debug_target_count,
-        "debug_positive_pair_links": debug_pair_count,
     }
+    summary["selected_pairs_augmented"] = int(augmentation_stats.get("selected_pairs_augmented", 0))
+    summary["anchor_augmented_pairs"] = int(augmentation_stats.get("anchor_augmented_pairs", 0))
+    summary["target_augmented_pairs"] = int(augmentation_stats.get("target_augmented_pairs", 0))
+    summary.update(dataset_positive_summary)
     print("[info] training summary:", summary)
 
     _persist_state(cfg, projector_a, projector_b, summary)
@@ -301,6 +286,81 @@ def _dataset_pair(cfg: AlignmentConfig) -> Tuple[str, str]:
     if len(cfg.datasets) < 2:
         raise ValueError("Overlap alignment requires at least two datasets.")
     return cfg.datasets[0].name, cfg.datasets[1].name
+
+
+def _compute_overlap_debug(
+    pairs: Sequence[OverlapAlignmentPair],
+    anchor_name: str,
+    target_name: str,
+) -> Dict[str, int]:
+    overlap_tiles: Dict[str, set] = {anchor_name: set(), target_name: set()}
+    positive_tiles: Dict[str, set] = {anchor_name: set(), target_name: set()}
+    overlapping_positive_pairs = 0
+    for pair in pairs:
+        for dataset_name, record in (
+            (pair.anchor_dataset, pair.anchor_record),
+            (pair.target_dataset, pair.target_record),
+        ):
+            marker = record.tile_id if record.tile_id is not None else record.index
+            overlap_tiles.setdefault(dataset_name, set()).add(marker)
+            if int(record.label) == 1:
+                positive_tiles.setdefault(dataset_name, set()).add(marker)
+        if int(pair.anchor_record.label) == 1 and int(pair.target_record.label) == 1:
+            overlapping_positive_pairs += 1
+    return {
+        "anchor_positive": len(positive_tiles.get(anchor_name, set())),
+        "anchor_overlap": len(overlap_tiles.get(anchor_name, set())),
+        "target_positive": len(positive_tiles.get(target_name, set())),
+        "target_overlap": len(overlap_tiles.get(target_name, set())),
+        "positive_pairs": overlapping_positive_pairs,
+    }
+
+
+def _dataset_positive_counts(cfg: AlignmentConfig, workspace: OverlapAlignmentWorkspace) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for dataset_cfg in cfg.datasets:
+        region_tokens = dataset_cfg.region_filter or [dataset_cfg.name]
+        region_key = "_".join(str(token) for token in region_tokens) if region_tokens else dataset_cfg.name
+        region_key = region_key.replace(" ", "_")
+        bundle = workspace.datasets.get(dataset_cfg.name)
+        if bundle is None:
+            continue
+        summary = getattr(bundle, "summary", {}) or {}
+        label_info = summary.get("labels") if isinstance(summary, dict) else None
+        pos_val = None
+        if isinstance(label_info, dict):
+            pos_val = label_info.get(1)
+            if pos_val is None:
+                try:
+                    pos_val = label_info.get("1")
+                except Exception:
+                    pos_val = None
+        if pos_val is None:
+            try:
+                pos_val = sum(1 for record in getattr(bundle, "records", []) if int(getattr(record, "label", 0)) == 1)
+            except Exception:
+                pos_val = 0
+        counts[f"data_{region_key}_positives"] = int(pos_val or 0)
+    return counts
+
+
+def _print_augmentation_usage(
+    anchor_name: str,
+    target_name: str,
+    loaded_counts: Dict[str, int],
+    usage_stats: Dict[str, int],
+    total_pairs: int,
+) -> None:
+    anchor_loaded = loaded_counts.get(anchor_name, 0)
+    target_loaded = loaded_counts.get(target_name, 0)
+    anchor_used = int(usage_stats.get("anchor_augmented_pairs", 0))
+    target_used = int(usage_stats.get("target_augmented_pairs", 0))
+    print(
+        "[info] augmentation usage: "
+        f"{anchor_name} loaded={anchor_loaded} used={anchor_used}; "
+        f"{target_name} loaded={target_loaded} used={target_used}; "
+        f"total_pairs_with_aug={total_pairs}"
+    )
 
 def _build_positive_aligned_pairs(
     pairs: Sequence[OverlapAlignmentPair],
@@ -319,6 +379,7 @@ def _build_positive_aligned_pairs(
     List[torch.Tensor],
     Counter,
     Optional[Dict[str, List[Dict[str, object]]]],
+    Dict[str, int],
 ]:
     anchor_augment_map = anchor_augment_map or {}
     target_augment_map = target_augment_map or {}
@@ -420,6 +481,12 @@ def _build_positive_aligned_pairs(
                 target_aug_added += 1
 
 
+    aug_stats = {
+        "anchor_augmented_pairs": int(anchor_aug_added),
+        "target_augmented_pairs": int(target_aug_added),
+        "selected_pairs_augmented": int(anchor_aug_added + target_aug_added),
+    }
+
     if debug_data is not None:
         anchor_serialised = [_serialise_sample(sample) for sample in debug_data["anchor_positive"].values()]
         target_serialised = [_serialise_sample(sample) for sample in debug_data["target_positive"].values()]
@@ -442,13 +509,15 @@ def _build_positive_aligned_pairs(
     else:
         debug_payload = None
 
-    return anchor_vecs, target_vecs, label_hist, debug_payload
+    return anchor_vecs, target_vecs, label_hist, debug_payload, aug_stats
 
 def _add_debug_sample(
     store: Dict[str, Dict[str, object]],
     record,
     dataset_name: str,
     dataset_meta: Optional[Dict[str, object]],
+    *,
+    is_augmented: bool = False,
 ) -> Optional[Dict[str, object]]:
     if record.coord is None or any(math.isnan(c) for c in record.coord[:2]):
         return None
@@ -477,6 +546,7 @@ def _add_debug_sample(
             width = window[1] * float(pixel_res)
             height = window[0] * float(pixel_res)
             sample["footprint"] = [width, height]
+        sample["is_augmented"] = bool(is_augmented)
         store[record.tile_id] = sample
     return sample
 
@@ -496,6 +566,8 @@ def _serialise_sample(sample: Dict[str, object]) -> Dict[str, object]:
         data["pixel_resolution"] = float(sample["pixel_resolution"])
     if sample.get("footprint") is not None:
         data["footprint"] = [float(sample["footprint"][0]), float(sample["footprint"][1])]
+    if sample.get("is_augmented"):
+        data["is_augmented"] = True
     return data
 
 def _label_key(anchor_label: int, target_label: int, anchor_name: str, target_name: str) -> str:
@@ -578,6 +650,10 @@ def dcca_loss(z_a: torch.Tensor, z_b: torch.Tensor, eps: float = 1e-5) -> Tuple[
     inv_sqrt_aa = _matrix_inverse_sqrt(cov_aa, eps)
     inv_sqrt_bb = _matrix_inverse_sqrt(cov_bb, eps)
     t_mat = inv_sqrt_aa @ cov_ab @ inv_sqrt_bb
+    jitter = _adaptive_tmat_jitter(t_mat)
+    if jitter > 0:
+        eye = torch.eye(t_mat.size(-1), device=t_mat.device, dtype=t_mat.dtype)
+        t_mat = t_mat + jitter * eye
     try:
         singular_values = torch.linalg.svdvals(t_mat)
     except RuntimeError:
@@ -596,6 +672,21 @@ def _matrix_inverse_sqrt(mat: torch.Tensor, eps: float) -> torch.Tensor:
     eigvals = torch.clamp(eigvals, min=eps)
     inv_sqrt = eigvecs @ torch.diag(eigvals.rsqrt()) @ eigvecs.T
     return inv_sqrt
+
+
+def _adaptive_tmat_jitter(mat: torch.Tensor, base: float = 1e-3, scale_ratio: float = 1e-2) -> float:
+    if mat.numel() == 0:
+        return 0.0
+    try:
+        fro_norm = torch.linalg.norm(mat, ord="fro")
+    except RuntimeError:
+        fro_norm = torch.sqrt(torch.sum(mat * mat))
+    dim = float(mat.size(-1))
+    if dim <= 0:
+        return float(base)
+    scaled = float(fro_norm.detach().cpu()) / math.sqrt(mat.numel())
+    jitter = max(base, scaled * scale_ratio)
+    return float(jitter)
 
 
 def _prepare_output_dir(primary: Optional[Path], fallback_relative: str) -> Optional[Path]:
@@ -689,10 +780,6 @@ def _maybe_save_debug_figures(cfg: AlignmentConfig, debug_data: Optional[Dict[st
     if debug_data is None:
         print("[warn] Debug data unavailable; skipping figure generation.")
         return
-    if plt is None:
-        print("[warn] Matplotlib is not installed; cannot save debug figures.")
-        return
-
     viz_primary = None
     if cfg.output_dir is not None:
         viz_primary = cfg.output_dir / "bridge_visualizations" / "overlap"
@@ -702,26 +789,18 @@ def _maybe_save_debug_figures(cfg: AlignmentConfig, debug_data: Optional[Dict[st
     if viz_dir is None:
         return
 
-    fig, ax = plt.subplots(figsize=(7, 7))
-
-    # Draw overlap boundary if available
     geometry = None
-    try:
-        with Path(cfg.overlap_pairs_path).open("r", encoding="utf-8") as handle:
-            doc = json.load(handle)
-        geometry = doc.get("overlap", {}).get("geometry")
-    except Exception:
-        geometry = None
-
-    if isinstance(geometry, dict) and geometry.get("type") == "Polygon":
-        for ring in geometry.get("coordinates", []):
-            ring_arr = np.asarray(ring, dtype=float)
-            if ring_arr.ndim == 2 and ring_arr.size:
-                ax.plot(ring_arr[:, 0], ring_arr[:, 1], color="black", linewidth=1.0, alpha=0.5)
+    overlap_json = cfg.overlap_pairs_path or cfg.overlap_pairs_augmented_path
+    if overlap_json is not None:
+        try:
+            with Path(overlap_json).open("r", encoding="utf-8") as handle:
+                doc = json.load(handle)
+            geometry = doc.get("overlap", {}).get("geometry")
+        except Exception:
+            geometry = None
 
     anchor_samples = debug_data.get("anchor_positive", []) or []
     target_samples = debug_data.get("target_positive", []) or []
-    selected_pairs = debug_data.get("selected_pairs", []) or []
     anchor_label = (
         anchor_samples[0].get("dataset")
         if anchor_samples and anchor_samples[0].get("dataset")
@@ -733,116 +812,37 @@ def _maybe_save_debug_figures(cfg: AlignmentConfig, debug_data: Optional[Dict[st
         else debug_data.get("target_name", "target")
     )
 
-    if anchor_samples:
-        anchor_coords = np.asarray([sample["coord"] for sample in anchor_samples if sample.get("coord")], dtype=float)
-        if anchor_coords.size:
-            ax.scatter(
-                anchor_coords[:, 0],
-                anchor_coords[:, 1],
-                s=40,
-                facecolors="none",
-                edgecolors="#1f77b4",
-                linewidths=1.4,
-                label=f"positive_{anchor_label}",
-            )
-    if target_samples:
-        target_coords = np.asarray([sample["coord"] for sample in target_samples if sample.get("coord")], dtype=float)
-        if target_coords.size:
-            ax.scatter(
-                target_coords[:, 0],
-                target_coords[:, 1],
-                s=36,
-                facecolors="none",
-                edgecolors="#2ca02c",
-                linewidths=1.4,
-                label=f"positive_{target_label}",
-            )
+    anchor_serialised = [_serialise_sample(sample) for sample in anchor_samples]
+    target_serialised = [_serialise_sample(sample) for sample in target_samples]
+    plot_path = viz_dir / "debug_positive_overlap.png"
+    save_overlap_debug_plot(
+        plot_path,
+        geometry,
+        anchor_serialised,
+        target_serialised,
+        title="Positive overlap",
+        anchor_label=str(anchor_label),
+        target_label=str(target_label),
+        centroid_points=None,
+    )
+    print(f"[info] saved debug figure to {plot_path}")
 
-    if selected_pairs:
-        for idx, pair in enumerate(selected_pairs):
-            anchor_sample = pair["anchor"]
-            target_sample = pair["target"]
-            if not anchor_sample.get("coord") or not target_sample.get("coord"):
-                continue
-            ax.scatter(
-                anchor_sample["coord"][0],
-                anchor_sample["coord"][1],
-                s=80,
-                facecolors="none",
-                edgecolors="#d62728",
-                linewidths=2.0,
-                label="selected positives" if idx == 0 else None,
-                zorder=5,
+    if cfg.use_positive_augmentation:
+        aug_anchor = [sample for sample in anchor_serialised if sample.get("is_augmented")]
+        aug_target = [sample for sample in target_serialised if sample.get("is_augmented")]
+        if aug_anchor or aug_target:
+            aug_path = viz_dir / "debug_positive_aug_overlap.png"
+            save_overlap_debug_plot(
+                aug_path,
+                geometry,
+                aug_anchor or anchor_serialised,
+                aug_target or target_serialised,
+                title="Positive overlap (augmented)",
+                anchor_label=str(anchor_label),
+                target_label=str(target_label),
+                centroid_points=None,
             )
-            ax.scatter(
-                target_sample["coord"][0],
-                target_sample["coord"][1],
-                s=80,
-                facecolors="none",
-                edgecolors="#d62728",
-                linewidths=2.0,
-                zorder=5,
-            )
-            ax.plot(
-                [anchor_sample["coord"][0], target_sample["coord"][0]],
-                [anchor_sample["coord"][1], target_sample["coord"][1]],
-                color="#d62728",
-                alpha=0.45,
-                linewidth=1.2,
-                linestyle="--",
-            )
-
-    # Draw approximate windows as rectangles
-    try:
-        from matplotlib import patches
-    except ImportError:
-        patches = None
-
-    if patches is not None:
-        for sample in (anchor_samples + target_samples):
-            coord = sample.get("coord")
-            footprint = sample.get("footprint")
-            if coord is None or footprint is None:
-                continue
-            width, height = footprint
-            if width is None or height is None or width <= 0 or height <= 0:
-                continue
-            rect = patches.Rectangle(
-                (coord[0] - width / 2.0, coord[1] - height / 2.0),
-                width,
-                height,
-                linewidth=0.8,
-                edgecolor="#ff7f0e",
-                facecolor="none",
-                alpha=0.35,
-            )
-            ax.add_patch(rect)
-
-    ax.set_title("Overlap positive samples and selected pairs")
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    handles, labels = ax.get_legend_handles_labels()
-    if handles:
-        ax.legend()
-    ax.grid(True, alpha=0.2)
-    fig.tight_layout()
-
-    fig_path = viz_dir / "debug_positive_overlap.png"
-    try:
-        fig.savefig(fig_path, dpi=200)
-        print(f"[info] saved debug figure to {fig_path}")
-    except Exception as exc:
-        print(f"[warn] Unable to save debug figure {fig_path}: {exc}")
-        fallback_dir = _prepare_output_dir(None, "overlap_alignment_debug/bridge_visualizations/overlap")
-        if fallback_dir is not None:
-            fallback_path = fallback_dir / fig_path.name
-            try:
-                fig.savefig(fallback_path, dpi=200)
-                print(f"[info] saved debug figure to fallback location {fallback_path}")
-            except Exception as exc_fallback:
-                print(f"[warn] Unable to save debug figure to fallback location {fallback_path}: {exc_fallback}")
-    finally:
-        plt.close(fig)
+            print(f"[info] saved debug figure to {aug_path}")
 
 
 if __name__ == "__main__":
