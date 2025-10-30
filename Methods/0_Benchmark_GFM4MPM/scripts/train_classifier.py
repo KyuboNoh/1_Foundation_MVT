@@ -12,7 +12,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from sklearn.model_selection import train_test_split
+<<<<<<< HEAD
 from torch.utils.data import DataLoader, Dataset
+=======
+>>>>>>> 22eef72 (UFMv1 cls)
 
 _THIS_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _THIS_DIR.parent  # points to Methods/0_Benchmark_GFM4MPM
@@ -29,6 +32,7 @@ from Common.data_utils import (
 
 from Common.data_utils import resolve_search_root, load_training_args, load_training_metadata, mae_kwargs_from_training_args, resolve_pretraining_patch, infer_region_from_name, resolve_label_rasters, collect_feature_rasters, read_stack_patch
 from Common.debug_visualization import visualize_debug_features
+<<<<<<< HEAD
 from src.gfm4mpm.models.mae_vit import MAEViT
 from src.gfm4mpm.models.mlp_dropout import MLPDropout
 from src.gfm4mpm.training.train_cls import train_classifier, eval_classifier
@@ -60,6 +64,15 @@ class LabeledPatches(Dataset):
             x = patch
             y = label
         return torch.from_numpy(x).float(), torch.tensor(y, dtype=torch.long)
+=======
+from Common.cls.models.mae_vit import MAEViT
+from Common.cls.models.mlp_dropout import MLPDropout
+from Common.cls.training.train_cls import train_classifier, eval_classifier, dataloader_metric_inputORembedding
+from Common.metrics_logger import DEFAULT_METRIC_ORDER, log_metrics, normalize_metrics, save_metrics_json
+from Common.cls.infer.infer_maps import group_coords, mc_predict_map, write_prediction_outputs
+
+
+>>>>>>> 22eef72 (UFMv1 cls)
 
 
 if __name__ == '__main__':
@@ -72,6 +85,13 @@ if __name__ == '__main__':
     ap.add_argument('--out', required=True)
     ap.add_argument('--batch', type=int, default=32)
     ap.add_argument('--epochs', type=int, default=60)
+<<<<<<< HEAD
+=======
+    ap.add_argument('--mlp-hidden-dims', type=int, nargs='+', default=[256, 128],
+                    help='Hidden layer sizes for the classifier MLP (space-separated)')
+    ap.add_argument('--mlp-dropout', type=float, default=0.2,
+                    help='Dropout probability applied to classifier MLP layers')
+>>>>>>> 22eef72 (UFMv1 cls)
 
     ap.add_argument('--stride', type=int, default=None, help='Stride for sliding window inference (in pixels)')
     ap.add_argument('--passes', type=int, default=10, help='Number of stochastic forward passes for MC-Dropout')
@@ -94,6 +114,11 @@ if __name__ == '__main__':
     metrics_summary["plot_prediction"] = bool(args.plot_prediction)
     metrics_summary["passes"] = int(args.passes)
     metrics_summary["positive_augmentation"] = bool(args.positive_augmentation)
+<<<<<<< HEAD
+=======
+    metrics_summary["mlp_hidden_dims"] = [int(h) for h in args.mlp_hidden_dims]
+    metrics_summary["mlp_dropout"] = float(args.mlp_dropout)
+>>>>>>> 22eef72 (UFMv1 cls)
 
     modes = [bool(args.bands), bool(args.stac_root), bool(args.stac_table)]
     if sum(modes) != 1:
@@ -309,6 +334,7 @@ if __name__ == '__main__':
 
     # Split data
     Xtr, Xval, ytr, yval = train_test_split(coords, labels, test_size=args.test_ratio, stratify=labels, random_state=args.random_seed)
+<<<<<<< HEAD
     train_pos = int(sum(ytr))
     val_pos = int(sum(yval))
     metrics_summary["train_samples"] = len(Xtr)
@@ -353,16 +379,41 @@ if __name__ == '__main__':
     metrics_summary["batch_size"] = int(batch_size)
     metrics_summary["epochs"] = int(args.epochs)
 
+=======
+
+    dl_tr, dl_va, metrics_summary_append = dataloader_metric_inputORembedding(Xtr, Xval, ytr, yval, batch_size, positive_augmentation=args.positive_augmentation,
+                                                             augmented_patches_all=augmented_patches_all, pos_coord_to_index=pos_coord_to_index,
+                                                             window_size=window_size, stack=stack, 
+                                                             embedding=None,
+                                                             epochs=args.epochs)
+    metrics_summary.update(metrics_summary_append)
+
+
+    # Build models
+>>>>>>> 22eef72 (UFMv1 cls)
     encoder = MAEViT(in_chans=stack.count, **mae_kwargs)
     encoder.load_state_dict(state_dict)
     in_dim = encoder.blocks[0].attn.embed_dim
 
+<<<<<<< HEAD
     # TODO: Add hyperparameters for probability, hidden dims...
     mlp = MLPDropout(in_dim=in_dim)
+=======
+    hidden_dims = tuple(int(h) for h in args.mlp_hidden_dims if int(h) > 0)
+    if not hidden_dims:
+        raise ValueError("At least one positive hidden dimension must be provided for the classifier MLP.")
+    if not (0.0 <= args.mlp_dropout < 1.0):
+        raise ValueError("Classifier MLP dropout must be in the range [0.0, 1.0).")
+    mlp = MLPDropout(in_dim=in_dim, hidden_dims=hidden_dims, p=float(args.mlp_dropout))
+>>>>>>> 22eef72 (UFMv1 cls)
 
     # Train classifier
     mlp, epoch_history = train_classifier(
         encoder,
+<<<<<<< HEAD
+=======
+        None,
+>>>>>>> 22eef72 (UFMv1 cls)
         mlp,
         dl_tr,
         dl_va,
@@ -484,12 +535,21 @@ if __name__ == '__main__':
         print(f"Wrote table predictions to {out_csv}")
         outputs_summary["prediction_table"] = str(out_csv)
     else:
+<<<<<<< HEAD
         pos_coord_map = group_positive_coords(pos_coords_final, stack)
+=======
+        pos_coord_map = group_coords(pos_coords_final, stack)
+        neg_coord_map = group_coords(neg_coords_final, stack)
+>>>>>>> 22eef72 (UFMv1 cls)
         write_prediction_outputs(
             prediction,
             stack,
             out_dir,
             pos_coords_by_region=pos_coord_map,
+<<<<<<< HEAD
+=======
+            neg_coords_by_region=neg_coord_map,
+>>>>>>> 22eef72 (UFMv1 cls)
         )
         outputs_summary["prediction_directory"] = str(out_dir)
 
@@ -503,4 +563,8 @@ if __name__ == '__main__':
         save_metrics_json(summary_payload, summary_path)
         print(f"[info] Saved classifier configuration to {summary_path}")
     except Exception as exc:
+<<<<<<< HEAD
         print(f"[warn] Failed to write classifier summary to {summary_path}: {exc}")
+=======
+        print(f"[warn] Failed to write classifier summary to {summary_path}: {exc}")
+>>>>>>> 22eef72 (UFMv1 cls)

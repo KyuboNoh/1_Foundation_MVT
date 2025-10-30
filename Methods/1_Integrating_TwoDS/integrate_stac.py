@@ -212,7 +212,11 @@ def _parse_bridge_entry(entry: str, dataset_ids: Sequence[str]) -> Dict[str, Lis
 def _load_bridge_visualizer():
     from importlib import import_module
 
+<<<<<<< HEAD
     module = import_module("Methods.0_Benchmark_GFM4MPM.src.gfm4mpm.infer.infer_maps")
+=======
+    module = import_module("Common.cls.infer.infer_maps")
+>>>>>>> 22eef72 (UFMv1 cls)
     return getattr(module, "generate_bridge_visualizations")
 
 

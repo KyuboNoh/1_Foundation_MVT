@@ -12,7 +12,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from src.gfm4mpm.data.stac_table import StacTableStack
+from Common.cls.data.stac_table import StacTableStack
 
 
 def summarize_labels(stack: StacTableStack, columns: List[str]) -> List[Dict]:

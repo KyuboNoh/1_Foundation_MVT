@@ -41,8 +41,13 @@ _PROJECT_ROOT = (_THIS_DIR.parent / "Methods" / "0_Benchmark_GFM4MPM").resolve()
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+<<<<<<< HEAD
 from src.gfm4mpm.data.geo_stack import GeoStack  # noqa: E402
 from src.gfm4mpm.data.stac_table import StacTableStack  # noqa: E402
+=======
+from Common.cls.data.geo_stack import GeoStack  # noqa: E402
+from Common.cls.data.stac_table import StacTableStack  # noqa: E402
+>>>>>>> 22eef72 (UFMv1 cls)
 
 
 @dataclass

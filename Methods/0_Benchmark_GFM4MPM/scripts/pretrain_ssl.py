@@ -29,10 +29,10 @@ from Common.data_utils import (
     export_window_center_visualizations,
     load_region_boundaries,
 )
-from src.gfm4mpm.data.geo_stack import GeoStack
-from src.gfm4mpm.data.stac_table import StacTableStack
-from src.gfm4mpm.models.mae_vit import MAEViT
-from src.gfm4mpm.training.train_ssl import _collect_preview_samples, _plot_samples, train_ssl
+from Common.cls.data.geo_stack import GeoStack
+from Common.cls.data.stac_table import StacTableStack
+from Common.cls.models.mae_vit import MAEViT
+from Common.cls.training.train_ssl import _collect_preview_samples, _plot_samples, train_ssl
 
 
 # TODO: How to deal with catergorical data? 1) Only use it for input, not for reconstruction 2) Use it for reconstruction, but use cross-entropy loss (how to deal with MSE?)

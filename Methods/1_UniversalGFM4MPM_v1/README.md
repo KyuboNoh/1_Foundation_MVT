@@ -37,14 +37,27 @@ The stage-1 trainer freezes encoder features and optimises only the projection
 heads using a positive-only, negative-free alignment loss.
 
 ```bash
+<<<<<<< HEAD
 python -m Methods.1_UniversalGFM4MPM_v1.overlap_alignment.train --config /home/qubuntu25/Desktop/Research/Data/2_UFM_v1/config_ufm_v1_debug.json --debug 
+=======
+python -m Methods.1_UniversalGFM4MPM_v1.overlap_alignment.train --config /home/qubuntu25/Desktop/Research/Data/2_UFM_v1/config_ufm_v1_debug.json --dcca-eps 1.e-3 --debug 
+```
+```bash
+python -m Methods.1_UniversalGFM4MPM_v1.overlap_alignment.train --config C:\Users\kyubo\Desktop\Research\Data\2_UFM_v1\windows_config_ufm_v1_debug.json --debug 
+```
+```bash
+python -m Methods.1_UniversalGFM4MPM_v1.overlap_alignment.train --config C:\Users\kyubo\Desktop\Research\Data\2_UFM_v1\windows_config_ufm_v1_debug.json --train-cls --read-dcca --no-train-dcca --dcca-weights-path C:\Users\kyubo\Desktop\Research\Data\2_UFM_v1\UFM_v1_experiments\DCCA_posneg_dim128\overlap_alignment_stage1.pt --debug 
+>>>>>>> 22eef72 (UFMv1 cls)
 ```
 
 ```bash
 python -m Methods.1_UniversalGFM4MPM_v1.overlap_alignment.train --config /home/qubuntu25/Desktop/Research/Data/2_UFM_v1/config_ufm_v1_debug.json --debug --projection-dim 512 --use-positive-only --use-positive-augmentation
 ```
 
+<<<<<<< HEAD
 
+=======
+>>>>>>> 22eef72 (UFMv1 cls)
 By default the trainer:
 
 - Groups fine-scale tiles into coarse windows via weighted pooling (settable with `--aggregator`).
@@ -55,7 +68,11 @@ By default the trainer:
   and projection dimension (overridable via CLI flags or config).
 - Auto-selects `--max-coord-error` when not provided, using the coarser tile
   spacing/resolution, and exposes the value in the saved summary.
+<<<<<<< HEAD
 - `--debug` saves a centroid scatter (`bridge_visualizations/overlap/debug_positive_overlap.png`,
+=======
+- `--debug` saves a centroid scatter (`overlap_visualizations/overlap/debug_positive_overlap.png`,
+>>>>>>> 22eef72 (UFMv1 cls)
   requires matplotlib) alongside the standard logs.
 
 Outputs:

@@ -13,7 +13,15 @@ python -m Methods.1_Integrating_TwoDS.integrate_stac \
 --embedding-path /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021-minocc/work/f21_2_10/2_Labeling_01_10/embeddings.npz /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/Out_Data_Binary_Geophy_Float_Down10/2_Labeling_01_10/embeddings.npz \
 --projectname 2_Integrate_MVT_gcs_bcgs_occ   --output /home/qubuntu25/Desktop/Research/Data \
 --dataset-ids NA_AU BC   --region-select "{NA; GLOBAL}" \
+<<<<<<< HEAD
 --bridge-guess-number 1 --bridge "{Gravity_Bouguer, Gravity_Bouguer_HGM; NEBC_Canada_2_km___GRAV___Bouguer, NEBC_Canada_2_km___GRAV___Horizontal_Gradient}"   --visualize
+=======
+--bridge-guess-number 1 --bridge "{Gravity_Bouguer, Gravity_Bouguer_HGM; NEBC_Canada_2_km___GRAV___Bouguer, NEBC_Canada_2_km___GRAV___Horizontal_Gradient}" \
+--visualize
+```
+```bash
+python -m Methods.1_Integrating_TwoDS.integrate_stac --collections C:\Users\kyubo\Desktop\Research\Data\gsc-2021-minocc\ C:\Users\kyubo\Desktop\Research\Data\Out_Data_Binary_Geophy_Float_Down5 --embedding-path C:\Users\kyubo\Desktop\Research\Data\gsc-2021-minocc\work\f21_2_10\2_Labeling_01_10\embeddings.npz C:\Users\kyubo\Desktop\Research\Data\Out_Data_Binary_Geophy_Float_Down5\2_Labeling_01_10/embeddings.npz --projectname 2_Integrate_MVT_gcs_bcgs_occ   --output C:\Users\kyubo\Desktop\Research\Data --dataset-ids NA_AU BC   --region-select "{NA; GLOBAL}" --bridge-guess-number 1 --bridge "{Gravity_Bouguer, Gravity_Bouguer_HGM; NEBC_Canada_2_km___GRAV___Bouguer, NEBC_Canada_2_km___GRAV___Horizontal_Gradient}" --visualize
+>>>>>>> 22eef72 (UFMv1 cls)
 ```
 
 ```bash
@@ -22,7 +30,12 @@ python -m Methods.1_Integrating_TwoDS.integrate_stac \
 --embedding-path /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/gsc-2021-minocc/work/f21_2_10/2_Labeling_01_10/embeddings.npz /home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/Out_Data_Binary_Geophy_Float_Down5/2_Labeling_01_10/embeddings.npz \
 --projectname 2_Integrate_MVT_gcs_bcgs_occ_posaug   --output /home/qubuntu25/Desktop/Research/Data \
 --dataset-ids NA_AU BC   --region-select "{NA; GLOBAL}" \
+<<<<<<< HEAD
 --bridge-guess-number 1 --bridge "{Gravity_Bouguer, Gravity_Bouguer_HGM; NEBC_Canada_2_km___GRAV___Bouguer, NEBC_Canada_2_km___GRAV___Horizontal_Gradient}"   --visualize  --use-positive-augmentation --debug
+=======
+--bridge-guess-number 1 --bridge "{Gravity_Bouguer, Gravity_Bouguer_HGM; NEBC_Canada_2_km___GRAV___Bouguer, NEBC_Canada_2_km___GRAV___Horizontal_Gradient}" \
+--visualize  --use-positive-augmentation --debug
+>>>>>>> 22eef72 (UFMv1 cls)
 ```
 
 

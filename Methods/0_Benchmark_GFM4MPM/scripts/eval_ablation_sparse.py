@@ -9,16 +9,16 @@ import torch
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
 
-from gfm4mpm.data.geo_stack import GeoStack
-from gfm4mpm.data.stac_table import StacTableStack
-from gfm4mpm.models.mae_vit import MAEViT
-from gfm4mpm.models.mlp_dropout import MLPDropout
+from Common.cls.data.geo_stack import GeoStack
+from Common.cls.data.stac_table import StacTableStack
+from Common.cls.models.mae_vit import MAEViT
+from Common.cls.models.mlp_dropout import MLPDropout
 _THIS_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _THIS_DIR.parents[3]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from gfm4mpm.training.train_cls import eval_classifier
+from Common.cls.training.train_cls import eval_classifier
 from Common.metrics_logger import DEFAULT_METRIC_ORDER, log_metrics
 
 class LabeledPatches(Dataset):

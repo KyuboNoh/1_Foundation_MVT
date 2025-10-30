@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+<<<<<<< HEAD
+=======
+import copy
+>>>>>>> 22eef72 (UFMv1 cls)
 import json
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, TYPE_CHECKING
@@ -272,4 +276,64 @@ def _load_integration_metadata(path: Path) -> Dict[str, Dict[str, object]]:
                 spacing = None
             info.setdefault(dataset_key, {})["window_spacing"] = spacing
 
+<<<<<<< HEAD
+=======
+    base_dir = path.parent
+
+    def _resolve_path(candidate: Optional[str], dataset_root: Optional[str] = None) -> Optional[str]:
+        if not candidate:
+            return None
+        try:
+            candidate_path = Path(candidate)
+        except (TypeError, ValueError):
+            return None
+        if candidate_path.is_absolute():
+            return str(candidate_path)
+        if dataset_root:
+            root_path = Path(dataset_root)
+            resolved = (root_path / candidate_path).resolve()
+            if resolved.exists():
+                return str(resolved)
+        return str((base_dir / candidate_path).resolve())
+
+    datasets_payload = doc.get("datasets")
+    if isinstance(datasets_payload, list):
+        for entry in datasets_payload:
+            if not isinstance(entry, dict):
+                continue
+            dataset_id = entry.get("dataset_id") or entry.get("dataset") or entry.get("name")
+            if not dataset_id:
+                continue
+            dataset_key = str(dataset_id)
+            meta = info.setdefault(dataset_key, {})
+            root_value = entry.get("root")
+            if isinstance(root_value, str) and root_value:
+                meta.setdefault("root", root_value)
+            # store boundaries if present so downstream plotting can use them
+            boundaries = entry.get("boundaries")
+            if isinstance(boundaries, dict) and boundaries:
+                meta["boundaries"] = copy.deepcopy(boundaries)
+
+    overlap_mask_path = doc.get("study_area_overlap_mask")
+    fallback_entry: Optional[Dict[str, object]] = None
+    resolved_overlap_mask = _resolve_path(overlap_mask_path)
+    if resolved_overlap_mask:
+        fallback_entry = {
+            "path": resolved_overlap_mask,
+            "filename": Path(resolved_overlap_mask).name,
+            "role": "project",
+            "path_resolved": resolved_overlap_mask,
+        }
+
+    if fallback_entry is not None:
+        for dataset_key, meta in info.items():
+            boundaries = meta.get("boundaries")
+            project_entries: Optional[Sequence[Dict[str, object]]] = None
+            if isinstance(boundaries, dict):
+                project_entries = boundaries.get("project")
+            if project_entries:
+                continue
+            meta.setdefault("boundaries", {})["project"] = [copy.deepcopy(fallback_entry)]
+
+>>>>>>> 22eef72 (UFMv1 cls)
     return info

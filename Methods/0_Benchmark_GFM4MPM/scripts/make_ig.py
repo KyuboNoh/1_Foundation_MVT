@@ -5,11 +5,11 @@ import csv
 from pathlib import Path
 import torch
 
-from gfm4mpm.data.geo_stack import GeoStack
-from gfm4mpm.data.stac_table import StacTableStack
-from gfm4mpm.models.mae_vit import MAEViT
-from gfm4mpm.models.mlp_dropout import MLPDropout
-from gfm4mpm.explain.ig_maps import ig_attribution_map
+from Common.cls.data.geo_stack import GeoStack
+from Common.cls.data.stac_table import StacTableStack
+from Common.cls.models.mae_vit import MAEViT
+from Common.cls.models.mlp_dropout import MLPDropout
+from Common.cls.explain.ig_maps import ig_attribution_map
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()

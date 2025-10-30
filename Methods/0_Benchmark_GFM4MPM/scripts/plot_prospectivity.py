@@ -23,10 +23,10 @@ if str(_PROJECT_ROOT) not in sys.path:
 from Common.data_utils import clamp_coords_to_window, filter_valid_raster_coords, load_split_stack, normalize_region_coord
 from Common.data_utils import resolve_search_root, load_training_args, load_training_metadata, mae_kwargs_from_training_args, resolve_pretraining_patch, infer_region_from_name, resolve_label_rasters, collect_feature_rasters, read_stack_patch
 from Common.debug_visualization import visualize_debug_features
-from src.gfm4mpm.models.mae_vit import MAEViT
-from src.gfm4mpm.models.mlp_dropout import MLPDropout
-from src.gfm4mpm.training.train_cls import train_classifier
-from src.gfm4mpm.infer.infer_maps import mc_predict_map, group_positive_coords, write_prediction_outputs
+from Common.cls.models.mae_vit import MAEViT
+from Common.cls.models.mlp_dropout import MLPDropout
+from Common.cls.training.train_cls import train_classifier
+from Common.cls.infer.infer_maps import mc_predict_map, group_coords, write_prediction_outputs
 
 
 def _infer_prediction_region_name(path: Path) -> str:
@@ -234,7 +234,8 @@ if __name__ == '__main__':
     coords = pos_coords + neg_coords
     labels = [1]*len(pos_coords) + [0]*len(neg_coords)
 
-    pos_coords_by_region = group_positive_coords(pos_coords, stack)
+    pos_coords_by_region = group_coords(pos_coords, stack)
+    neg_coords_by_region = group_coords(neg_coords, stack)
 
     if args.prediction_glob:
         print(f"[info] Reconstructing prospectivity maps from saved predictions matching {args.prediction_glob}")
@@ -245,5 +246,6 @@ if __name__ == '__main__':
             stack,
             Path(args.out),
             pos_coords_by_region=pos_coords_by_region,
+            neg_coords_by_region=neg_coords_by_region,
         )
         sys.exit(0)
