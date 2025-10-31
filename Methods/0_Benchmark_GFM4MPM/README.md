@@ -117,6 +117,9 @@ python -m Methods.0_Benchmark_GFM4MPM.scripts.train_classifier \
 --save-prediction --epochs 40 --test-ratio 0.3 --stride 10 --positive-augmentation 
 ```
 
+```bash
+python -m Methods.0_Benchmark_GFM4MPM.scripts.train_classifier --bands "C:/Users/kyubo/Desktop/Research/Data/Out_Data_Binary_Geophy_Float_Down5/assets/rasters/*.tif" --step1  C:/Users/kyubo/Desktop/Research/Data/Out_Data_Binary_Geophy_Float_Down5/1_SSL_re/ --step2  C:/Users/kyubo/Desktop/Research/Data/Out_Data_Binary_Geophy_Float_Down5/2_Labeling_01_10/ --out    C:/Users/kyubo/Desktop/Research/Data/Out_Data_Binary_Geophy_Float_Down5/3_cls_01_10 --save-prediction --epochs 40 --test-ratio 0.3 --stride 10
+```
 
 
 

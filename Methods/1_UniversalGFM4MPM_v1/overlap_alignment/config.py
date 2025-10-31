@@ -97,6 +97,7 @@ class AlignmentConfig:
     gaussian_sigma: Optional[float] = None
     use_positive_only: bool = False
     use_positive_augmentation: bool = False
+    train_cls_onlyoverlap: bool = True
 
     def resolve_paths(self, base_dir: Path) -> "AlignmentConfig":
         resolved = AlignmentConfig(
@@ -116,6 +117,7 @@ class AlignmentConfig:
             gaussian_sigma=self.gaussian_sigma,
             use_positive_only=self.use_positive_only,
             use_positive_augmentation=self.use_positive_augmentation,
+            train_cls_onlyoverlap=self.train_cls_onlyoverlap,
         )
         return resolved
 
@@ -193,5 +195,6 @@ def load_config(path: Path) -> AlignmentConfig:
         gaussian_sigma=float(payload.get("gaussian_sigma")) if payload.get("gaussian_sigma") is not None else None,
         use_positive_only=bool(payload.get("use_positive_only", False)),
         use_positive_augmentation=bool(payload.get("use_positive_augmentation", False)),
+        train_cls_onlyoverlap=bool(payload.get("train_cls_onlyoverlap", True)),
     )
     return config.resolve_paths(base_dir)

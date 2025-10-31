@@ -121,16 +121,28 @@ def _mc_predict_single_region(
     mlp,
     stack,
     window_size: int,
-    stride: int,
     passes: int,
     device: str,
     show_progress: bool,
     region_name: str = "",
     save_prediction: bool = False,
     save_path: str = None,
+    precomputed_embeddings: Optional[Tuple[np.ndarray, Dict[Tuple[int, int], int], Sequence[Tuple[int, int]]]] = None,
 ):
     torch_mod = _require_torch()
-    encoder.eval().to(device)
+    embedding_array: Optional[np.ndarray] = None
+    embedding_lookup: Optional[Dict[Tuple[int, int], int]] = None
+    embedding_coords: Optional[Sequence[Tuple[int, int]]] = None
+    if precomputed_embeddings is not None:
+        try:
+            embedding_array, embedding_lookup, embedding_coords = precomputed_embeddings  # type: ignore[misc]
+        except ValueError:
+            embedding_array, embedding_lookup = precomputed_embeddings  # type: ignore[misc]
+            embedding_coords = None
+    if embedding_lookup is None and encoder is None:
+        raise ValueError("encoder is required when no precomputed embeddings are provided.")
+    if encoder is not None:
+        encoder.eval().to(device)
     mlp.eval().to(device)
     for module in mlp.modules():
         if isinstance(module, nn.Dropout):
@@ -141,14 +153,18 @@ def _mc_predict_single_region(
     mean_map = np.zeros((H, W), dtype=np.float32)
     var_map  = np.zeros((H, W), dtype=np.float32)
     counts   = np.zeros((H, W), dtype=np.int32)
-    centers = stack.grid_centers(stride)
-    if save_prediction and not hasattr(centers, "__len__"):
-        centers = list(centers)
+    if embedding_coords:
+        centers = list(embedding_coords)
+    else:
+        centers = stack.grid_centers(1)
+        if not isinstance(centers, (list, tuple)):
+            centers = list(centers)
     iterator = centers
     prediction_buffer = None
     next_row = 0
     if save_prediction:
         prediction_buffer = np.empty((len(centers), 4), dtype=np.float32)
+    missing_embeddings = 0
 
     if show_progress and tqdm is not None:
         desc = "MC inference"
@@ -158,9 +174,22 @@ def _mc_predict_single_region(
     elif show_progress and tqdm is None:
         print("[warn] tqdm not installed; progress bar disabled.")
     for r, c in iterator:
-        x = stack.read_patch(r, c, window_size)
-        x = torch_mod.from_numpy(x[None]).to(device)
-        zs = encoder.encode(x)
+        zs = None
+        if embedding_lookup is not None and embedding_array is not None:
+            idx = embedding_lookup.get((int(r), int(c)))
+            if idx is not None:
+                emb_vec = np.asarray(embedding_array[idx], dtype=np.float32)
+                zs = torch_mod.from_numpy(emb_vec.reshape(1, -1)).to(device)
+        if zs is None:
+            if encoder is None:
+                raise RuntimeError(
+                    f"No precomputed embedding available for coordinate {(int(r), int(c))} "
+                    "and encoder is None."
+                )
+            patch = stack.read_patch(r, c, window_size)
+            patch_tensor = torch_mod.from_numpy(patch[None]).to(device)
+            zs = encoder.encode(patch_tensor)
+            missing_embeddings += 1
         preds = []
         for _ in range(passes):
             p = mlp(zs)
@@ -213,15 +242,32 @@ def _mc_predict_single_region(
     with np.errstate(invalid="ignore"):
         mean_map = np.divide(mean_map, counts, where=counts > 0)
         var_map = np.divide(var_map, counts, where=counts > 0)
+    if embedding_lookup is not None and missing_embeddings:
+        region_label = region_name if region_name else "GLOBAL"
+        print(
+            f"[warn] Fallback to encoder for {missing_embeddings} sample(s) "
+            f"in region {region_label}; corresponding embeddings were not found."
+        )
     mean_map[counts == 0] = np.nan
     var_map[counts == 0] = np.nan
-    if stride > 1:
-        mean_map = _interpolate_prediction_grid(mean_map, counts)
-        var_map = _interpolate_prediction_grid(var_map, counts)
+    np.maximum(var_map, 0.0, out=var_map)
+
     return mean_map, np.sqrt(var_map)
 
 
-def mc_predict_map(encoder, mlp, stack, window_size=32, stride=16, passes=30, device=None, show_progress=False, save_prediction=False, save_path=None):
+def mc_predict_map(
+    encoder,
+    mlp,
+    stack,
+    window_size=32,
+    stride=16,
+    passes=30,
+    device=None,
+    show_progress=False,
+    save_prediction=False,
+    save_path=None,
+    precomputed_embeddings: Optional[Dict[str, Tuple[np.ndarray, Dict[Tuple[int, int], int]]]] = None,
+):
     torch_mod = _require_torch()
     if device is None:
         device = 'cuda' if torch_mod.cuda.is_available() else 'cpu'
@@ -230,18 +276,24 @@ def mc_predict_map(encoder, mlp, stack, window_size=32, stride=16, passes=30, de
         if hasattr(stack, "resolve_region_stack") and hasattr(stack, "iter_region_stacks"):
             region_results = {}
             for region_name, region_stack in stack.iter_region_stacks():
+                region_embeddings = None
+                if precomputed_embeddings:
+                    region_key = str(region_name)
+                    region_embeddings = precomputed_embeddings.get(region_key)
+                    if region_embeddings is None:
+                        region_embeddings = precomputed_embeddings.get("GLOBAL")
                 region_mean, region_std = _mc_predict_single_region(
                     encoder,
                     mlp,
                     region_stack,
                     window_size=window_size,
-                    stride=stride,
                     passes=passes,
                     device=device,
                     show_progress=show_progress,
                     region_name=str(region_name),
                     save_prediction=save_prediction,
-                    save_path=save_path
+                    save_path=save_path,
+                    precomputed_embeddings=region_embeddings,
                 )
                 region_results[str(region_name)] = {
                     "mean": region_mean,
@@ -255,12 +307,12 @@ def mc_predict_map(encoder, mlp, stack, window_size=32, stride=16, passes=30, de
             mlp,
             stack,
             window_size=window_size,
-            stride=stride,
             passes=passes,
             device=device,
             show_progress=show_progress,
             save_prediction=save_prediction,
-            save_path=save_path
+            save_path=save_path,
+            precomputed_embeddings=precomputed_embeddings.get("GLOBAL") if precomputed_embeddings else None,
         )
         return mean_map, std_map
 
@@ -407,7 +459,7 @@ def _resolve_reference_context(
     return reference, valid_mask, boundary_mask
 
 
-def group_positive_coords(
+def group_coords(
     coords: Sequence[Tuple[str, int, int]],
     stack: Any,
 ) -> Dict[str, List[Tuple[int, int]]]:
@@ -528,6 +580,7 @@ def write_prediction_outputs(
         )
 
         summary_png = mean_path.with_suffix('.png')
+
         save_png(
             summary_png,
             masked_mean,
@@ -571,6 +624,17 @@ def write_prediction_outputs(
 def save_geotiff(path, array, ref_src, valid_mask: np.ndarray = None, nodata: float = np.nan):
     if hasattr(ref_src, "profile"):
         profile = ref_src.profile.copy()
+    elif hasattr(ref_src, "srcs") and getattr(ref_src, "srcs"):
+        primary = ref_src.srcs[0]
+        profile = primary.profile.copy()
+        transform = getattr(ref_src, "transform", None)
+        crs = getattr(ref_src, "crs", None)
+        if transform is not None:
+            profile["transform"] = transform
+        if crs is not None:
+            profile["crs"] = crs
+        profile["height"] = int(array.shape[0])
+        profile["width"] = int(array.shape[1])
     elif isinstance(ref_src, dict):
         profile = dict(ref_src.get("profile", ref_src)).copy()
         transform = ref_src.get("transform")
@@ -824,9 +888,8 @@ def save_png(
     if levels_int < 2:
         levels_int = 2
     if vmax <= vmin:
-        level_values = np.linspace(vmin, vmax + 1e-6, max(levels_int, 2))
-    else:
-        level_values = np.linspace(vmin, vmax, levels_int)
+        vmax = vmin + 1e-6
+    level_values = np.linspace(vmin, vmax, max(levels_int, 2))
 
     contour = ax.contourf(
         x,

@@ -79,6 +79,19 @@ def parse_args() -> argparse.Namespace:
         help="Train the DCCA projection heads (default: true). Use --no-train-dcca to disable.",
     )
     parser.add_argument(
+        "--read-dcca",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Load existing DCCA projection head weights before training (default: false).",
+    )
+    parser.add_argument(
+        "--dcca-weights-path",
+        type=str,
+        default=None,
+        help="Optional path to a saved DCCA checkpoint used when --read-dcca is enabled.",
+    )
+
+    parser.add_argument(
         "--train-cls",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -92,6 +105,12 @@ def parse_args() -> argparse.Namespace:
         help="PN classifier training method to use (1 [Unified CLS] or 2 [Independent CLS]; default: 1).",
     )
     parser.add_argument(
+        "--train-cls-onlyoverlap",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Restrict classifier training samples to the overlap mask region (default: true). Use --no-train-cls-onlyoverlap to disable.",
+    )
+    parser.add_argument(
         "--mlp-hidden-dims",
         type=int,
         nargs="+",
@@ -103,19 +122,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.2,
         help="Dropout probability applied to classifier MLP layers.",
-    )
-    
-    parser.add_argument(
-        "--read-dcca",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Load existing DCCA projection head weights before training (default: false).",
-    )
-    parser.add_argument(
-        "--dcca-weights-path",
-        type=str,
-        default=None,
-        help="Optional path to a saved DCCA checkpoint used when --read-dcca is enabled.",
     )
     return parser.parse_args()
 
@@ -143,6 +149,7 @@ def main() -> None:
         cfg.use_positive_only = True
     if args.use_positive_augmentation:
         cfg.use_positive_augmentation = True
+    cfg.train_cls_onlyoverlap = bool(args.train_cls_onlyoverlap)
     debug_mode = bool(args.debug)
 
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
@@ -186,7 +193,6 @@ def main() -> None:
                     f"[info] Loaded {aug_count} augmented embeddings for dataset {dataset_cfg.name} "
                     f"from {dataset_cfg.pos_aug_path}"
                 )
-            else:
                 print(
                     f"[warn] No augmented embeddings retained for dataset {dataset_cfg.name}; "
                     "region filter or bundle contents may have excluded all entries."
@@ -323,7 +329,6 @@ def main() -> None:
         val_target = target_tensor[val_indices]
         validation_dataset = TensorDataset(val_anchor, val_target)
         actual_validation_fraction = val_indices.numel() / total_pairs
-    else:
         validation_dataset = None
         actual_validation_fraction = 0.0
 
@@ -348,7 +353,6 @@ def main() -> None:
     run_logger = _RunLogger(cfg)
     if read_dcca and weights_path is not None:
         run_logger.log(f"Reading DCCA weights from {weights_path}")
-    else:
         run_logger.log(
             "Starting stage-1 overlap alignment with initial projection_dim={proj}; "
             "train_pairs={train}, val_pairs={val}, validation_fraction={vf:.3f}, "
@@ -389,20 +393,24 @@ def main() -> None:
     )
     #################################### Training Overlap Alignment (DCCA) END ####################################
 
-    if plt is not None:
-        if cfg.output_dir is not None:
-            _debug_root = Path(cfg.output_dir)
-        elif cfg.log_dir is not None:
-            _debug_root = Path(cfg.log_dir)
-        else:
-            _debug_root = Path.cwd()
-        debug_plot_dir = _debug_root / "debug_classifier_inspection"
-        try:
-            debug_plot_dir.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            debug_plot_dir = None
-    else:
-        debug_plot_dir = None
+#    if plt is not None:
+#        if cfg.output_dir is not None:
+#            _debug_root = Path(cfg.output_dir)
+#        elif cfg.log_dir is not None:
+#            _debug_root = Path(cfg.log_dir)
+#            _debug_root = Path.cwd()
+#        debug_plot_dir = _debug_root / "debug_classifier_inspection"
+#        try:
+#            debug_plot_dir.mkdir(parents=True, exist_ok=True)
+#        except Exception:
+#            debug_plot_dir = None
+#        debug_plot_dir = None
+
+    _debug_root = Path(cfg.output_dir)
+    debug_plot_dir = _debug_root / "debug_classifier_inspection"
+    debug_plot_dir.mkdir(parents=True, exist_ok=True)
+
+    print("debug_plot_dir=", debug_plot_dir)
 
     def _clean_point(point: Optional[Sequence[object]]) -> Optional[Tuple[float, float]]:
         if point is None:
@@ -475,6 +483,7 @@ def main() -> None:
         print(f"[unified {tag}] label counts {counts}")
         print(f"[unified {tag}] by anchor region {dict(regions)}")
         if indices:
+            print("Call _debug_plot_points in _debug_check_summarize to plot points.")
             _debug_plot_points(f"unified_{tag}_anchor", anchor_points)
             _debug_plot_points(f"unified_{tag}_target", target_points)
         return coords  # keep if you want to inspect/export later
@@ -533,6 +542,14 @@ def main() -> None:
             anchor_name: projector_a,
             target_name: projector_b,
         }
+
+        apply_overlap_filter = bool(getattr(cfg, "train_cls_onlyoverlap", True))
+        overlap_mask_info = None
+        if apply_overlap_filter:
+            overlap_mask_info = _load_overlap_mask_data(cfg.overlap_mask_path)
+            if overlap_mask_info is None:
+                run_logger.log("[cls] Overlap mask unavailable or invalid; using full dataset samples for classifier training.")
+                apply_overlap_filter = False
         sample_sets: Dict[str, Dict[str, object]] = {}
         for dataset_name, projector in projector_map.items():
             if projector is None:
@@ -545,6 +562,8 @@ def main() -> None:
                 projector=projector,
                 device=device,
                 run_logger=run_logger,
+                overlap_mask=overlap_mask_info,
+                apply_overlap_filter=apply_overlap_filter,
             )
             if sample_set:
                 sample_sets[dataset_name] = sample_set
@@ -626,6 +645,10 @@ def main() -> None:
                     run_logger.log(f"Skipping classifier method {method}: unable to resolve output directory.")
                     continue
                 metadata_payload: Dict[str, object] = {}
+                metadata_payload["train_cls_onlyoverlap"] = bool(apply_overlap_filter)
+                metadata_payload["overlap_mask_path"] = str(cfg.overlap_mask_path) if cfg.overlap_mask_path is not None else None
+                metadata_payload["overlap_mask"] = overlap_mask_info
+                results: Dict[str, object] = {}
                 if method == 1:
                     if method1_data is None or not method1_data["train_indices"]:
                         run_logger.log("Unified classifier skipped: no labelled samples available.")
@@ -698,6 +721,7 @@ def main() -> None:
         "aggregator": cfg.aggregator,
         "use_positive_only": cfg.use_positive_only,
         "use_positive_augmentation": cfg.use_positive_augmentation,
+        "train_cls_onlyoverlap": bool(getattr(cfg, "train_cls_onlyoverlap", True)),
         "projection_dim": final_proj_dim,
         "projection_layers": mlp_layers,
         "train_dcca": train_dcca,
@@ -761,6 +785,29 @@ def main() -> None:
             sample_seed=int(cfg.seed),
         )
 
+    return
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def _filter_singular_values(singular_values: torch.Tensor, drop_ratio: float) -> Tuple[torch.Tensor, Dict[str, object]]:
@@ -807,7 +854,6 @@ def _filter_singular_values(singular_values: torch.Tensor, drop_ratio: float) ->
     if filtered.numel() > 0:
         info["kept_min"] = float(filtered.min().item())
         info["kept_max"] = float(filtered.max().item())
-    else:
         info["kept_min"] = None
         info["kept_max"] = None
     return filtered, info
@@ -1028,7 +1074,6 @@ def _train_with_adaptive_projection(
                         f"Pretrained DCCA projection layers {pretrained_layers} do not match configured {mlp_layers}; skipping weight initialisation."
                     )
                     warned_layer_mismatch = True
-            else:
                 state_for_attempt = pretrained_state
 
         if state_for_attempt is not None:
@@ -1282,7 +1327,6 @@ def _evaluate_dcca(
     for key, value in metrics.items():
         if isinstance(value, (int, float)):
             normalised[key] = float(value)
-        else:
             normalised[key] = value
     return normalised
 
@@ -1801,7 +1845,6 @@ def _resolve_pair_labels(
             combined = int(max(anchor_final, target_final))
         elif anchor_final is not None:
             combined = anchor_final
-        else:
             combined = target_final
 
         resolved.append(
@@ -1848,6 +1891,56 @@ def _build_mlp_classifier(in_dim: int, hidden_dims: Sequence[int], dropout: floa
     return _LogitMLPWrapper(in_dim, hidden_dims, dropout)
 
 
+def _mc_dropout_statistics(
+    model: nn.Module,
+    features: torch.Tensor,
+    *,
+    num_passes: int = 30,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Run Monte-Carlo dropout over ``num_passes`` stochastic forward passes.
+
+    Returns mean and standard deviation tensors (CPU, 1-D) aligned with the input rows.
+    """
+    if features.numel() == 0:
+        empty = torch.empty(0, dtype=torch.float32)
+        return empty, empty
+
+    device = features.device
+    dropout_modules: List[nn.Module] = [
+        module
+        for module in model.modules()
+        if isinstance(module, nn.Dropout)
+    ]
+
+    def _set_dropout_modules(mode: bool) -> None:
+        for module in dropout_modules:
+            module.train(mode)
+
+    model.eval()
+    _set_dropout_modules(False)
+    with torch.no_grad():
+        logits = model(features)
+        base_probs = torch.sigmoid(logits).squeeze(1)
+
+    if num_passes <= 1 or not dropout_modules:
+        return base_probs.detach().cpu(), torch.zeros_like(base_probs, device="cpu")
+
+    samples: List[torch.Tensor] = []
+    with torch.no_grad():
+        for _ in range(num_passes):
+            _set_dropout_modules(True)
+            logits = model(features)
+            probs = torch.sigmoid(logits).squeeze(1)
+            samples.append(probs.detach().clone())
+        _set_dropout_modules(False)
+
+    stacked = torch.stack(samples, dim=0)
+    mean = stacked.mean(dim=0)
+    std = stacked.std(dim=0, unbiased=False)
+    return mean.detach().cpu(), std.detach().cpu()
+
+
 def _prepare_classifier_dir(
     cfg: AlignmentConfig,
     method_id: int,
@@ -1882,7 +1975,6 @@ def _dataset_boundary_path(dataset_meta_map: Dict[str, Dict[str, object]], datas
             root = meta.get("root")
             if root:
                 candidate_path = Path(root) / candidate
-            else:
                 candidate_path = Path(candidate).resolve()
         if candidate_path.exists():
             return candidate_path
@@ -1960,6 +2052,8 @@ def _build_prediction_payload_from_samples(
     samples: Sequence[object],
     dataset_meta_map: Dict[str, Dict[str, object]],
     run_logger: "_RunLogger",
+    *,
+    overlap_mask: Optional[Dict[str, object]] = None,
 ) -> Optional[Tuple[
     Dict[str, Dict[str, object]],
     Dict[str, object],
@@ -1980,12 +2074,13 @@ def _build_prediction_payload_from_samples(
             y = entry.get("y")
             prob = entry.get("prob")
             label = entry.get("label", 1)
-        else:
-            try:
-                x, y, prob = entry[:3]
-                label = entry[3] if len(entry) >= 4 else 1
-            except Exception:
+        elif isinstance(entry, (list, tuple, np.ndarray)):
+            if len(entry) < 3:
                 continue
+            x, y, prob = entry[:3]
+            label = entry[3] if len(entry) >= 4 else 1
+        else:
+            continue
         try:
             x_f = float(x)
             y_f = float(y)
@@ -1998,7 +2093,6 @@ def _build_prediction_payload_from_samples(
         ys_list.append(y_f)
         prob_list.append(prob_f)
         label_list.append(_resolve_binary_label(label))
-
     if not xs_list:
         run_logger.log(f"Probability export skipped for dataset {dataset}: insufficient coordinate data.")
         return None
@@ -2058,12 +2152,19 @@ def _build_prediction_payload_from_samples(
                         "boundary_mask": boundary_mask,
                     }
 
+                    mean_map, std_map, valid_mask, boundary_mask = _apply_overlap_mask_to_grid(
+                    mean_map,
+                    std_map,
+                    valid_mask,
+                    boundary_mask,
+                    overlap_mask,
+                    transform,
+                )
                     pos_pixels: set[Tuple[int, int]] = set()
                     neg_pixels: set[Tuple[int, int]] = set()
                     for r, c, lbl in zip(rows.tolist(), cols.tolist(), labels_inside.tolist()):
                         if lbl > 0:
                             pos_pixels.add((int(r), int(c)))
-                        else:
                             neg_pixels.add((int(r), int(c)))
 
                     return (
@@ -2149,7 +2250,6 @@ def _build_prediction_payload_from_samples(
     for r, c, lbl in zip(rows.tolist(), cols.tolist(), labels.tolist()):
         if lbl > 0:
             pos_pixels.add((int(r), int(c)))
-        else:
             neg_pixels.add((int(r), int(c)))
 
     return (
@@ -2166,14 +2266,75 @@ def _build_prediction_payload_from_samples(
     )
 
 
+
+def _apply_overlap_mask_to_grid(
+    mean_map: np.ndarray,
+    std_map: np.ndarray,
+    valid_mask: Optional[np.ndarray],
+    boundary_mask: Optional[np.ndarray],
+    mask_info: Optional[Dict[str, object]],
+    grid_transform: Affine,
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+    if mask_info is None or rasterio is None:
+        return mean_map, std_map, valid_mask, boundary_mask
+    mask_array = mask_info.get("array")
+    mask_transform = mask_info.get("transform")
+    mask_shape = mask_info.get("shape")
+    nodata = mask_info.get("nodata")
+    if mask_array is None or mask_transform is None or mask_shape is None:
+        return mean_map, std_map, valid_mask, boundary_mask
+    height, width = mean_map.shape
+    if height == 0 or width == 0:
+        return mean_map, std_map, valid_mask, boundary_mask
+    rr, cc = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
+    try:
+        xs, ys = rasterio.transform.xy(grid_transform, rr, cc, offset="center")
+        xs = np.asarray(xs).ravel()
+        ys = np.asarray(ys).ravel()
+        mask_rows, mask_cols = rasterio.transform.rowcol(mask_transform, xs, ys)
+    except Exception:
+        return mean_map, std_map, valid_mask, boundary_mask
+    mask_bool = np.zeros(height * width, dtype=bool)
+    mask_rows = np.asarray(mask_rows)
+    mask_cols = np.asarray(mask_cols)
+    valid = (mask_rows >= 0) & (mask_rows < mask_shape[0]) & (mask_cols >= 0) & (mask_cols < mask_shape[1])
+    if valid.any():
+        values = mask_array[mask_rows[valid], mask_cols[valid]]
+        finite = np.isfinite(values)
+        if nodata is not None and np.isfinite(nodata):
+            finite &= ~np.isclose(values, nodata)
+        mask_bool[valid] = finite & (values != 0)
+    mask_bool = mask_bool.reshape(height, width)
+    if valid_mask is not None:
+        valid_mask = valid_mask & mask_bool
+    else:
+        valid_mask = mask_bool
+    if not valid_mask.any():
+        mean_map = np.full_like(mean_map, np.nan)
+        std_map = np.full_like(std_map, np.nan)
+        boundary_mask = None
+        return mean_map, std_map, valid_mask, boundary_mask
+    mean_map = np.where(valid_mask, mean_map, np.nan)
+    std_map = np.where(valid_mask, std_map, np.nan)
+    boundary_mask = _compute_boundary_mask(valid_mask) if valid_mask.any() else None
+    return mean_map, std_map, valid_mask, boundary_mask
+
 def _plot_probability_map(
     dataset: str,
     samples: Sequence[object],
     out_dir: Path,
     run_logger: "_RunLogger",
     dataset_meta_map: Dict[str, Dict[str, object]],
+    *,
+    overlap_mask: Optional[Dict[str, object]] = None,
 ) -> None:
-    payload = _build_prediction_payload_from_samples(dataset, samples, dataset_meta_map, run_logger)
+    payload = _build_prediction_payload_from_samples(
+        dataset,
+        samples,
+        dataset_meta_map,
+        run_logger,
+        overlap_mask=overlap_mask,
+    )
     if payload is None:
         run_logger.log(f"No probability samples available for dataset {dataset}; skipping exports.")
         return
@@ -2188,6 +2349,54 @@ def _plot_probability_map(
     )
 
 
+def _load_overlap_mask_data(mask_path: Optional[Path]) -> Optional[Dict[str, object]]:
+    if mask_path is None:
+        return None
+    if rasterio is None:
+        print(f"[warn] rasterio unavailable; cannot apply overlap mask filtering ({mask_path}).")
+        return None
+    try:
+        with rasterio.open(mask_path) as src:
+            mask_array = src.read(1)
+            return {
+                "array": np.asarray(mask_array),
+                "transform": src.transform,
+                "shape": mask_array.shape,
+                "nodata": src.nodata,
+            }
+    except Exception as exc:
+        print(f"[warn] Unable to load overlap mask {mask_path}: {exc}")
+        return None
+
+def _mask_contains_coord(coord: Optional[Tuple[float, float]], mask_info: Optional[Dict[str, object]]) -> bool:
+    if mask_info is None:
+        return True
+    if coord is None or rasterio is None:
+        return False
+    transform = mask_info.get("transform")
+    array = mask_info.get("array")
+    shape = mask_info.get("shape")
+    if transform is None or array is None or shape is None:
+        return True
+    try:
+        row, col = rasterio.transform.rowcol(transform, coord[0], coord[1])
+    except Exception:
+        return False
+    height, width = shape
+    if not (0 <= row < height and 0 <= col < width):
+        return False
+    value = array[row, col]
+    nodata = mask_info.get("nodata")
+    try:
+        if nodata is not None and np.isfinite(nodata):
+            if np.isfinite(value) and np.isclose(value, nodata):
+                return False
+            if not np.isfinite(value):
+                return False
+    except Exception:
+        pass
+    return bool(value)
+
 def _save_classifier_outputs(
     cfg: AlignmentConfig,
     run_logger: "_RunLogger",
@@ -2196,14 +2405,13 @@ def _save_classifier_outputs(
     target_name: str,
     method_dir: Path,
     results: Dict[str, object],
-    pair_metadata: Sequence[Dict[str, object]],
+    classifier_metadata: Dict[str, object],
     dataset_meta_map: Dict[str, Dict[str, object]],
-    train_indices: Sequence[int],
-    val_indices: Sequence[int],
 ) -> Dict[str, object]:
     summary_payload: Dict[str, object] = {}
     method_dir = method_dir.resolve()
     method_dir.mkdir(parents=True, exist_ok=True)
+    overlap_mask_info = classifier_metadata.get("overlap_mask") if classifier_metadata else None
 
     def _write_json(path: Path, payload: object) -> None:
         try:
@@ -2221,19 +2429,35 @@ def _save_classifier_outputs(
         except Exception as exc:
             run_logger.log(f"Failed to save classifier weights to {out_path}: {exc}")
 
-    def _plot_for_dataset(dataset: str, samples: List[Dict[str, object]], out_dir: Path) -> None:
+    def _plot_for_dataset(
+        dataset: str,
+        samples: List[Dict[str, object]],
+        out_dir: Path,
+        run_logger: "_RunLogger",
+        dataset_meta_map: Dict[str, Dict[str, object]],
+        *,
+        overlap_mask: Optional[Dict[str, object]] = None,
+    ) -> None:
         if not samples:
             run_logger.log(f"No samples available for dataset {dataset}; skipping probability export.")
             return
-        _plot_probability_map(dataset, samples, out_dir, run_logger, dataset_meta_map)
+        _plot_probability_map(
+            dataset,
+            samples,
+            out_dir,
+            run_logger,
+            dataset_meta_map,
+            overlap_mask=overlap_mask,
+        )
 
     if method_id == 1:
         method_1_dir = Path(method_dir) / 'method_1_classifiers'
-       
+        method_1_dir.mkdir(parents=True, exist_ok=True)
         plots_dir = method_1_dir / 'plots'
         plots_dir.mkdir(parents=True, exist_ok=True)
         metrics_data: Dict[str, object] = {}
         history_data: Dict[str, object] = {}
+        method1_data: Optional[Dict[str, object]] = classifier_metadata.get("method1") if classifier_metadata else None
         for tag, info in results.items():
             info = dict(info)
             state_dict = info.pop('state_dict', None)
@@ -2241,67 +2465,60 @@ def _save_classifier_outputs(
             history = info.get('history', [])
             metrics_data[tag] = metrics
             history_data[tag] = history
+            _write_json(method_1_dir / f'predictions_{tag}.json', info)
             _plot_training_curves(history, plots_dir / f'training_curve_{tag}.png', f'Method 1 ({tag}) Training')
             _export_state_dict(state_dict, method_1_dir / f'classifier_{tag}.pt')
         strong_info = results.get('strong') or next(iter(results.values()), None)
-        if strong_info:
+        if strong_info and method1_data:
             valid_indices = strong_info.get('valid_indices', [])
             all_probs = strong_info.get('all_probs', [])
-            train_set = set(strong_info.get('train_indices', []))
-            val_set = set(strong_info.get('val_indices', []))
-            anchor_samples: List[Dict[str, object]] = []
-            target_samples: List[Dict[str, object]] = []
-            for idx, prob in zip(valid_indices, all_probs):
-                if idx >= len(pair_metadata):
+            mc_info = strong_info.get('mc_dropout') or {}
+            mc_all_mean = mc_info.get('all_mean') or []
+            mc_all_std = mc_info.get('all_std') or []
+            mc_passes = mc_info.get('num_passes')
+            train_set = set(method1_data.get('train_indices', []))
+            val_set = set(method1_data.get('val_indices', []))
+            metadata_list: Sequence[Dict[str, object]] = method1_data.get('metadata', [])
+            samples_by_dataset: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+            for pos, idx in enumerate(valid_indices):
+                if pos >= len(all_probs):
                     continue
-                meta = pair_metadata[idx]
+                prob = all_probs[pos]
+                if idx >= len(metadata_list):
+                    continue
+                meta = metadata_list[idx]
+                coord = meta.get('coord')
+                if coord is None or not isinstance(coord, (tuple, list)):
+                    continue
+                dataset_key = str(meta.get('dataset') or anchor_name)
                 split = 'val' if idx in val_set else ('train' if idx in train_set else 'unlabeled')
-                anchor_coord = meta.get('anchor_coord')
-                if anchor_coord is not None and isinstance(anchor_coord, (tuple, list)):
-                    anchor_label = _resolve_binary_label(meta.get('anchor_label'), default=0)
-                    anchor_samples.append(
-                        {
-                            "x": float(anchor_coord[0]),
-                            "y": float(anchor_coord[1]),
-                            "prob": float(prob),
-                            "label": anchor_label,
-                            "split": split,
-                        }
-                    )
-                coords_list = meta.get('target_coords') or []
-                labels_list = meta.get('target_labels') or []
-                added = False
-                if isinstance(coords_list, (list, tuple)) and isinstance(labels_list, (list, tuple)):
-                    for coord_val, label_val in zip(coords_list, labels_list):
-                        if coord_val is None or not isinstance(coord_val, (tuple, list)):
-                            continue
-                        target_samples.append(
-                            {
-                                "x": float(coord_val[0]),
-                                "y": float(coord_val[1]),
-                                "prob": float(prob),
-                                "label": _resolve_binary_label(label_val, default=0),
-                                "split": split,
-                            }
-                        )
-                        added = True
-                if not added:
-                    weighted_coord = meta.get('target_weighted_coord')
-                    if weighted_coord is None and coords_list:
-                        weighted_coord = coords_list[0]
-                    if weighted_coord is not None and isinstance(weighted_coord, (tuple, list)):
-                        fallback_label = labels_list[0] if labels_list else meta.get('combined_label')
-                        target_samples.append(
-                            {
-                                "x": float(weighted_coord[0]),
-                                "y": float(weighted_coord[1]),
-                                "prob": float(prob),
-                                "label": _resolve_binary_label(fallback_label, default=0),
-                                "split": split,
-                            }
-                        )
-            _plot_for_dataset(anchor_name, anchor_samples, plots_dir / f"probability_{anchor_name}")
-            _plot_for_dataset(target_name, target_samples, plots_dir / f"probability_{target_name}")
+                mc_mean_val = mc_all_mean[pos] if pos < len(mc_all_mean) else None
+                mc_std_val = mc_all_std[pos] if pos < len(mc_all_std) else None
+                sample_entry = {
+                    "x": float(coord[0]),
+                    "y": float(coord[1]),
+                    "prob": float(prob),
+                    "label": _resolve_binary_label(meta.get('label'), default=0),
+                    "split": split,
+                }
+                if mc_mean_val is not None:
+                    sample_entry["prob_mc_mean"] = float(mc_mean_val)
+                if mc_std_val is not None:
+                    sample_entry["prob_mc_std"] = float(mc_std_val)
+                if mc_passes:
+                    sample_entry["mc_passes"] = int(mc_passes)
+                samples_by_dataset[dataset_key].append(sample_entry)
+            for dataset_key, dataset_samples in samples_by_dataset.items():
+                dataset_plot_dir = plots_dir / f"probability_{dataset_key}"
+                _plot_for_dataset(
+                    dataset_key,
+                    dataset_samples,
+                    dataset_plot_dir,
+                    run_logger,
+                    dataset_meta_map,
+                    overlap_mask=overlap_mask_info,
+                )
+                _write_json(plots_dir / f"probability_{dataset_key}.json", dataset_samples)
         _write_json(method_1_dir / 'training_metrics.json', metrics_data)
         _write_json(method_1_dir / 'training_history.json', history_data)
         log_lines = [f'Method {method_id} classifier summary']
@@ -2310,24 +2527,27 @@ def _save_classifier_outputs(
         (method_1_dir / 'training.log').write_text('\n'.join(log_lines), encoding='utf-8')
         summary_payload['output_dir'] = str(method_1_dir)
         summary_payload['metrics'] = metrics_data
+        if method1_data:
+            summary_payload['train_size'] = len(method1_data.get('train_indices', []))
+            summary_payload['val_size'] = len(method1_data.get('val_indices', []))
         return summary_payload
 
     if method_id == 2:
         anchor_info = dict(results.get('anchor') or {})
         target_info = dict(results.get('target') or {})
-        fusion_info = dict(results.get('fusion') or {})
         summary_payload['anchor'] = {}
         summary_payload['target'] = {}
-        overview: Dict[str, object] = {'train_size': len(train_indices), 'val_size': len(val_indices)}
+        overview: Dict[str, object] = {}
 
         if anchor_info:
-            # anchor_dir = _prepare_classifier_dir(cfg, method_id, anchor_name) or _fallback_subdir(method_dir, anchor_name, 'anchor')
             anchor_dir = Path(method_dir) / ('method_2_' + anchor_name)
-
             anchor_dir.mkdir(parents=True, exist_ok=True)
             plots_dir = anchor_dir / 'plots'
             plots_dir.mkdir(parents=True, exist_ok=True)
             anchor_state = anchor_info.pop('state_dict', None)
+            anchor_predictions = dict(anchor_info)
+            anchor_predictions.pop("metadata", None)
+            _write_json(anchor_dir / 'predictions_anchor.json', anchor_predictions)
             _export_state_dict(anchor_state, anchor_dir / 'classifier.pt')
             metrics = anchor_info.get('metrics', {})
             history = anchor_info.get('history', [])
@@ -2335,38 +2555,69 @@ def _save_classifier_outputs(
             _write_json(anchor_dir / 'training_history.json', history)
             _plot_training_curves(history, plots_dir / 'training_curve_anchor.png', f'Method 2 ({anchor_name}) Training')
             anchor_samples: List[Dict[str, object]] = []
-            for idx, prob in zip(anchor_info.get('valid_indices', []), anchor_info.get('all_probs', [])):
-                if idx >= len(pair_metadata):
+            anchor_metadata: Sequence[Dict[str, object]] = (classifier_metadata.get('anchor') or {}).get('metadata', [])
+            train_set = set(anchor_info.get('train_indices', []))
+            val_set = set(anchor_info.get('val_indices', []))
+            mc_info = anchor_info.get('mc_dropout') or {}
+            mc_all_mean = mc_info.get('all_mean') or []
+            mc_all_std = mc_info.get('all_std') or []
+            mc_passes = mc_info.get('num_passes')
+            valid_indices_anchor = anchor_info.get('valid_indices', [])
+            all_probs_anchor = anchor_info.get('all_probs', [])
+            for pos, idx in enumerate(valid_indices_anchor):
+                if pos >= len(all_probs_anchor):
                     continue
-                meta = pair_metadata[idx]
-                coord = meta.get('anchor_coord')
-                if coord is None:
+                prob = all_probs_anchor[pos]
+                if idx >= len(anchor_metadata):
                     continue
-                split = 'val' if idx in anchor_info.get('val_indices', []) else ('train' if idx in anchor_info.get('train_indices', []) else 'unlabeled')
-                anchor_label = _resolve_binary_label(meta.get('anchor_label'), default=0)
-                anchor_samples.append(
-                    {
-                        "x": float(coord[0]),
-                        "y": float(coord[1]),
-                        "prob": float(prob),
-                        "label": anchor_label,
-                        "split": split,
-                    }
-                )
-            _plot_for_dataset(anchor_name, anchor_samples, plots_dir / f"probability_{anchor_name}")
+                meta = anchor_metadata[idx]
+                coord = meta.get('coord')
+                if coord is None or not isinstance(coord, (tuple, list)):
+                    continue
+                split = 'val' if idx in val_set else ('train' if idx in train_set else 'unlabeled')
+                mc_mean_val = mc_all_mean[pos] if pos < len(mc_all_mean) else None
+                mc_std_val = mc_all_std[pos] if pos < len(mc_all_std) else None
+                sample_entry = {
+                    "x": float(coord[0]),
+                    "y": float(coord[1]),
+                    "prob": float(prob),
+                    "label": _resolve_binary_label(meta.get('label'), default=0),
+                    "split": split,
+                }
+                if mc_mean_val is not None:
+                    sample_entry["prob_mc_mean"] = float(mc_mean_val)
+                if mc_std_val is not None:
+                    sample_entry["prob_mc_std"] = float(mc_std_val)
+                if mc_passes:
+                    sample_entry["mc_passes"] = int(mc_passes)
+                anchor_samples.append(sample_entry)
+            dataset_plot_dir = plots_dir / f"probability_{anchor_name}"
+            _plot_for_dataset(
+                anchor_name,
+                anchor_samples,
+                dataset_plot_dir,
+                run_logger,
+                dataset_meta_map,
+                overlap_mask=overlap_mask_info,
+            )
+            _write_json(anchor_dir / f"probability_{anchor_name}.json", anchor_samples)
             (anchor_dir / 'training.log').write_text('\n'.join([f'Method {method_id} anchor summary', json.dumps(metrics)]), encoding='utf-8')
             summary_payload['anchor']['output_dir'] = str(anchor_dir)
             summary_payload['anchor']['metrics'] = metrics
-            overview['anchor'] = metrics
+            summary_payload['anchor']['train_size'] = len(train_set)
+            summary_payload['anchor']['val_size'] = len(val_set)
+            overview['anchor_train_size'] = len(train_set)
+            overview['anchor_val_size'] = len(val_set)
 
         if target_info:
-            # target_dir = _prepare_classifier_dir(cfg, method_id, target_name) or _fallback_subdir(method_dir, target_name, 'target')
             target_dir = Path(method_dir) / ('method_2_' + target_name)
-
             target_dir.mkdir(parents=True, exist_ok=True)
             plots_dir = target_dir / 'plots'
             plots_dir.mkdir(parents=True, exist_ok=True)
             target_state = target_info.pop('state_dict', None)
+            target_predictions = dict(target_info)
+            target_predictions.pop("metadata", None)
+            _write_json(target_dir / 'predictions_target.json', target_predictions)
             _export_state_dict(target_state, target_dir / 'classifier.pt')
             metrics = target_info.get('metrics', {})
             history = target_info.get('history', [])
@@ -2374,69 +2625,62 @@ def _save_classifier_outputs(
             _write_json(target_dir / 'training_history.json', history)
             _plot_training_curves(history, plots_dir / 'training_curve_target.png', f'Method 2 ({target_name}) Training')
             target_samples: List[Dict[str, object]] = []
-            for idx, prob in zip(target_info.get('valid_indices', []), target_info.get('all_probs', [])):
-                if idx >= len(pair_metadata):
+            target_metadata: Sequence[Dict[str, object]] = (classifier_metadata.get('target') or {}).get('metadata', [])
+            train_set = set(target_info.get('train_indices', []))
+            val_set = set(target_info.get('val_indices', []))
+            mc_info = target_info.get('mc_dropout') or {}
+            mc_all_mean = mc_info.get('all_mean') or []
+            mc_all_std = mc_info.get('all_std') or []
+            mc_passes = mc_info.get('num_passes')
+            valid_indices_target = target_info.get('valid_indices', [])
+            all_probs_target = target_info.get('all_probs', [])
+            for pos, idx in enumerate(valid_indices_target):
+                if pos >= len(all_probs_target):
                     continue
-                meta = pair_metadata[idx]
-                coords_list = meta.get('target_coords') or []
-                labels_list = meta.get('target_labels') or []
-                split = 'val' if idx in target_info.get('val_indices', []) else ('train' if idx in target_info.get('train_indices', []) else 'unlabeled')
-                added = False
-                if isinstance(coords_list, (list, tuple)) and isinstance(labels_list, (list, tuple)):
-                    for coord_val, label_val in zip(coords_list, labels_list):
-                        if coord_val is None or not isinstance(coord_val, (tuple, list)):
-                            continue
-                        target_samples.append(
-                            {
-                                "x": float(coord_val[0]),
-                                "y": float(coord_val[1]),
-                                "prob": float(prob),
-                                "label": _resolve_binary_label(label_val, default=0),
-                                "split": split,
-                            }
-                        )
-                        added = True
-                if not added:
-                    weighted_coord = meta.get('target_weighted_coord')
-                    if weighted_coord is None and coords_list:
-                        weighted_coord = coords_list[0]
-                    if weighted_coord is None or not isinstance(weighted_coord, (tuple, list)):
-                        continue
-                    fallback_label = labels_list[0] if labels_list else meta.get('combined_label')
-                    target_samples.append(
-                        {
-                            "x": float(weighted_coord[0]),
-                            "y": float(weighted_coord[1]),
-                            "prob": float(prob),
-                            "label": _resolve_binary_label(fallback_label, default=0),
-                            "split": split,
-                        }
-                    )
-            _plot_for_dataset(target_name, target_samples, plots_dir / f"probability_{target_name}")
+                prob = all_probs_target[pos]
+                if idx >= len(target_metadata):
+                    continue
+                meta = target_metadata[idx]
+                coord = meta.get('coord')
+                if coord is None or not isinstance(coord, (tuple, list)):
+                    continue
+                split = 'val' if idx in val_set else ('train' if idx in train_set else 'unlabeled')
+                mc_mean_val = mc_all_mean[pos] if pos < len(mc_all_mean) else None
+                mc_std_val = mc_all_std[pos] if pos < len(mc_all_std) else None
+                sample_entry = {
+                    "x": float(coord[0]),
+                    "y": float(coord[1]),
+                    "prob": float(prob),
+                    "label": _resolve_binary_label(meta.get('label'), default=0),
+                    "split": split,
+                }
+                if mc_mean_val is not None:
+                    sample_entry["prob_mc_mean"] = float(mc_mean_val)
+                if mc_std_val is not None:
+                    sample_entry["prob_mc_std"] = float(mc_std_val)
+                if mc_passes:
+                    sample_entry["mc_passes"] = int(mc_passes)
+                target_samples.append(sample_entry)
+            dataset_plot_dir = plots_dir / f"probability_{target_name}"
+            _plot_for_dataset(
+                target_name,
+                target_samples,
+                dataset_plot_dir,
+                run_logger,
+                dataset_meta_map,
+                overlap_mask=overlap_mask_info,
+            )
+            _write_json(target_dir / f"probability_{target_name}.json", target_samples)
             (target_dir / 'training.log').write_text('\n'.join([f'Method {method_id} target summary', json.dumps(metrics)]), encoding='utf-8')
             summary_payload['target']['output_dir'] = str(target_dir)
             summary_payload['target']['metrics'] = metrics
-            overview['target'] = metrics
+            summary_payload['target']['train_size'] = len(train_set)
+            summary_payload['target']['val_size'] = len(val_set)
+            overview['target_train_size'] = len(train_set)
+            overview['target_val_size'] = len(val_set)
 
-        # fusion_dir = _prepare_classifier_dir(cfg, method_id, anchor_name, target_name, 'fusion') or _fallback_subdir(method_dir, anchor_name, target_name, 'fusion')
-        fusion_dir = Path(method_dir) / ('method_2_' + 'fusion')
-
-        fusion_dir.mkdir(parents=True, exist_ok=True)
-        fusion_metrics = fusion_info.get('metrics', {})
-        fusion_params = fusion_info.get('fusion_params')
-        _write_json(fusion_dir / 'training_metrics.json', fusion_metrics)
-        if fusion_params:
-            try:
-                torch.save({'weights': list(fusion_params)}, fusion_dir / 'fusion_params.pt')
-            except Exception as exc:
-                run_logger.log(f'Failed to save fusion parameters: {exc}')
-        (fusion_dir / 'training.log').write_text('\n'.join([f'Method {method_id} fusion summary', json.dumps(fusion_metrics)]), encoding='utf-8')
-        summary_payload.setdefault('fusion', {})['output_dir'] = str(fusion_dir)
-        summary_payload['fusion']['metrics'] = fusion_metrics
-        summary_payload['fusion']['train_pairs'] = fusion_info.get('train_pairs', [])
-        summary_payload['fusion']['val_pairs'] = fusion_info.get('val_pairs', [])
-        overview['fusion'] = fusion_metrics
-        _write_json(method_dir / 'summary.json', overview)
+        if overview:
+            _write_json(method_dir / 'summary.json', overview)
 
         if not summary_payload['anchor']:
             summary_payload.pop('anchor', None)
@@ -2446,7 +2690,6 @@ def _save_classifier_outputs(
 
     run_logger.log(f'Classifier outputs skipped for unsupported method {method_id}.')
     return summary_payload
-
 
 def _build_unified_features(
     projected_anchor: torch.Tensor,
@@ -2480,10 +2723,9 @@ def _binary_classification_metrics(targets: torch.Tensor, probs: torch.Tensor) -
     fn = ((preds_np == 0) & (targets_np == 1)).sum()
     precision = tp / (tp + fp) if (tp + fp) else 0.0
     recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 0.0
     if precision + recall > 0:
         f1 = 2 * precision * recall / (precision + recall)
-    else:
-        f1 = 0.0
     metrics.update(
         {
             "accuracy": correct / total if total else float("nan"),
@@ -2513,7 +2755,10 @@ def _train_classifier(
     if model_factory is None:
         model = ClassifierHead(input_dim).to(device)
     else:
-        model = model_factory(input_dim).to(device)
+        model = model_factory(input_dim)
+        if model is None:
+            raise ValueError("model_factory returned None")
+        model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     if pos_weight is not None and pos_weight > 0:
         loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=device))
@@ -2522,7 +2767,7 @@ def _train_classifier(
 
     history: List[Dict[str, object]] = []
     if tqdm is not None:
-        epoch_iter: Iterable[int] = tqdm(range(1, epochs + 1), desc=progress_desc, leave=False)
+        epoch_iter = tqdm(range(1, epochs + 1), desc=progress_desc, leave=False)
     else:
         epoch_iter = range(1, epochs + 1)
 
@@ -2583,6 +2828,9 @@ def _collect_classifier_samples(
     projector: nn.Module,
     device: torch.device,
     run_logger: "_RunLogger",
+    *,
+    overlap_mask: Optional[Dict[str, object]] = None,
+    apply_overlap_filter: bool = False,
 ) -> Optional[Dict[str, object]]:
     bundle = workspace.datasets.get(dataset_name)
     if bundle is None:
@@ -2591,6 +2839,9 @@ def _collect_classifier_samples(
     if pn_lookup is None or (not pn_lookup.get("pos") and not pn_lookup.get("neg")):
         run_logger.log(f"[cls] PN lookup unavailable for dataset {dataset_name}; skipping classifier samples.")
         return None
+    if apply_overlap_filter and overlap_mask is None:
+        run_logger.log(f"[cls] overlap mask unavailable; cannot filter samples for dataset {dataset_name}.")
+        apply_overlap_filter = False
     matched_records: List[EmbeddingRecord] = []
     labels: List[int] = []
     coords: List[Optional[Tuple[float, float]]] = []
@@ -2603,9 +2854,11 @@ def _collect_classifier_samples(
         if label is None:
             continue
         label_int = 1 if int(label) > 0 else 0
+        coord_norm = _normalise_coord(record.coord)
+        if apply_overlap_filter and not _mask_contains_coord(coord_norm, overlap_mask):
+            continue
         matched_records.append(record)
         labels.append(label_int)
-        coord_norm = _normalise_coord(record.coord)
         coords.append(coord_norm)
         regions.append(getattr(record, "region", None))
         row_cols.append(getattr(record, "row_col", None))
@@ -2619,6 +2872,7 @@ def _collect_classifier_samples(
                 "row_col": getattr(record, "row_col", None),
                 "embedding_index": int(getattr(record, "index", len(indices))),
                 "tile_id": getattr(record, "tile_id", None),
+                "overlap_filtered": bool(apply_overlap_filter),
             }
         )
     if not matched_records:
@@ -2813,6 +3067,14 @@ def _train_unified_method(
         with torch.no_grad():
             all_subset = feature_tensor[valid_indices].to(device)
             all_probs = torch.sigmoid(model(all_subset)).cpu().squeeze(1)
+        mc_passes = max(1, int(getattr(cfg.training, "mc_dropout_passes", 30)))
+        mc_mean_all, mc_std_all = _mc_dropout_statistics(model, all_subset, num_passes=mc_passes)
+        mc_mean_np = mc_mean_all.numpy()
+        mc_std_np = mc_std_all.numpy()
+        def _slice_or_empty(arr: np.ndarray, idx: List[int]) -> List[float]:
+            if not idx:
+                return []
+            return arr[idx].tolist()
         result_entry: Dict[str, object] = {
             "metrics": metrics,
             "history": history,
@@ -2824,6 +3086,15 @@ def _train_unified_method(
             "all_probs": all_probs.numpy().tolist(),
             "labels": [int(labels[idx].get("combined_label") or 0) for idx in valid_indices],
             "state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+            "mc_dropout": {
+                "num_passes": mc_passes,
+                "all_mean": mc_mean_np.tolist(),
+                "all_std": mc_std_np.tolist(),
+                "train_mean": _slice_or_empty(mc_mean_np, sel_train),
+                "train_std": _slice_or_empty(mc_std_np, sel_train),
+                "val_mean": _slice_or_empty(mc_mean_np, sel_val),
+                "val_std": _slice_or_empty(mc_std_np, sel_val),
+            },
         }
         results[tag] = result_entry
     return results
@@ -2839,6 +3110,7 @@ def _train_single_view_classifier(
     *,
     desc: str,
     model_factory: Optional[Callable[[int], nn.Module]] = None,
+    mc_passes: int = 30,
 ) -> Tuple[Optional[nn.Module], Dict[str, object], List[int]]:
     valid_idx = [idx for idx in range(features.size(0)) if labels[idx] is not None]
     if not valid_idx:
@@ -2872,6 +3144,13 @@ def _train_single_view_classifier(
     model.eval()
     with torch.no_grad():
         all_probs = torch.sigmoid(model(x_valid)).cpu().squeeze(1)
+    mc_mean_all, mc_std_all = _mc_dropout_statistics(model, x_valid, num_passes=max(1, mc_passes))
+    mc_mean_np = mc_mean_all.numpy()
+    mc_std_np = mc_std_all.numpy()
+    def _slice(arr: np.ndarray, idx: List[int]) -> List[float]:
+        if not idx:
+            return []
+        return arr[idx].tolist()
     info: Dict[str, object] = {
         "metrics": metrics,
         "history": history,
@@ -2882,6 +3161,15 @@ def _train_single_view_classifier(
         "val_probs": val_probs.numpy().tolist() if val_probs.numel() else [],
         "all_probs": all_probs.numpy().tolist(),
         "labels": [int(labels[idx]) if labels[idx] is not None else 0 for idx in valid_idx],
+        "mc_dropout": {
+            "num_passes": int(max(1, mc_passes)),
+            "all_mean": mc_mean_np.tolist(),
+            "all_std": mc_std_np.tolist(),
+            "train_mean": _slice(mc_mean_np, train_sel),
+            "train_std": _slice(mc_std_np, train_sel),
+            "val_mean": _slice(mc_mean_np, val_sel),
+            "val_std": _slice(mc_std_np, val_sel),
+        },
     }
     return model, info, valid_idx
 
@@ -2900,6 +3188,7 @@ def _train_dual_head_method(
     results: Dict[str, object] = {}
 
     classifier_factory = lambda in_dim: _build_mlp_classifier(in_dim, mlp_hidden_dims, mlp_dropout)
+    mc_passes = max(1, int(getattr(cfg.training, "mc_dropout_passes", 30)))
 
     if anchor_data:
         anchor_labels = [int(val) for val in anchor_data["labels"].tolist()]
@@ -2912,14 +3201,18 @@ def _train_dual_head_method(
             epochs=epochs,
             desc="CLS method 2 (anchor)",
             model_factory=classifier_factory,
+            mc_passes=mc_passes,
         )
         if anchor_info:
             anchor_info = dict(anchor_info)
             anchor_info["metadata"] = anchor_data["metadata"]
-            anchor_info["state_dict"] = {k: v.detach().cpu() for k, v in anchor_model.state_dict().items()} if anchor_model is not None else None
+            if anchor_model is not None:
+                anchor_info["state_dict"] = {k: v.detach().cpu() for k, v in anchor_model.state_dict().items()}
+            else:
+                anchor_info["state_dict"] = None
             results["anchor"] = anchor_info
-    else:
-        run_logger.log("Dual-head classifier: anchor dataset unavailable or lacks PN-labelled samples.")
+        else:
+            run_logger.log("Dual-head classifier: anchor dataset unavailable or lacks PN-labelled samples.")
 
     if target_data:
         target_labels = [int(val) for val in target_data["labels"].tolist()]
@@ -2932,14 +3225,18 @@ def _train_dual_head_method(
             epochs=epochs,
             desc="CLS method 2 (target)",
             model_factory=classifier_factory,
+            mc_passes=mc_passes,
         )
         if target_info:
             target_info = dict(target_info)
             target_info["metadata"] = target_data["metadata"]
-            target_info["state_dict"] = {k: v.detach().cpu() for k, v in target_model.state_dict().items()} if target_model is not None else None
+            if target_model is not None:
+                target_info["state_dict"] = {k: v.detach().cpu() for k, v in target_model.state_dict().items()}
+            else:
+                target_info["state_dict"] = None
             results["target"] = target_info
-    else:
-        run_logger.log("Dual-head classifier: target dataset unavailable or lacks PN-labelled samples.")
+        else:
+            run_logger.log("Dual-head classifier: target dataset unavailable or lacks PN-labelled samples.")
 
     if not results:
         run_logger.log("Dual-head classifier skipped: no classifiers were trained.")
@@ -3003,7 +3300,6 @@ def _load_augmented_embeddings(path: Path, region_filter: Optional[Sequence[str]
                 meta_dict: Dict[str, object] = {}
                 if isinstance(meta, dict):
                     meta_dict = meta
-                else:
                     try:
                         meta_dict = meta.item()
                     except Exception:
@@ -3128,10 +3424,9 @@ def _build_aligned_pairs(
         pos_lookup = lookup.get("pos")
         if pos_lookup and key in pos_lookup:
             label_bucket = "pos"
-        else:
-            neg_lookup = lookup.get("neg")
-            if neg_lookup and key in neg_lookup:
-                label_bucket = "neg"
+        neg_lookup = lookup.get("neg")
+        if neg_lookup and key in neg_lookup:
+            label_bucket = "neg"
         if label_bucket is None:
             return
         idx_val = getattr(record, "index", None)
@@ -3325,7 +3620,6 @@ def _build_aligned_pairs(
             'target_augmented_pairs': int(target_aug_added),
         }
         debug_payload["pn_index_summary"] = pn_index_summary
-    else:
         debug_payload = None
 
     return anchor_vecs, target_vecs, label_hist, debug_payload, aug_stats, pair_metadata, pn_index_summary
@@ -3544,7 +3838,7 @@ if torch is not None:
             if num_layers == 1:
                 layers.append(nn.Linear(prev_dim, out_dim))
             else:
-                for layer_idx in range(num_layers - 1):
+                for _ in range(num_layers - 1):
                     layers.append(nn.Linear(prev_dim, hidden_dim))
                     layers.append(nn.ReLU(inplace=True))
                     prev_dim = hidden_dim
@@ -3765,4 +4059,5 @@ def _maybe_save_debug_figures(cfg: AlignmentConfig, debug_data: Optional[Dict[st
 
 if __name__ == "__main__":
     main()
+
 

@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-<<<<<<< HEAD
-=======
 import copy
->>>>>>> 22eef72 (UFMv1 cls)
 import json
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, TYPE_CHECKING
@@ -276,8 +273,6 @@ def _load_integration_metadata(path: Path) -> Dict[str, Dict[str, object]]:
                 spacing = None
             info.setdefault(dataset_key, {})["window_spacing"] = spacing
 
-<<<<<<< HEAD
-=======
     base_dir = path.parent
 
     def _resolve_path(candidate: Optional[str], dataset_root: Optional[str] = None) -> Optional[str]:
@@ -335,5 +330,4 @@ def _load_integration_metadata(path: Path) -> Dict[str, Dict[str, object]]:
                 continue
             meta.setdefault("boundaries", {})["project"] = [copy.deepcopy(fallback_entry)]
 
->>>>>>> 22eef72 (UFMv1 cls)
     return info
