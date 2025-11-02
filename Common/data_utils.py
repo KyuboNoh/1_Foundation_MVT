@@ -41,13 +41,8 @@ _PROJECT_ROOT = (_THIS_DIR.parent / "Methods" / "0_Benchmark_GFM4MPM").resolve()
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-<<<<<<< HEAD
-from src.gfm4mpm.data.geo_stack import GeoStack  # noqa: E402
-from src.gfm4mpm.data.stac_table import StacTableStack  # noqa: E402
-=======
 from Common.cls.data.geo_stack import GeoStack  # noqa: E402
 from Common.cls.data.stac_table import StacTableStack  # noqa: E402
->>>>>>> 22eef72 (UFMv1 cls)
 
 
 @dataclass
@@ -143,6 +138,7 @@ def load_split_stack(
     metadata_root = find_metadata_root(stack_root_path)
 
     training_args_data, training_args_path = load_training_args(metadata_root, encoder_path)
+
     training_metadata, training_metadata_path = load_training_metadata(metadata_root, encoder_path)
     if training_args_data:
         features_raw = training_args_data.get("features")
@@ -1396,36 +1392,40 @@ def load_training_args(stack_root: Optional[Path], encoder_path: Path) -> Tuple[
 
 
 def load_training_metadata(stack_root: Optional[Path], encoder_path: Path) -> Tuple[Optional[Dict], Optional[Path]]:
-    candidates: List[Path] = []
-    root = resolve_search_root(stack_root)
-    if root is not None:
-        search_dirs = [root] + list(root.parents)
-        for base in search_dirs:
-            for candidate in [base / 'training_metadata.json', base / 'assetization' / 'training_metadata.json']:
-                candidates.append(candidate)
-            try:
-                for candidate in base.rglob('training_metadata.json'):
-                    candidates.append(candidate)
-            except Exception:
-                pass
-
-    encoder_dir = encoder_path.resolve().parent
-    candidates.append(encoder_dir / 'training_metadata.json')
-
-    seen: set[Path] = set()
-    for candidate in candidates:
+    def _load_metadata(candidate: Path) -> Tuple[Optional[Dict], Optional[Path]]:
         try:
             resolved = candidate.resolve()
         except Exception:
-            continue
-        if resolved in seen or not resolved.exists():
-            continue
-        seen.add(resolved)
+            return None, None
+        if not resolved.exists():
+            return None, None
         try:
             with resolved.open('r', encoding='utf-8') as fh:
                 return json.load(fh), resolved
         except Exception as exc:
             print(f"[warn] Failed to load training metadata from {resolved}: {exc}")
+            return None, None
+
+    root = resolve_search_root(stack_root)
+    if root is not None:
+        preferred = root / 'training_metadata.json'
+        preferred_data, preferred_path = _load_metadata(preferred)
+        if preferred_data is not None:
+            return preferred_data, preferred_path
+
+        asset_candidate = root / 'assetization' / 'training_metadata.json'
+        asset_data, _ = _load_metadata(asset_candidate)
+        if asset_data is not None:
+            # Even when sourcing from the assetization directory, expose a deterministic path
+            # anchored at the metadata root for downstream logging.
+            return asset_data, preferred
+
+    encoder_dir = encoder_path.resolve().parent
+    encoder_candidate = encoder_dir / 'training_metadata.json'
+    encoder_data, encoder_path_resolved = _load_metadata(encoder_candidate)
+    if encoder_data is not None:
+        return encoder_data, encoder_path_resolved
+
     return None, None
 
 

@@ -26,7 +26,7 @@ from Common.debug_visualization import visualize_debug_features
 from Common.cls.models.mae_vit import MAEViT
 from Common.cls.models.mlp_dropout import MLPDropout
 from Common.cls.training.train_cls import train_classifier
-from Common.cls.infer.infer_maps import mc_predict_map, group_coords, write_prediction_outputs
+from Common.cls.infer.infer_maps import mc_predict_map_from_embeddings, group_coords, write_prediction_outputs
 
 
 def _infer_prediction_region_name(path: Path) -> str:
@@ -166,11 +166,10 @@ if __name__ == '__main__':
     ap.add_argument('--bands', help='glob to raster bands (e.g. /data/*.tif)')
     ap.add_argument('--stac-root', help='STAC collection root (table workflow)')
     ap.add_argument('--stac-table', help='Direct path to STAC Parquet table asset')
-    ap.add_argument('--splits', required=True)
-    ap.add_argument('--encoder', required=True)
-
-    ap.add_argument('--prediction-glob', help='Glob pattern to saved *_prediction*.npy files for redraw', default=None)
+    ap.add_argument('--step1', required=True, help='Path to SSL encoder weights (.pth) or directory containing them')
+    ap.add_argument('--step2', required=True, help='Path to labeling step output directory or splits.json file')
     ap.add_argument('--out', required=True)
+    ap.add_argument('--prediction-glob', help='Glob pattern to saved *_prediction*.npy files for redraw (defaults to <out>/*_predictions.npy)', default=None)
 
     args = ap.parse_args()
 
@@ -178,7 +177,29 @@ if __name__ == '__main__':
     if sum(modes) != 1:
         ap.error('Provide either --bands or one of --stac-root/--stac-table (exactly one input source)')
 
-    encoder_path = Path(args.encoder).resolve()
+    out_dir = Path(args.out).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    encoder_input_path = Path(args.step1).resolve()
+    if encoder_input_path.is_dir():
+        weight_candidates = sorted(encoder_input_path.glob('mae_encoder*.pth'))
+        if not weight_candidates:
+            raise FileNotFoundError(f"No mae_encoder*.pth found inside {encoder_input_path}")
+        encoder_path = weight_candidates[0]
+    else:
+        encoder_path = encoder_input_path
+    if not encoder_path.exists():
+        raise FileNotFoundError(f"Encoder weights not found at {encoder_path}")
+
+    step2_input = Path(args.step2).resolve()
+    splits_path = step2_input / 'splits.json' if step2_input.is_dir() else step2_input
+    if not splits_path.exists():
+        raise FileNotFoundError(f"splits.json not found at {splits_path}")
+
+    prediction_pattern = args.prediction_glob
+    if not prediction_pattern:
+        prediction_pattern = str(out_dir / "*_predictions.npy")
+
     label_column = 'Training_MVT_Deposit'
 
     load_result = load_split_stack(
@@ -196,6 +217,9 @@ if __name__ == '__main__':
 
     stack = load_result.stack
     training_args_data = load_result.training_args
+
+    if training_args_data is None:
+        raise RuntimeError("Failed to load pretraining arguments; ensure metadata from step1 is available.")
 
     patch_size = int(training_args_data['patch'])
     window_size = int(training_args_data['window'])
@@ -227,7 +251,7 @@ if __name__ == '__main__':
     else:
         default_region = "GLOBAL"
 
-    with open(args.splits) as f:
+    with open(splits_path) as f:
         sp = json.load(f)
     pos_coords = [normalize_region_coord(entry, default_region=default_region) for entry in sp['pos']]
     neg_coords = [normalize_region_coord(entry, default_region=default_region) for entry in sp['neg']]
@@ -237,14 +261,14 @@ if __name__ == '__main__':
     pos_coords_by_region = group_coords(pos_coords, stack)
     neg_coords_by_region = group_coords(neg_coords, stack)
 
-    if args.prediction_glob:
-        print(f"[info] Reconstructing prospectivity maps from saved predictions matching {args.prediction_glob}")
-        prediction = _load_saved_prediction_maps(args.prediction_glob, stack)
+    if prediction_pattern:
+        print(f"[info] Reconstructing prospectivity maps from saved predictions matching {prediction_pattern}")
+        prediction = _load_saved_prediction_maps(prediction_pattern, stack)
 
         write_prediction_outputs(
             prediction,
             stack,
-            Path(args.out),
+            out_dir,
             pos_coords_by_region=pos_coords_by_region,
             neg_coords_by_region=neg_coords_by_region,
         )

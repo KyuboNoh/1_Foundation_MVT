@@ -12,10 +12,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from sklearn.model_selection import train_test_split
-<<<<<<< HEAD
-from torch.utils.data import DataLoader, Dataset
-=======
->>>>>>> 22eef72 (UFMv1 cls)
 
 _THIS_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _THIS_DIR.parent  # points to Methods/0_Benchmark_GFM4MPM
@@ -32,47 +28,13 @@ from Common.data_utils import (
 
 from Common.data_utils import resolve_search_root, load_training_args, load_training_metadata, mae_kwargs_from_training_args, resolve_pretraining_patch, infer_region_from_name, resolve_label_rasters, collect_feature_rasters, read_stack_patch
 from Common.debug_visualization import visualize_debug_features
-<<<<<<< HEAD
-from src.gfm4mpm.models.mae_vit import MAEViT
-from src.gfm4mpm.models.mlp_dropout import MLPDropout
-from src.gfm4mpm.training.train_cls import train_classifier, eval_classifier
-from Common.metrics_logger import DEFAULT_METRIC_ORDER, log_metrics, normalize_metrics, save_metrics_json
-from src.gfm4mpm.infer.infer_maps import group_positive_coords, mc_predict_map, write_prediction_outputs
-
-class LabeledPatches(Dataset):
-    def __init__(self, stack, coords, labels, window=32, extra_samples: Optional[Sequence[Tuple[np.ndarray, int]]] = None):
-        self.stack = stack
-        self.coords = list(coords)
-        self.labels = list(labels)
-        self.window = window
-        self.extra: List[Tuple[np.ndarray, int]] = []
-        if extra_samples:
-            for patch, label in extra_samples:
-                arr = np.asarray(patch, dtype=np.float32)
-                self.extra.append((arr, int(label)))
-
-    def __len__(self):
-        return len(self.coords) + len(self.extra)
-
-    def __getitem__(self, idx):
-        if idx < len(self.coords):
-            coord = self.coords[idx]
-            x = read_stack_patch(self.stack, coord, self.window)
-            y = self.labels[idx]
-        else:
-            patch, label = self.extra[idx - len(self.coords)]
-            x = patch
-            y = label
-        return torch.from_numpy(x).float(), torch.tensor(y, dtype=torch.long)
-=======
 from Common.cls.models.mae_vit import MAEViT
 from Common.cls.models.mlp_dropout import MLPDropout
 from Common.cls.training.train_cls import train_classifier, eval_classifier, dataloader_metric_inputORembedding
 from Common.metrics_logger import DEFAULT_METRIC_ORDER, log_metrics, normalize_metrics, save_metrics_json
-from Common.cls.infer.infer_maps import group_coords, mc_predict_map, write_prediction_outputs
+from Common.cls.infer.infer_maps import group_coords, mc_predict_map_from_embeddings, write_prediction_outputs
 
 
->>>>>>> 22eef72 (UFMv1 cls)
 
 
 if __name__ == '__main__':
@@ -85,16 +47,12 @@ if __name__ == '__main__':
     ap.add_argument('--out', required=True)
     ap.add_argument('--batch', type=int, default=32)
     ap.add_argument('--epochs', type=int, default=60)
-<<<<<<< HEAD
-=======
     ap.add_argument('--mlp-hidden-dims', type=int, nargs='+', default=[256, 128],
                     help='Hidden layer sizes for the classifier MLP (space-separated)')
     ap.add_argument('--mlp-dropout', type=float, default=0.2,
                     help='Dropout probability applied to classifier MLP layers')
->>>>>>> 22eef72 (UFMv1 cls)
 
-    ap.add_argument('--stride', type=int, default=None, help='Stride for sliding window inference (in pixels)')
-    ap.add_argument('--passes', type=int, default=10, help='Number of stochastic forward passes for MC-Dropout')
+    ap.add_argument('--passes', type=int, default=5, help='Number of stochastic forward passes for MC-Dropout')
     ap.add_argument('--debug', action='store_true', help='Generate debug plots for labels and feature rasters')
     ap.add_argument('--positive-augmentation', action='store_true', help='Include augmented positive patches from the encoder directory.')
 
@@ -114,11 +72,8 @@ if __name__ == '__main__':
     metrics_summary["plot_prediction"] = bool(args.plot_prediction)
     metrics_summary["passes"] = int(args.passes)
     metrics_summary["positive_augmentation"] = bool(args.positive_augmentation)
-<<<<<<< HEAD
-=======
     metrics_summary["mlp_hidden_dims"] = [int(h) for h in args.mlp_hidden_dims]
     metrics_summary["mlp_dropout"] = float(args.mlp_dropout)
->>>>>>> 22eef72 (UFMv1 cls)
 
     modes = [bool(args.bands), bool(args.stac_root), bool(args.stac_table)]
     if sum(modes) != 1:
@@ -232,9 +187,6 @@ if __name__ == '__main__':
     metrics_summary["patch_size"] = int(patch_size)
     metrics_summary["window_size"] = int(window_size)
 
-    stride = args.stride if args.stride is not None else window_size
-    metrics_summary["stride"] = int(stride)
-
     state_dict = torch.load(encoder_weights_path, map_location='cpu')
     patch_proj = state_dict.get('patch.proj.weight')
     if isinstance(patch_proj, torch.Tensor):
@@ -334,52 +286,6 @@ if __name__ == '__main__':
 
     # Split data
     Xtr, Xval, ytr, yval = train_test_split(coords, labels, test_size=args.test_ratio, stratify=labels, random_state=args.random_seed)
-<<<<<<< HEAD
-    train_pos = int(sum(ytr))
-    val_pos = int(sum(yval))
-    metrics_summary["train_samples"] = len(Xtr)
-    metrics_summary["val_samples"] = len(Xval)
-    metrics_summary["train_pos"] = train_pos
-    metrics_summary["train_neg"] = len(Xtr) - train_pos
-    metrics_summary["val_pos"] = val_pos
-    metrics_summary["val_neg"] = len(Xval) - val_pos
-
-    extra_train_samples: List[Tuple[np.ndarray, int]] = []
-    train_aug_sources = np.array([], dtype=int)
-    if args.positive_augmentation and augmented_patches_all is not None and augmented_sources_all is not None:
-        train_pos_indices: set[int] = set()
-        for coord, label in zip(Xtr, ytr):
-            if label == 1:
-                idx = pos_coord_to_index.get(tuple(coord))
-                if idx is not None:
-                    train_pos_indices.add(idx)
-        if train_pos_indices:
-            mask_train_aug = np.isin(augmented_sources_all, list(train_pos_indices))
-            if mask_train_aug.any():
-                train_aug_patches = augmented_patches_all[mask_train_aug]
-                train_aug_sources = augmented_sources_all[mask_train_aug]
-                extra_train_samples = [(patch, 1) for patch in train_aug_patches]
-                metrics_summary['train_augmented'] = int(len(train_aug_sources))
-        else:
-            train_aug_sources = np.array([], dtype=int)
-    else:
-        train_aug_sources = np.array([], dtype=int)
-    if 'train_augmented' not in metrics_summary:
-        metrics_summary['train_augmented'] = int(len(extra_train_samples))
-    metrics_summary['train_samples_with_aug'] = len(Xtr) + len(extra_train_samples)
-    ds_tr = LabeledPatches(stack, Xtr, ytr, window=window_size, extra_samples=extra_train_samples)
-    ds_va = LabeledPatches(stack, Xval, yval, window=window_size)
-    if extra_train_samples:
-        print(f'[info] Added {len(extra_train_samples)} augmented positive samples to training loader.')
-    worker_count = 0 if getattr(stack, 'kind', None) == 'raster' else 8
-    if worker_count == 0:
-        print('[info] Using single-process data loading for raster stack')
-    dl_tr = DataLoader(ds_tr, batch_size=batch_size, shuffle=True, num_workers=worker_count)
-    dl_va = DataLoader(ds_va, batch_size=batch_size, shuffle=False, num_workers=worker_count)
-    metrics_summary["batch_size"] = int(batch_size)
-    metrics_summary["epochs"] = int(args.epochs)
-
-=======
 
     dl_tr, dl_va, metrics_summary_append = dataloader_metric_inputORembedding(Xtr, Xval, ytr, yval, batch_size, positive_augmentation=args.positive_augmentation,
                                                              augmented_patches_all=augmented_patches_all, pos_coord_to_index=pos_coord_to_index,
@@ -390,30 +296,22 @@ if __name__ == '__main__':
 
 
     # Build models
->>>>>>> 22eef72 (UFMv1 cls)
     encoder = MAEViT(in_chans=stack.count, **mae_kwargs)
     encoder.load_state_dict(state_dict)
     in_dim = encoder.blocks[0].attn.embed_dim
 
-<<<<<<< HEAD
-    # TODO: Add hyperparameters for probability, hidden dims...
-    mlp = MLPDropout(in_dim=in_dim)
-=======
     hidden_dims = tuple(int(h) for h in args.mlp_hidden_dims if int(h) > 0)
     if not hidden_dims:
         raise ValueError("At least one positive hidden dimension must be provided for the classifier MLP.")
     if not (0.0 <= args.mlp_dropout < 1.0):
         raise ValueError("Classifier MLP dropout must be in the range [0.0, 1.0).")
     mlp = MLPDropout(in_dim=in_dim, hidden_dims=hidden_dims, p=float(args.mlp_dropout))
->>>>>>> 22eef72 (UFMv1 cls)
 
     # Train classifier
+
+    print("[info] Training classifier MLP...")
     mlp, epoch_history = train_classifier(
         encoder,
-<<<<<<< HEAD
-=======
-        None,
->>>>>>> 22eef72 (UFMv1 cls)
         mlp,
         dl_tr,
         dl_va,
@@ -500,16 +398,107 @@ if __name__ == '__main__':
     except Exception as exc:
         print(f"[warn] Failed to write metrics JSON to {metrics_json_path}: {exc}")
 
+    precomputed_embeddings_map: Optional[Dict[str, Tuple[np.ndarray, Dict[Tuple[int, int], int], List[Tuple[int, int]]]]] = None
+    embedding_bundle_path = Path(args.step2) / "embeddings.npz"
+    if embedding_bundle_path.exists():
+        emb_npz = None
+        try:
+            emb_npz = np.load(embedding_bundle_path, allow_pickle=True)
+            embeddings_all = np.asarray(emb_npz["embeddings"], dtype=np.float32)
+            metadata_array = emb_npz.get("metadata")
+            if embeddings_all.ndim == 2 and metadata_array is not None:
+                region_coord_lookup: Dict[str, Dict[Tuple[int, int], int]] = {}
+                region_coord_order: Dict[str, List[Tuple[int, int]]] = {}
+                missing_metadata = 0
+                for idx, meta in enumerate(metadata_array):
+                    meta_dict = meta
+                    if hasattr(meta, "item") and not isinstance(meta, dict):
+                        try:
+                            meta_dict = meta.item()
+                        except Exception:
+                            meta_dict = None
+                    if not isinstance(meta_dict, dict):
+                        missing_metadata += 1
+                        continue
+                    row_val = meta_dict.get("row")
+                    col_val = meta_dict.get("col")
+                    if row_val is None or col_val is None:
+                        missing_metadata += 1
+                        continue
+                    try:
+                        row_idx = int(row_val)
+                        col_idx = int(col_val)
+                    except (TypeError, ValueError):
+                        missing_metadata += 1
+                        continue
+                    region_name = str(meta_dict.get("region") or default_region)
+                    coord_key = (row_idx, col_idx)
+                    region_lookup = region_coord_lookup.setdefault(region_name, {})
+                    if coord_key not in region_lookup:
+                        region_coord_order.setdefault(region_name, []).append(coord_key)
+                    region_lookup[coord_key] = idx
+                if region_coord_lookup:
+                    precomputed_embeddings_map = {}
+                    total_mapped_unique = 0
+                    for region, coord_lookup in region_coord_lookup.items():
+                        coord_list = region_coord_order.get(region)
+                        if coord_list is None:
+                            coord_list = list(coord_lookup.keys())
+                        precomputed_embeddings_map[region] = (embeddings_all, coord_lookup, coord_list)
+                        total_mapped_unique += len(coord_list)
+                    if "GLOBAL" not in precomputed_embeddings_map and region_coord_lookup:
+                        global_lookup: Dict[Tuple[int, int], int] = {}
+                        global_order: List[Tuple[int, int]] = []
+                        for coord_lookup in region_coord_lookup.values():
+                            for coord_key, emb_idx in coord_lookup.items():
+                                if coord_key not in global_lookup:
+                                    global_order.append(coord_key)
+                                global_lookup[coord_key] = emb_idx
+                        if global_lookup:
+                            precomputed_embeddings_map["GLOBAL"] = (embeddings_all, global_lookup, global_order)
+                    metrics_summary["precomputed_embeddings"] = {
+                        "regions": sorted(region_coord_lookup.keys()),
+                        "total_mapped": int(total_mapped_unique),
+                        "missing_metadata": int(missing_metadata),
+                    }
+                    if missing_metadata:
+                        print(
+                            f"[warn] {missing_metadata} embedding record(s) in {embedding_bundle_path.name} "
+                            "were missing region/row/col metadata; falling back to encoder for those coordinates."
+                        )
+                    else:
+                        print(f"[info] Loaded {total_mapped_unique} precomputed embeddings from {embedding_bundle_path}")
+                else:
+                    print(
+                        f"[warn] No usable region metadata found in {embedding_bundle_path}; "
+                        "will rely on encoder outputs for inference."
+                    )
+            else:
+                print(
+                    f"[warn] embeddings.npz at {embedding_bundle_path} is missing metadata or has unexpected shape; "
+                    "will rely on encoder outputs for inference."
+                )
+        except Exception as exc:
+            print(f"[warn] Failed to load precomputed embeddings from {embedding_bundle_path}: {exc}")
+        finally:
+            if emb_npz is not None:
+                try:
+                    emb_npz.close()
+                except Exception:
+                    pass
+    else:
+        print(f"[info] No embeddings.npz found at {embedding_bundle_path}; using encoder for inference.")
+
     print("[info] Generating prediction maps with MC-Dropout")
-    # TODO: Allow stride override?
-    # prediction = mc_predict_map(encoder, mlp, stack, window_size=window_size, stride=int(1.00*patch_size), passes=args.passes, show_progress=True, save_prediction=args.save_prediction, save_path=out_dir)
-    # prediction = mc_predict_map(encoder, mlp, stack, window_size=window_size, stride=int(1.00*window_size), passes=args.passes, show_progress=True, save_prediction=args.save_prediction, save_path=out_dir)
-    prediction = mc_predict_map(
-        encoder,
+    if precomputed_embeddings_map:
+        mapped_total = sum(len(mapping[2]) for key, mapping in precomputed_embeddings_map.items() if key != "GLOBAL")
+        print(f"[info] Using {mapped_total} precomputed embedding(s) for prediction inference.")
+    
+    
+    prediction = mc_predict_map_from_embeddings(
+        precomputed_embeddings_map,
         mlp,
         stack,
-        window_size=window_size,
-        stride=stride,
         passes=args.passes,
         show_progress=True,
         save_prediction=args.save_prediction,
@@ -535,21 +524,14 @@ if __name__ == '__main__':
         print(f"Wrote table predictions to {out_csv}")
         outputs_summary["prediction_table"] = str(out_csv)
     else:
-<<<<<<< HEAD
-        pos_coord_map = group_positive_coords(pos_coords_final, stack)
-=======
         pos_coord_map = group_coords(pos_coords_final, stack)
         neg_coord_map = group_coords(neg_coords_final, stack)
->>>>>>> 22eef72 (UFMv1 cls)
         write_prediction_outputs(
             prediction,
             stack,
             out_dir,
             pos_coords_by_region=pos_coord_map,
-<<<<<<< HEAD
-=======
             neg_coords_by_region=neg_coord_map,
->>>>>>> 22eef72 (UFMv1 cls)
         )
         outputs_summary["prediction_directory"] = str(out_dir)
 
@@ -563,8 +545,4 @@ if __name__ == '__main__':
         save_metrics_json(summary_payload, summary_path)
         print(f"[info] Saved classifier configuration to {summary_path}")
     except Exception as exc:
-<<<<<<< HEAD
         print(f"[warn] Failed to write classifier summary to {summary_path}: {exc}")
-=======
-        print(f"[warn] Failed to write classifier summary to {summary_path}: {exc}")
->>>>>>> 22eef72 (UFMv1 cls)

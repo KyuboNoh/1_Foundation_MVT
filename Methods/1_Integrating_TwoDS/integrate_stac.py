@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """
-Utilities to combine metadata from multiple STAC collections into a unified
-feature schema. 
-This is the first step for the Universal GFM4MPM pipeline 
-which will ingest different regional STAC exports (e.g., CAN/US/AU, BC) and
+Utilities to combine metadata from multiple STAC collections into a unified feature schema. 
+This is the first step for the Universal GFM4MPM pipeline which will ingest different regional STAC exports (e.g., CAN/US/AU, BC) and
 produce a compatible superset of channels.
-We generate additional "overlap" features to utilize the information in injested
-collections optimally.
+We generate additional "overlap" features to utilize the information in injested collections optimally.
 """
 
 from __future__ import annotations
@@ -19,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
+from affine import Affine
 from Common.overlap_debug_plot import save_overlap_debug_plot
 from itertools import combinations
 
@@ -212,11 +210,7 @@ def _parse_bridge_entry(entry: str, dataset_ids: Sequence[str]) -> Dict[str, Lis
 def _load_bridge_visualizer():
     from importlib import import_module
 
-<<<<<<< HEAD
-    module = import_module("Methods.0_Benchmark_GFM4MPM.src.gfm4mpm.infer.infer_maps")
-=======
     module = import_module("Common.cls.infer.infer_maps")
->>>>>>> 22eef72 (UFMv1 cls)
     return getattr(module, "generate_bridge_visualizations")
 
 
@@ -620,6 +614,206 @@ def _collect_dataset_geometry(summary: DatasetSummary, dataset_crs: CRS) -> Opti
         return None
     return merged
 
+
+def _write_geojson_feature(path: Path, geom: Polygon, source_path: Path) -> None:
+    feature = {
+        "type": "Feature",
+        "geometry": mapping(geom),
+        "properties": {
+            "source_path": str(source_path),
+        },
+    }
+    payload = {"type": "FeatureCollection", "features": [feature]}
+    try:
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _rasterize_geometry_to_path(
+    geom: Polygon,
+    out_path: Path,
+    *,
+    transform: Affine,
+    width: int,
+    height: int,
+    target_crs,
+    source_path: Path,
+) -> None:
+    if rasterio is None or rio_features is None:
+        return
+    try:
+        shapes = [(mapping(geom), 1)]
+        raster = rio_features.rasterize(
+            shapes,
+            out_shape=(height, width),
+            transform=transform,
+            fill=0,
+            dtype=np.uint8,
+        )
+        with rasterio.open(
+            out_path,
+            "w",
+            driver="GTiff",
+            height=height,
+            width=width,
+            count=1,
+            dtype="uint8",
+            transform=transform,
+            crs=target_crs,
+        ) as dst:
+            dst.write(raster, 1)
+            dst.update_tags(source_path=str(source_path))
+    except Exception:
+        if out_path.exists():
+            try:
+                out_path.unlink()
+            except Exception:
+                pass
+
+
+def _convert_boundary_to_unified_crs(
+    src_path: Path,
+    *,
+    transformer,
+    target_crs,
+    dataset_root: Path,
+    role: Optional[str],
+    region: Optional[str],
+    default_resolution: Optional[float] = None,
+) -> Optional[Dict[str, object]]:
+    if shapely_shape is None or Transformer is None or target_crs is None:
+        return None
+    geom_native = _load_boundary_geometry(src_path)
+    if geom_native is None or geom_native.is_empty:
+        return None
+    projected_geom = _transform_geometry(transformer, geom_native)
+    if projected_geom is None or projected_geom.is_empty:
+        return None
+
+    minx, miny, maxx, maxy = projected_geom.bounds
+    if not np.isfinite([minx, miny, maxx, maxy]).all():
+        return None
+    span_x = maxx - minx
+    span_y = maxy - miny
+    if span_x <= 0 or span_y <= 0:
+        return None
+
+    resolution = default_resolution
+    if resolution is None and rasterio is not None:
+        suffix = src_path.suffix.lower()
+        if suffix in {".tif", ".tiff"}:
+            try:
+                with rasterio.open(src_path) as src:
+                    res_val = _pixel_resolution(src.transform)
+                    if res_val is not None and res_val > 0:
+                        resolution = float(res_val)
+            except Exception:
+                pass
+    if resolution is None or not math.isfinite(resolution) or resolution <= 0:
+        resolution = max(span_x, span_y) / 2048.0
+        if not math.isfinite(resolution) or resolution <= 0:
+            resolution = 1000.0
+
+    width = max(1, int(math.ceil(span_x / resolution)))
+    height = max(1, int(math.ceil(span_y / resolution)))
+    transform = Affine(resolution, 0.0, minx, 0.0, -resolution, maxy)
+
+    base_dir = Path("/home/wslqubuntu24/Research/Data/2_Integrate_MVT_gcs_bcgs_occ/data/Boundary_UnifiedCRS")
+    dataset_dir = base_dir / dataset_root.name
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    base_name = src_path.stem + "_UnifiedCRS"
+    out_tif = dataset_dir / f"{base_name}.tif"
+    out_geojson = dataset_dir / f"{base_name}.geojson"
+
+    _write_geojson_feature(out_geojson, projected_geom, src_path)
+    _rasterize_geometry_to_path(
+        projected_geom,
+        out_tif,
+        transform=transform,
+        width=width,
+        height=height,
+        target_crs=target_crs,
+        source_path=src_path,
+    )
+
+    record: Dict[str, object] = {
+        "path": str(out_tif),
+        "filename": out_tif.name,
+        "role": role or "UnifiedCRS",
+        "path_resolved": str(out_tif),
+        "geojson_path": str(out_geojson),
+        "geojson_path_resolved": str(out_geojson),
+        "source_path": str(src_path),
+    }
+    if region is not None:
+        record["region"] = region
+    return record
+
+
+def _ensure_unified_crs_boundaries(
+    summary: DatasetSummary,
+    dataset_crs: Optional[CRS],
+    target_crs,
+) -> None:
+    if dataset_crs is None or Transformer is None or shapely_shape is None or target_crs is None:
+        return
+    transformer = Transformer.from_crs(dataset_crs, target_crs, always_xy=True)
+    processed: set[Path] = set()
+    new_records: List[Dict[str, object]] = []
+
+    def _handle(path: Path, role: Optional[str], region: Optional[str]) -> None:
+        if not path.exists():
+            return
+        resolved = path.resolve()
+        if resolved.suffix.lower() not in {".tif", ".tiff", ".geojson", ".json"}:
+            return
+        if resolved.name.endswith("_UnifiedCRS.tif") or resolved.name.endswith("_UnifiedCRS.geojson"):
+            return
+        if resolved in processed:
+            return
+        processed.add(resolved)
+        record = _convert_boundary_to_unified_crs(
+            resolved,
+            transformer=transformer,
+            target_crs=target_crs,
+            dataset_root=summary.root,
+            role=role,
+            region=region,
+        )
+        if record is not None:
+            new_records.append(record)
+
+    for records in summary.boundaries.values():
+        for record in records:
+            path_value = record.get("path_resolved") or record.get("path")
+            if not path_value:
+                continue
+            src_path = Path(path_value)
+            if not src_path.is_absolute():
+                src_path = (summary.root / src_path).resolve()
+            role = record.get("role") if isinstance(record, dict) else None
+            region = record.get("region") if isinstance(record, dict) else None
+            _handle(src_path, role, region)
+
+    boundaries_dir = summary.root / "boundaries"
+    if boundaries_dir.exists():
+        for candidate in boundaries_dir.glob("*"):
+            if not candidate.is_file():
+                continue
+            _handle(candidate, None, None)
+
+    if new_records:
+        unified_records = summary.boundaries.setdefault("Unified CRS", [])
+        existing_paths = {
+            Path(record.get("path_resolved", "")).resolve()
+            for record in unified_records
+            if isinstance(record, dict) and record.get("path_resolved")
+        }
+        for record in new_records:
+            record_path = Path(record.get("path_resolved", "")).resolve()
+            if record_path not in existing_paths:
+                unified_records.append(record)
 
 def _collect_dataset_tiles_v0(summary: DatasetSummary, target_crs: Optional[CRS]) -> List[Dict[str, object]]:
     # _collect_dataset_tiles_v0 assumes consistent data coverage (region) per region/dataset.
@@ -1727,6 +1921,11 @@ def main() -> None:
                 continue
             geom_pairs.append((summary.dataset_id, native_geom, equal_geom))
 
+        for summary in datasets:
+            dataset_crs = dataset_crs_map.get(summary.dataset_id)
+            if dataset_crs is not None:
+                _ensure_unified_crs_boundaries(summary, dataset_crs, target_crs)
+
         if len(geom_pairs) >= 2:
             max_area = max(eq_geom.area for _, _, eq_geom in geom_pairs if not eq_geom.is_empty)
             area_epsilon = max(max_area * 1e-8, 1e-6)
@@ -1798,6 +1997,11 @@ def main() -> None:
 
     payload = {
         "dataset_count": len(datasets),
+        "native_crs": {
+            ds.dataset_id: (dataset_crs_map.get(ds.dataset_id).to_string() if dataset_crs_map.get(ds.dataset_id) is not None and hasattr(dataset_crs_map.get(ds.dataset_id), "to_string") else str(dataset_crs_map.get(ds.dataset_id)))
+            for ds in datasets
+        },
+        "unified_crs": "EPSG:8857",
         "region_union": region_union,
         "dataset_min_resolution": {key: float(value) for key, value in dataset_resolution_map.items()},
         "dataset_window_spacing": {
@@ -1875,6 +2079,36 @@ def main() -> None:
     overlap_boundary_path: Optional[Path] = None
     if overlap_geom_equal is not None and shapely_shape is not None and mapping is not None and not overlap_geom_equal.is_empty:
         payload["study_area_overlap_detected"] = True
+
+        overlap_dir = Path("/home/wslqubuntu24/Research/Data/2_Integrate_MVT_gcs_bcgs_occ/data/Boundary_UnifiedCRS/Overlap")
+        overlap_dir.mkdir(parents=True, exist_ok=True)
+        overlap_geojson = overlap_dir / "study_area_overlap.geojson"
+        overlap_tif = overlap_dir / "study_area_overlap.tif"
+
+        _write_geojson_feature(overlap_geojson, overlap_geom_equal, Path("overlap"))
+
+        span_x = overlap_geom_equal.bounds[2] - overlap_geom_equal.bounds[0]
+        span_y = overlap_geom_equal.bounds[3] - overlap_geom_equal.bounds[1]
+        resolution = max(span_x, span_y) / 4096.0
+        if not math.isfinite(resolution) or resolution <= 0:
+            resolution = 1000.0
+        width = max(1, int(math.ceil(span_x / resolution)))
+        height = max(1, int(math.ceil(span_y / resolution)))
+        transform = Affine(resolution, 0.0, overlap_geom_equal.bounds[0], 0.0, -resolution, overlap_geom_equal.bounds[3])
+        _rasterize_geometry_to_path(
+            overlap_geom_equal,
+            overlap_tif,
+            transform=transform,
+            width=width,
+            height=height,
+            target_crs=target_crs,
+            source_path=overlap_geojson,
+        )
+
+        payload["study_area_overlap_boundary"] = {
+            "geojson_path": str(overlap_geojson),
+            "tif_path": str(overlap_tif),
+        }
     else:
         payload["study_area_overlap_detected"] = False
         payload["study_area_overlap_boundary"] = None
@@ -1910,91 +2144,16 @@ def main() -> None:
         visual_base = Path.cwd() / "integrate_stac_output"
 
     overlap_mask_path: Optional[Path] = None
-
-    if (
-        payload.get("study_area_overlap_detected")
-        and overlap_geom_equal is not None
-        and shapely_shape is not None
-        and mapping is not None
-    ):
-        boundary_dir = visual_base if visual_base is not None else Path.cwd()
-        boundary_dir.mkdir(parents=True, exist_ok=True)
-        overlap_boundary_path = boundary_dir / "study_area_overlap.geojson"
-        try:
-            geom_mapping = mapping(overlap_geom_equal)
-            geojson_doc = {
-                "type": "FeatureCollection",
-                "features": [
-                    {
-                        "type": "Feature",
-                        "properties": {
-                            "crs": "EPSG:8857"
-                        },
-                        "geometry": geom_mapping,
-                    }
-                ],
-            }
-            overlap_boundary_path.write_text(json.dumps(geojson_doc, indent=2), encoding="utf-8")
-            payload["study_area_overlap_boundary"] = str(overlap_boundary_path)
-            print(f"[info] Wrote study area overlap boundary to {overlap_boundary_path}")
-        except Exception as exc:
-            print(f"[warn] Failed to write overlap boundary GeoJSON: {exc}")
-            payload["study_area_overlap_boundary"] = None
-
-        overlap_mask_path = boundary_dir / "study_area_overlap.tif"
-        if rasterio is not None and rio_features is not None and from_origin is not None and target_crs is not None:
-            try:
-                minx, miny, maxx, maxy = overlap_geom_equal.bounds
-                if maxx > minx and maxy > miny:
-                    resolution_candidates = [
-                        float(val)
-                        for val in dataset_resolution_map.values()
-                        if isinstance(val, (int, float)) and val > 0
-                    ]
-                    resolution = min(resolution_candidates) if resolution_candidates else 500.0
-                    resolution = max(resolution, 1.0)
-                    width = max(1, int(np.ceil((maxx - minx) / resolution)))
-                    height = max(1, int(np.ceil((maxy - miny) / resolution)))
-                    transform = from_origin(minx, maxy, resolution, resolution)
-                    mask_array = rio_features.rasterize(
-                        [(overlap_geom_equal, 1)],
-                        out_shape=(height, width),
-                        transform=transform,
-                        fill=0,
-                        default_value=1,
-                        all_touched=True,
-                        dtype="uint8",
-                    )
-                    with rasterio.open(
-                        overlap_mask_path,
-                        "w",
-                        driver="GTiff",
-                        height=height,
-                        width=width,
-                        count=1,
-                        dtype="uint8",
-                        crs=target_crs,
-                        transform=transform,
-                    ) as dst:
-                        dst.write(mask_array, 1)
-                    payload["study_area_overlap_mask"] = str(overlap_mask_path)
-                    print(f"[info] Wrote study area overlap raster to {overlap_mask_path}")
-            except Exception as exc:
-                print(f"[warn] Failed to write overlap boundary GeoTIFF: {exc}")
-                if overlap_mask_path.exists():
-                    try:
-                        overlap_mask_path.unlink()
-                    except Exception:
-                        pass
-                overlap_mask_path = None
-                payload["study_area_overlap_mask"] = None
-        else:
-            print("[warn] Rasterio unavailable; skipping overlap mask generation.")
-            payload["study_area_overlap_mask"] = None
+    if payload.get("study_area_overlap_boundary"):
+        overlap_entry = payload["study_area_overlap_boundary"]
+        overlap_mask_path = Path(overlap_entry.get("tif_path")) if isinstance(overlap_entry, dict) else None
+        payload["study_area_overlap_mask"] = overlap_entry.get("tif_path") if isinstance(overlap_entry, dict) else None
     else:
         payload["study_area_overlap_mask"] = None
 
-    pair_output_root = visual_base if visual_base is not None else Path.cwd()
+    pairs_dir = Path("/home/wslqubuntu24/Research/Data/2_Integrate_MVT_gcs_bcgs_occ/data/Pairs")
+    pairs_dir.mkdir(parents=True, exist_ok=True)
+    pair_output_root = pairs_dir
     overlap_pairs_outputs: Dict[str, str] = {}
     overlap_pairs_positive: Dict[str, str] = {}
     if tile_geoms_index or embedding_windows_map:

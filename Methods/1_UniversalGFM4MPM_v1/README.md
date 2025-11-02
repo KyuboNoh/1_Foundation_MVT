@@ -1,63 +1,35 @@
-# Universal GFM4MPM v1 (overlap alignment sandbox)
-
-The `v1` refresh introduces a modular overlap-alignment workspace that separates
-data ingestion, overlap reasoning, and (future) optimisation. The immediate goal
-is to understand how pre-computed embeddings overlap across datasets before
-implementing the training loop.
+# Universal GFM4MPM v1 (DCCA overlap alignment + CLS training)
 
 ## Layout
 
-- `overlap_alignment/config.py` — JSON schema loader (backwards-compatible with `v0`).
+- `overlap_alignment/train.py` — DCCA and CLS training.
+- `overlap_alignment/cli.py` — quick diagnostics over the loaded workspace.
+- `overlap_alignment/config.py` — JSON schema loader (updated format from `v0`).
 - `overlap_alignment/datasets.py` — embedding loader exposing region / window / resolution metadata.
 - `overlap_alignment/overlaps.py` — parser for `*_overlap_pairs.json` with robust handling of schema variants.
 - `overlap_alignment/workspace.py` — workspace that pairs embeddings for co-located tiles.
-- `overlap_alignment/cli.py` — quick diagnostics over the loaded workspace.
 
-## Quick start
-
-```bash
-python -m Methods.1_UniversalGFM4MPM_v1.overlap_alignment.cli --config /home/qubuntu25/Desktop/Research/Data/2_UFM_v1/config_ufm_v1_debug.json
-```
-
-The command prints dataset summaries (counts, label balance, region coverage,
-pixel resolution / window stats) and describes how many overlap entries were
-resolved into co-located embedding pairs. Use `--json` to emit a machine-friendly report.
-
-If you provide `integration_metadata_path` in the config, the workspace will
-pull dataset-level fallbacks (e.g. min resolution, window spacing) from the
-STAC-integrated `combined_metadata.json` whenever per-tile metadata is missing
-inside the embedding bundles. When a `log_dir` (or `output_dir`) is supplied,
-the CLI also emits `overlap_pairs.json` that enumerates every resolved overlap
-pair together with the label type (`positive_common`, `positive_<dataset>`, or
-`unlabelled`) and the source indices for each dataset.
-
-## Stage-1 Overlap Alignment Training (positive-only)
+## Stage-1 Overlap Alignment Training 
 
 The stage-1 trainer freezes encoder features and optimises only the projection
 heads using a positive-only, negative-free alignment loss.
 
 ```bash
-<<<<<<< HEAD
-python -m Methods.1_UniversalGFM4MPM_v1.overlap_alignment.train --config /home/qubuntu25/Desktop/Research/Data/2_UFM_v1/config_ufm_v1_debug.json --debug 
-=======
-python -m Methods.1_UniversalGFM4MPM_v1.overlap_alignment.train --config /home/qubuntu25/Desktop/Research/Data/2_UFM_v1/config_ufm_v1_debug.json --dcca-eps 1.e-3 --debug 
-```
-```bash
-python -m Methods.1_UniversalGFM4MPM_v1.overlap_alignment.train --config C:\Users\kyubo\Desktop\Research\Data\2_UFM_v1\windows_config_ufm_v1_debug.json --debug 
-```
-```bash
-python -m Methods.1_UniversalGFM4MPM_v1.overlap_alignment.train --config C:\Users\kyubo\Desktop\Research\Data\2_UFM_v1\windows_config_ufm_v1_debug.json --train-cls --read-dcca --no-train-dcca --dcca-weights-path C:\Users\kyubo\Desktop\Research\Data\2_UFM_v1\UFM_v1_experiments\DCCA_posneg_dim128\overlap_alignment_stage1.pt --debug 
->>>>>>> 22eef72 (UFMv1 cls)
+python -m Methods.1_UniversalGFM4MPM_v1.overlap_alignment.train --config ./ufm_v1_config_wsl_debug.json --debug
 ```
 
+## Stage-2 Train CLS after Overlap Alignment Training
+
 ```bash
-python -m Methods.1_UniversalGFM4MPM_v1.overlap_alignment.train --config /home/qubuntu25/Desktop/Research/Data/2_UFM_v1/config_ufm_v1_debug.json --debug --projection-dim 512 --use-positive-only --use-positive-augmentation
+python -m Methods.1_UniversalGFM4MPM_v1.overlap_alignment.train --config ./ufm_v1_config_wsl_debug.json --train-cls --read-dcca --no-train-dcca --dcca-weights-path /home/wslqubuntu24/Research/Data/1_Foundation_MVT_Result/2_UFM_v1/UFM_v1_experiments/DCCA_posneg_dim128/overlap_alignment_stage1.pt --debug
 ```
 
-<<<<<<< HEAD
+## Stage-1+2 Overlap Alignment Training (positive-only)
 
-=======
->>>>>>> 22eef72 (UFMv1 cls)
+```bash
+python -m Methods.1_UniversalGFM4MPM_v1.overlap_alignment.train --config ./ufm_v1_config_wsl_debug.json --train-cls --debug 
+```
+
 By default the trainer:
 
 - Groups fine-scale tiles into coarse windows via weighted pooling (settable with `--aggregator`).
@@ -68,11 +40,7 @@ By default the trainer:
   and projection dimension (overridable via CLI flags or config).
 - Auto-selects `--max-coord-error` when not provided, using the coarser tile
   spacing/resolution, and exposes the value in the saved summary.
-<<<<<<< HEAD
-- `--debug` saves a centroid scatter (`bridge_visualizations/overlap/debug_positive_overlap.png`,
-=======
 - `--debug` saves a centroid scatter (`overlap_visualizations/overlap/debug_positive_overlap.png`,
->>>>>>> 22eef72 (UFMv1 cls)
   requires matplotlib) alongside the standard logs.
 
 Outputs:

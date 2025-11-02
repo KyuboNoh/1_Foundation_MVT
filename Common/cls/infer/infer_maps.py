@@ -117,11 +117,9 @@ except ImportError:
     tqdm = None
 
 def _mc_predict_single_region(
-    encoder,
+    precomputed_embeddings,
     mlp,
     stack,
-    window_size: int,
-    stride: int,
     passes: int,
     device: str,
     show_progress: bool,
@@ -130,7 +128,18 @@ def _mc_predict_single_region(
     save_path: str = None,
 ):
     torch_mod = _require_torch()
-    encoder.eval().to(device)
+    embedding_array: Optional[np.ndarray] = None
+    embedding_lookup: Optional[Dict[Tuple[int, int], int]] = None
+    embedding_coords: Optional[Sequence[Tuple[int, int]]] = None
+    if precomputed_embeddings is not None:
+        try:
+            embedding_array, embedding_lookup, embedding_coords = precomputed_embeddings  # type: ignore[misc]
+        except ValueError:
+            embedding_array, embedding_lookup = precomputed_embeddings  # type: ignore[misc]
+            embedding_coords = None
+    if embedding_lookup is None:
+        raise ValueError("precomputed_embeddings is required.")
+
     mlp.eval().to(device)
     for module in mlp.modules():
         if isinstance(module, nn.Dropout):
@@ -141,14 +150,18 @@ def _mc_predict_single_region(
     mean_map = np.zeros((H, W), dtype=np.float32)
     var_map  = np.zeros((H, W), dtype=np.float32)
     counts   = np.zeros((H, W), dtype=np.int32)
-    centers = stack.grid_centers(stride)
-    if save_prediction and not hasattr(centers, "__len__"):
-        centers = list(centers)
+    if embedding_coords:
+        centers = list(embedding_coords)
+    else:
+        centers = stack.grid_centers(1)
+        if not isinstance(centers, (list, tuple)):
+            centers = list(centers)
     iterator = centers
     prediction_buffer = None
     next_row = 0
     if save_prediction:
         prediction_buffer = np.empty((len(centers), 4), dtype=np.float32)
+    missing_embeddings = 0
 
     if show_progress and tqdm is not None:
         desc = "MC inference"
@@ -158,24 +171,20 @@ def _mc_predict_single_region(
     elif show_progress and tqdm is None:
         print("[warn] tqdm not installed; progress bar disabled.")
     for r, c in iterator:
-        x = stack.read_patch(r, c, window_size)
-        x = torch_mod.from_numpy(x[None]).to(device)
-        zs = encoder.encode(x)
+        zs = None
+        if embedding_lookup is not None and embedding_array is not None:
+            idx = embedding_lookup.get((int(r), int(c)))
+            if idx is not None:
+                emb_vec = np.asarray(embedding_array[idx], dtype=np.float32)
+                zs = torch_mod.from_numpy(emb_vec.reshape(1, -1)).to(device)
+        if zs is None:
+            missing_embeddings += 1
         preds = []
         for _ in range(passes):
             p = mlp(zs)
             preds.append(p.item())
 
         mu = float(np.mean(preds)); sig2 = float(np.var(preds))
-
-        # Update entire patch
-        # r0, c0 = r - window_size//2, c - window_size//2
-        # r1, c1 = r0 + window_size, c0 + window_size
-        # r0, c0 = max(r0,0), max(c0,0)
-        # r1, c1 = min(r1,H), min(c1,W)
-        # mean_map[r0:r1, c0:c1] += mu
-        # var_map[r0:r1, c0:c1]  += sig2
-        # counts[r0:r1, c0:c1]   += 1
 
         # Update only the center pixel
         mean_map[r, c] += mu
@@ -213,15 +222,31 @@ def _mc_predict_single_region(
     with np.errstate(invalid="ignore"):
         mean_map = np.divide(mean_map, counts, where=counts > 0)
         var_map = np.divide(var_map, counts, where=counts > 0)
+    if embedding_lookup is not None and missing_embeddings:
+        region_label = region_name if region_name else "GLOBAL"
+        print(
+            f"[warn] Missing embedding for {missing_embeddings} sample(s) "
+            f"in region {region_label}; corresponding embeddings were not found."
+        )
     mean_map[counts == 0] = np.nan
     var_map[counts == 0] = np.nan
-    if stride > 1:
-        mean_map = _interpolate_prediction_grid(mean_map, counts)
-        var_map = _interpolate_prediction_grid(var_map, counts)
+    np.maximum(var_map, 0.0, out=var_map)
+
     return mean_map, np.sqrt(var_map)
 
 
-def mc_predict_map(encoder, mlp, stack, window_size=32, stride=16, passes=30, device=None, show_progress=False, save_prediction=False, save_path=None):
+def mc_predict_map_from_embeddings(
+    precomputed_embeddings: Dict[str, Tuple[np.ndarray, Dict[Tuple[int, int], int]]],
+    mlp,
+    stack,
+    stride=16,
+    passes=30,
+    device=None,
+    show_progress=False,
+    save_prediction=False,
+    save_path=None,
+    
+):
     torch_mod = _require_torch()
     if device is None:
         device = 'cuda' if torch_mod.cuda.is_available() else 'cpu'
@@ -230,18 +255,22 @@ def mc_predict_map(encoder, mlp, stack, window_size=32, stride=16, passes=30, de
         if hasattr(stack, "resolve_region_stack") and hasattr(stack, "iter_region_stacks"):
             region_results = {}
             for region_name, region_stack in stack.iter_region_stacks():
+                region_embeddings = None
+                region_key = str(region_name)
+                region_embeddings = precomputed_embeddings.get(region_key)
+                if region_embeddings is None:
+                    region_embeddings = precomputed_embeddings.get("GLOBAL")
+                    
                 region_mean, region_std = _mc_predict_single_region(
-                    encoder,
+                    region_embeddings,
                     mlp,
                     region_stack,
-                    window_size=window_size,
-                    stride=stride,
                     passes=passes,
                     device=device,
                     show_progress=show_progress,
                     region_name=str(region_name),
                     save_prediction=save_prediction,
-                    save_path=save_path
+                    save_path=save_path,                    
                 )
                 region_results[str(region_name)] = {
                     "mean": region_mean,
@@ -251,16 +280,14 @@ def mc_predict_map(encoder, mlp, stack, window_size=32, stride=16, passes=30, de
             return region_results
 
         mean_map, std_map = _mc_predict_single_region(
-            encoder,
+            precomputed_embeddings.get("GLOBAL"),
             mlp,
             stack,
-            window_size=window_size,
-            stride=stride,
             passes=passes,
             device=device,
             show_progress=show_progress,
             save_prediction=save_prediction,
-            save_path=save_path
+            save_path=save_path,            
         )
         return mean_map, std_map
 
@@ -407,7 +434,7 @@ def _resolve_reference_context(
     return reference, valid_mask, boundary_mask
 
 
-def group_positive_coords(
+def group_coords(
     coords: Sequence[Tuple[str, int, int]],
     stack: Any,
 ) -> Dict[str, List[Tuple[int, int]]]:
@@ -527,29 +554,36 @@ def write_prediction_outputs(
             ["#FFFFFF", "#000000"],
         )
 
-        summary_png = mean_path.with_suffix('.png')
-        save_png(
-            summary_png,
-            masked_mean,
-            cmap=blue_yellow,
-            vmin=0.25,
-            valid_mask=valid_mask,
-            boundary_mask=boundary_mask,
-            pos_coords=pos_positions,
-            neg_coords=neg_positions,
-        )
-        std_png = std_path.with_suffix('.png')
-        save_png(
-            std_png,
-            masked_std,
-            cmap=white_black,
-            vmin=0.0,
-            vmax=0.5,
-            valid_mask=valid_mask,
-            boundary_mask=boundary_mask,
-            pos_coords=pos_positions,
-            neg_coords=neg_positions,
-        )
+#        summary_png = mean_path.with_suffix('.png')
+#        summary_scale_png = summary_png.with_name(f"{summary_png.stem}_scale.png")
+#        save_png(
+#            summary_png,
+#            masked_mean,
+#            cmap=blue_yellow,
+#            vmin=0.25,
+#            vmax=1.0,
+#            valid_mask=valid_mask,
+#            boundary_mask=boundary_mask,
+#            pos_coords=pos_positions,
+#            neg_coords=neg_positions,
+#             scale_path=summary_scale_png,
+#             scale_label="Likelihood",
+#         )
+#         std_png = std_path.with_suffix('.png')
+#         std_scale_png = std_png.with_name(f"{std_png.stem}_scale.png")
+#         save_png(
+#             std_png,
+#             masked_std,
+#             cmap=white_black,
+ #            vmin=0.0,
+ #            vmax=0.5,
+#             valid_mask=valid_mask,
+  #           boundary_mask=boundary_mask,
+    #         pos_coords=pos_positions,
+      #       neg_coords=neg_positions,
+        #     scale_path=std_scale_png,
+          #   scale_label="Uncertainty",
+        # )
         mean_std_png = mean_std_path.with_suffix('.png')
         mean_std_scale_png = mean_std_png.with_name(f"{mean_std_png.stem}_scale.png")
         save_png2(
@@ -559,6 +593,10 @@ def write_prediction_outputs(
             cmap1=blue_yellow,
             cmap2=white_black,
             criteria=0.25,
+            vmin1=0.25,
+            vmax1=1.0,            
+            vmin2=0.0,
+            vmax2=0.5,
             valid_mask=valid_mask,
             boundary_mask=boundary_mask,
             pos_coords=pos_positions,
@@ -571,6 +609,17 @@ def write_prediction_outputs(
 def save_geotiff(path, array, ref_src, valid_mask: np.ndarray = None, nodata: float = np.nan):
     if hasattr(ref_src, "profile"):
         profile = ref_src.profile.copy()
+    elif hasattr(ref_src, "srcs") and getattr(ref_src, "srcs"):
+        primary = ref_src.srcs[0]
+        profile = primary.profile.copy()
+        transform = getattr(ref_src, "transform", None)
+        crs = getattr(ref_src, "crs", None)
+        if transform is not None:
+            profile["transform"] = transform
+        if crs is not None:
+            profile["crs"] = crs
+        profile["height"] = int(array.shape[0])
+        profile["width"] = int(array.shape[1])
     elif isinstance(ref_src, dict):
         profile = dict(ref_src.get("profile", ref_src)).copy()
         transform = ref_src.get("transform")
@@ -746,20 +795,21 @@ def save_png(
     path,
     array,
     cmap: str = "viridis",
-    vmin: float = None,
-    vmax: float = None,
+    vmin: Optional[float] = 0.0,
+    vmax: Optional[float] = 1.0,
     valid_mask: np.ndarray = None,
     boundary_mask: np.ndarray = None,
     pos_coords: Sequence[Tuple[int, int]] = None,
     neg_coords: Sequence[Tuple[int, int]] = None,
     *,
-    levels: int = 32,
+    scale_path: Optional[Path] = None,
+    scale_label: str = "Value",
 ) -> None:
     import matplotlib
     if matplotlib.get_backend().lower() != "agg":
         matplotlib.use("Agg", force=True)
     from matplotlib import pyplot as plt
-    from matplotlib.colors import Colormap
+    from matplotlib import colors as mcolors
     import numpy as np
     from skimage.restoration import inpaint_biharmonic
     from scipy.ndimage import gaussian_filter
@@ -788,14 +838,12 @@ def save_png(
         display[:] = 0.0
         finite = np.ones_like(display, dtype=bool)
 
-    if vmin is None:
-        vmin = float(np.nanmin(display[finite]))
-    if vmax is None:
-        vmax = float(np.nanmax(display[finite]))
-    if not np.isfinite(vmin):
-        vmin = 0.0
-    if not np.isfinite(vmax) or vmax == vmin:
-        vmax = vmin + 1.0
+    #vmin_val = float(vmin) if vmin is not None else float(np.nanmin(display[finite]))
+    #vmax_val = float(vmax) if vmax is not None else float(np.nanmax(display[finite]))
+    #if not np.isfinite(vmin_val):
+    #    vmin_val = 0.0
+    #if not np.isfinite(vmax_val) or vmax_val <= vmin_val:
+    #    vmax_val = vmin_val + 1.0
 
     height, width = display.shape
     dpi = 100
@@ -806,37 +854,22 @@ def save_png(
     ax.axis("off")
 
     if isinstance(cmap, str):
-        cmap_obj: Colormap = plt.get_cmap(cmap).copy()
+        cmap_obj = _resolve_cmap(cmap, fallback="viridis")
     else:
-        cmap_obj: Colormap = cmap.copy()
-    cmap_obj.set_bad(color="white")
+        cmap_obj = cmap
+    cmap_work = cmap_obj.copy() if hasattr(cmap_obj, "copy") else cmap_obj
+    # norm = mcolors.Normalize(vmin=vmin_val, vmax=vmax_val, clip=True)
+    norm = mcolors.Normalize(vmin=vmin, vmax=vmax, clip=True)
 
-    x = np.arange(width)
-    y = np.arange(height)
-    masked_display = np.ma.masked_invalid(display)
+    rgba = cmap_work(norm(display))
+    combined_rgb = np.ones((height, width, 3), dtype=np.float32)
+    combined_rgb[finite] = rgba[..., :3][finite]
+    combined_rgb[~finite] = 1.0
 
-    try:
-        levels_int = int(levels)
-    except (TypeError, ValueError):
-        levels_int = 32
-    if levels_int <= 0:
-        levels_int = 32
-    if levels_int < 2:
-        levels_int = 2
-    if vmax <= vmin:
-        level_values = np.linspace(vmin, vmax + 1e-6, max(levels_int, 2))
-    else:
-        level_values = np.linspace(vmin, vmax, levels_int)
-
-    contour = ax.contourf(
-        x,
-        y,
-        masked_display,
-        levels=level_values,
-        cmap=cmap_obj,
-        vmin=vmin,
-        vmax=vmax,
-        extend="both",
+    ax.imshow(
+        combined_rgb,
+        origin="upper",
+        interpolation="none",
     )
 
     if pos_coords:
@@ -871,8 +904,6 @@ def save_png(
 
     if boundary_mask is not None and boundary_mask.shape == display.shape and boundary_mask.any():
         ax.contour(
-            np.arange(width),
-            np.arange(height),
             boundary_mask.astype(np.uint8),
             levels=[0.5],
             colors="black",
@@ -883,9 +914,18 @@ def save_png(
     ax.set_ylim(height - 0.5, -0.5)
     ax.set_aspect("equal")
 
-    fig.colorbar(contour, ax=ax, fraction=0.03, pad=0.02)
     fig.savefig(path, bbox_inches="tight", pad_inches=0, dpi=dpi)
     plt.close(fig)
+
+    if scale_path is not None:
+        scale_fig, scale_ax = plt.subplots(figsize=(1.8, 3.0), dpi=150)
+        sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap_work)
+        cbar = scale_fig.colorbar(sm, cax=scale_ax, orientation="vertical")
+        if scale_label:
+            cbar.set_label(scale_label, fontsize=9)
+        cbar.ax.tick_params(labelsize=8)
+        scale_fig.savefig(scale_path, bbox_inches="tight", pad_inches=0.15)
+        plt.close(scale_fig)
 
 
 
@@ -896,6 +936,10 @@ def save_png2(
     cmap1: str = "plasma",
     cmap2: str = "gray",
     criteria: float = 0.25,
+    vmin1: Optional[float] = 0.25,
+    vmax1: Optional[float] = 1.0,
+    vmin2: Optional[float] = 0.0,
+    vmax2: Optional[float] = 0.5,
     valid_mask: np.ndarray = None,
     boundary_mask: np.ndarray = None,
     pos_coords: Sequence[Tuple[int, int]] = None,
@@ -907,6 +951,10 @@ def save_png2(
         matplotlib.use("Agg", force=True)
     from matplotlib import pyplot as plt
     from matplotlib import colors as mcolors
+    try:
+        from scipy.interpolate import griddata as scipy_griddata
+    except Exception:
+        scipy_griddata = None
 
     mean = np.asarray(mean_array, np.float32)
     std = np.asarray(std_array, np.float32)
@@ -927,33 +975,94 @@ def save_png2(
 
     combined_rgb = np.ones((*mean.shape, 3), dtype=np.float32)
 
-    finite_mean = np.isfinite(mean)
-    finite_std = np.isfinite(std)
-    mean_mask = finite_mean & (mean > criteria)
+    def _interpolate_field(field: np.ndarray) -> np.ndarray:
+        target = np.asarray(field, dtype=np.float32)
+        support = np.ones_like(target, dtype=bool)
+        if valid_mask is not None and valid_mask.shape == target.shape:
+            support &= valid_mask.astype(bool)
+        if boundary_mask is not None and boundary_mask.shape == target.shape:
+            support &= boundary_mask.astype(bool)
+
+        finite_mask = np.isfinite(target) & support
+        if not finite_mask.any():
+            interp = np.full_like(target, np.nan, dtype=np.float32)
+            if boundary_mask is not None and boundary_mask.shape == target.shape:
+                interp[~boundary_mask.astype(bool)] = np.nan
+            return interp
+
+        if scipy_griddata is None:
+            interp = np.full_like(target, np.nan, dtype=np.float32)
+            interp[finite_mask] = target[finite_mask]
+            interp[~support] = np.nan
+            return interp
+
+        points = np.argwhere(finite_mask).astype(np.float32)
+        values = target[finite_mask].astype(np.float32, copy=False)
+        height, width = target.shape
+        grid_y, grid_x = np.meshgrid(
+            np.arange(height, dtype=np.float32),
+            np.arange(width, dtype=np.float32),
+            indexing="ij",
+        )
+
+        interpolated = None
+        for method in ("cubic", "linear", "nearest"):
+            try:
+                guess = scipy_griddata(points[:, ::-1], values, (grid_x, grid_y), method=method)
+            except Exception:
+                continue
+            if guess is None:
+                continue
+            if interpolated is None:
+                interpolated = guess.astype(np.float32, copy=False)
+            else:
+                np.copyto(interpolated, np.asarray(guess, dtype=np.float32), where=np.isnan(interpolated))
+            if method != "nearest":
+                try:
+                    nearest = scipy_griddata(points[:, ::-1], values, (grid_x, grid_y), method="nearest")
+                    interpolated = np.where(np.isnan(interpolated), nearest, interpolated)
+                except Exception:
+                    pass
+            if not np.isnan(interpolated).all():
+                break
+
+        if interpolated is None:
+            interpolated = np.full_like(target, np.nan, dtype=np.float32)
+
+        interpolated[finite_mask] = target[finite_mask]
+        interpolated[~support] = np.nan
+        return interpolated.astype(np.float32, copy=False)
+
+    mean_interp = _interpolate_field(mean)
+    std_interp = _interpolate_field(std)
+
+    finite_mean = np.isfinite(mean_interp)
+    finite_std = np.isfinite(std_interp)
+    mean_mask = finite_mean & (mean_interp > criteria)
     std_mask = finite_std & ~mean_mask
 
     norm_mean = None
     if mean_mask.any():
-        vmin_mean = float(np.nanmin(mean[mean_mask]))
-        vmax_mean = float(np.nanmax(mean[mean_mask]))
+        vmin_mean = float(vmin1) if vmin1 is not None else float(np.nanmin(mean_interp[mean_mask]))
+        vmax_mean = float(vmax1) if vmax1 is not None else float(np.nanmax(mean_interp[mean_mask]))
         if not np.isfinite(vmin_mean):
             vmin_mean = 0.0
-        if not np.isfinite(vmax_mean) or vmax_mean == vmin_mean:
+        if not np.isfinite(vmax_mean) or vmax_mean <= vmin_mean:
             vmax_mean = vmin_mean + 1.0
         norm_mean = mcolors.Normalize(vmin=vmin_mean, vmax=vmax_mean, clip=True)
-        mean_rgba = cmap_mean(norm_mean(mean))
+        mean_rgba = cmap_mean(norm_mean(mean_interp))
         combined_rgb[mean_mask] = mean_rgba[..., :3][mean_mask]
 
     norm_std = None
     if std_mask.any():
-        vmin_std = float(np.nanmin(std[std_mask]))
-        vmax_std = float(np.nanmax(std[std_mask]))
+        vmin_std = float(vmin2) if vmin2 is not None else float(np.nanmin(std_interp[std_mask]))
+        vmax_std = float(vmax2) if vmax2 is not None else float(np.nanmax(std_interp[std_mask]))
         if not np.isfinite(vmin_std):
             vmin_std = 0.0
-        if not np.isfinite(vmax_std) or vmax_std == vmin_std:
+        if not np.isfinite(vmax_std) or vmax_std <= vmin_std:
             vmax_std = vmin_std + 1.0
         norm_std = mcolors.Normalize(vmin=vmin_std, vmax=vmax_std, clip=True)
-        std_rgba = cmap_std(norm_std(std))
+        std_rgba = cmap_std(norm_std(std_interp))
         combined_rgb[std_mask] = std_rgba[..., :3][std_mask]
 
     h, w, _ = combined_rgb.shape
@@ -981,11 +1090,11 @@ def save_png2(
                 coords[:, 1],
                 offset="center",
             )
-            ax.scatter(xs, ys, s=50, c="#00FFFF", edgecolors="black", linewidths=0.4, zorder=5)
+            ax.scatter(xs, ys, s=100, c="red", edgecolors="black", linewidths=1, zorder=5)
         except Exception:
             ys = np.clip(coords[:, 0] + 0.5, 0, h - 0.5)
             xs = np.clip(coords[:, 1] + 0.5, 0, w - 0.5)
-            ax.scatter(xs, ys, s=50, c="#00FFFF", edgecolors="black", linewidths=0.4, zorder=5)
+            ax.scatter(xs, ys, s=100, c="red", edgecolors="black", linewidths=1, zorder=5)
 
     # Positive positions
     if neg_coords:
@@ -997,11 +1106,11 @@ def save_png2(
                 coords[:, 1],
                 offset="center",
             )
-            ax.scatter(xs, ys, s=50, c="#FF6F61", linewidths=0.6, marker="x", zorder=6)
+            ax.scatter(xs, ys, s=100, c="black", linewidths=1, marker="x", zorder=6)
         except Exception:
             ys = np.clip(coords[:, 0] + 0.5, 0, h - 0.5)
             xs = np.clip(coords[:, 1] + 0.5, 0, w - 0.5)
-            ax.scatter(xs, ys, s=50, c="#FF6F61", linewidths=0.6, marker="x", zorder=6)
+            ax.scatter(xs, ys, s=100, c="black", linewidths=1, marker="x", zorder=6)
 
 
 

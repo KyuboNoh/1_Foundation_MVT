@@ -52,7 +52,6 @@ class OptimizationConfig:
     batch_size: int = 256
     epochs: int = 50
     lr: float = 1e-4
-    weight_decay: float = 0.0
     warmup_steps: int = 500
     grad_clip_norm: Optional[float] = 1.0
     log_every: int = 50

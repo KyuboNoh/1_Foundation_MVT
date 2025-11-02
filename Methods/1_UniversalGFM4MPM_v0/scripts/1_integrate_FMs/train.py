@@ -213,7 +213,7 @@ class FMIntegrator:
             params += list(bundle.head.parameters())
             params += list(bundle.projector.parameters())
             params += [bundle.prototype]
-        opt = torch.optim.AdamW(params, lr=self.cfg.optimization.lr, weight_decay=self.cfg.optimization.weight_decay)
+        opt = torch.optim.AdamW(params, lr=self.cfg.optimization.lr,)
         disc_opt = None
         if self.domain_disc is not None:
             disc_opt = torch.optim.AdamW(self.domain_disc.parameters(), lr=self.cfg.optimization.lr * 0.5)

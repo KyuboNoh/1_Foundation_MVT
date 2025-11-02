@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-<<<<<<< HEAD
-=======
 import copy
->>>>>>> 22eef72 (UFMv1 cls)
 import json
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, TYPE_CHECKING
@@ -231,6 +228,194 @@ class OverlapAlignmentWorkspace:
         )
 
 
+class OverlapAlignmentLabels:
+    """
+    Utility that aligns PN-labelled samples across datasets using resolved overlap pairs.
+
+    This helper iterates over the resolved ``OverlapAlignmentPair`` entries exposed by an
+    ``OverlapAlignmentWorkspace`` instance and emits only those pairs where at least one side
+    corresponds to a PN-labelled tile. Each labelled tile is emitted at most once.
+    """
+
+    def __init__(
+        self,
+        workspace: "OverlapAlignmentWorkspace",
+        pn_label_maps: Dict[str, Optional[Dict[str, set[Tuple[str, int, int]]]]],
+    ) -> None:
+        self.workspace = workspace
+        self.pn_label_maps = pn_label_maps
+
+    def build_label_matches(
+        self,
+        *,
+        pairs: Optional[Sequence[OverlapAlignmentPair]] = None,
+        max_coord_error: Optional[float] = None,
+    ) -> List[Dict[str, object]]:
+        """
+        Generate a list of cross-dataset label matches within the provided coordinate tolerance.
+
+        Parameters
+        ----------
+        pairs:
+            Optional precomputed ``OverlapAlignmentPair`` sequence. When omitted, the helper will
+            iterate the workspace directly, applying ``max_coord_error``.
+        max_coord_error:
+            Distance tolerance used if pairs need to be resolved from the workspace.
+
+        Returns
+        -------
+        List[Dict[str, object]]
+            A list of label match payloads. Each item contains anchor/target metadata, PN label
+            assignments (if available), and the Euclidean distance between the matched coordinates.
+        """
+        resolved_pairs: Sequence[OverlapAlignmentPair]
+        if pairs is not None:
+            resolved_pairs = pairs
+        else:
+            resolved_pairs = list(self.workspace.iter_pairs(max_coord_error=max_coord_error))
+
+        matches: List[Dict[str, object]] = []
+        seen_anchor: set[Tuple[str, str, int, int]] = set()
+        seen_target: set[Tuple[str, str, int, int]] = set()
+
+        for pair in resolved_pairs:
+            anchor_info = self._resolve_record_info(pair.anchor_dataset, pair.anchor_record, seen_anchor)
+            target_info = self._resolve_record_info(pair.target_dataset, pair.target_record, seen_target)
+
+            if anchor_info is None and target_info is None:
+                continue
+
+            anchor_payload = anchor_info or self._basic_record_payload(pair.anchor_dataset, pair.anchor_record)
+            target_payload = target_info or self._basic_record_payload(pair.target_dataset, pair.target_record)
+
+            distance = self._coordinate_distance(
+                anchor_payload.get("coord"),
+                target_payload.get("coord"),
+            )
+
+            matches.append(
+                {
+                    "anchor_dataset": pair.anchor_dataset,
+                    "target_dataset": pair.target_dataset,
+                    "label_in_dataset_1": anchor_payload.get("pn_label"),
+                    "label_in_dataset_2": target_payload.get("pn_label"),
+                    "anchor": anchor_payload,
+                    "target": target_payload,
+                    "distance": distance,
+                }
+            )
+
+        return matches
+
+    def _resolve_record_info(
+        self,
+        dataset_name: str,
+        record: "EmbeddingRecord",
+        seen: set[Tuple[str, str, int, int]],
+    ) -> Optional[Dict[str, object]]:
+        pn_map = self.pn_label_maps.get(dataset_name)
+        if not pn_map:
+            return None
+
+        row_col = getattr(record, "row_col", None)
+        region = getattr(record, "region", None)
+        key = self._normalise_key(dataset_name, region, row_col)
+        if key is None:
+            return None
+        _, region_key, row, col = key
+        pn_label = self._lookup_pn_label(pn_map, (region_key, row, col))
+        if pn_label is None:
+            return None
+
+        if key in seen:
+            # Already yielded this PN-labelled tile.
+            return None
+        seen.add(key)
+
+        payload = self._basic_record_payload(dataset_name, record)
+        payload["pn_label"] = pn_label
+        payload["pn_key"] = key
+        return payload
+
+    @staticmethod
+    def _normalise_key(
+        dataset_name: str,
+        region: Optional[object],
+        row_col: Optional[Sequence[object]],
+    ) -> Optional[Tuple[str, str, int, int]]:
+        if row_col is None:
+            return None
+        try:
+            row = int(row_col[0])
+            col = int(row_col[1])
+        except Exception:
+            return None
+        region_key = str(region).upper() if region is not None else "NONE"
+        return (dataset_name, region_key, row, col)
+
+    @staticmethod
+    def _lookup_pn_label(
+        pn_map: Dict[str, set[Tuple[str, int, int]]],
+        key: Tuple[str, int, int],
+    ) -> Optional[int]:
+        region_key, row, col = key
+        candidates: Sequence[Tuple[str, int, int]] = [
+            (region_key, row, col),
+            ("NONE", row, col),
+        ]
+        pos_set = pn_map.get("pos", set())
+        neg_set = pn_map.get("neg", set())
+        for candidate in candidates:
+            if candidate in pos_set:
+                return 1
+            if candidate in neg_set:
+                return 0
+        return None
+
+    @staticmethod
+    def _basic_record_payload(dataset_name: str, record: "EmbeddingRecord") -> Dict[str, object]:
+        coord = getattr(record, "coord", None)
+        if coord is not None:
+            try:
+                coord_payload = (float(coord[0]), float(coord[1]))
+            except Exception:
+                coord_payload = None
+        else:
+            coord_payload = None
+
+        try:
+            index_val = int(getattr(record, "index"))
+        except Exception:
+            index_val = None
+
+        payload: Dict[str, object] = {
+            "dataset": dataset_name,
+            "tile_id": getattr(record, "tile_id", None),
+            "region": getattr(record, "region", None),
+            "row_col": getattr(record, "row_col", None),
+            "coord": coord_payload,
+            "index": index_val,
+            "record_label": int(getattr(record, "label", 0))
+            if getattr(record, "label", None) is not None
+            else None,
+        }
+        return payload
+
+    @staticmethod
+    def _coordinate_distance(
+        coord_a: Optional[Tuple[float, float]],
+        coord_b: Optional[Tuple[float, float]],
+    ) -> Optional[float]:
+        if coord_a is None or coord_b is None:
+            return None
+        try:
+            ax, ay = float(coord_a[0]), float(coord_a[1])
+            bx, by = float(coord_b[0]), float(coord_b[1])
+        except Exception:
+            return None
+        return float(np.linalg.norm([ax - bx, ay - by]))
+
+
 def _summary(values: Sequence[float]) -> Optional[Dict[str, float]]:
     if not values:
         return None
@@ -276,8 +461,6 @@ def _load_integration_metadata(path: Path) -> Dict[str, Dict[str, object]]:
                 spacing = None
             info.setdefault(dataset_key, {})["window_spacing"] = spacing
 
-<<<<<<< HEAD
-=======
     base_dir = path.parent
 
     def _resolve_path(candidate: Optional[str], dataset_root: Optional[str] = None) -> Optional[str]:
@@ -335,5 +518,4 @@ def _load_integration_metadata(path: Path) -> Dict[str, Dict[str, object]]:
                 continue
             meta.setdefault("boundaries", {})["project"] = [copy.deepcopy(fallback_entry)]
 
->>>>>>> 22eef72 (UFMv1 cls)
     return info

@@ -242,10 +242,10 @@ def dataloader_metric_inputORembedding(Xtr, Xval, ytr, yval, batch_size, positiv
 
 
     if extra_train_samples:
-        print(f'[info] Added {len(extra_train_samples)} augmented positive samples to training loader.')
+        print(f'    [info] Added {len(extra_train_samples)} augmented positive samples to training loader.')
 
-    if worker_count == 0:
-        print('[info] Using single-process data loading for raster stack')
+#    if worker_count == 0:
+#        print('[info] Using single-process data loading for raster stack')
     dl_tr = DataLoader(ds_tr, batch_size=batch_size, shuffle=True, num_workers=worker_count)
     dl_va = DataLoader(ds_va, batch_size=batch_size, shuffle=False, num_workers=worker_count)
     metrics_summary["batch_size"] = int(batch_size)

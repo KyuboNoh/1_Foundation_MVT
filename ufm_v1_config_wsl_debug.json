@@ -1,0 +1,43 @@
+{
+  "project_main_dir": "/home/wslqubuntu24/Research/Data/1_Foundation_MVT_Result/",
+  "output_dir": "2_UFM_v1/Ex1_DCCA_dim128",
+  "pipeline_presteps": {
+    "step1_datasets": [
+      {
+        "name": "NA_AU",
+        "main_path": "/gsc-2021-minocc/work/",
+        "embedding_path": "/f21_2_10/2_Labeling_01_10/",
+        "pn_split_path": "/f21_2_10/2_Labeling_01_10/",
+        "region_filter": ["NA"]
+      },
+      {
+        "name": "BC",
+        "main_path": "/Out_Data_Binary_Geophy_Float_Down5/",
+        "embedding_path": "/2_Labeling_01_10/",
+        "pn_split_path": "/2_Labeling_01_10/"
+      }
+    ],
+    "step2_data_integration_project": "2_Integrate_MVT_gcs_bcgs_occ"
+  },
+  "optimization": {
+    "step1_DCCA": {
+      "batch_size": 256,
+      "epochs": 60,
+      "lr": 0.0005,
+      "projection_dim": 128,
+      "mlp_hidden_dims": [256, 128],
+      "validation_fraction": 0.3,
+      "dcca_eps": 1e-5,
+      "singular_value_drop_ratio": 0.01,
+      "tcc_ratio": 0.0005
+    },
+    "step2_CLS": {
+      "batch_size": 256,
+      "epochs": 20,
+      "lr": 0.0005,
+      "mlp_hidden_dims": [256, 128],
+      "validation_fraction": 0.3,
+      "overlapregion_label": "BC"
+    }
+  }
+}
