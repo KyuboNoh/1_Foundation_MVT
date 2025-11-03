@@ -813,7 +813,7 @@ def main() -> None:
             run_logger.log("PN classifier skipped: no PN-labelled samples available for classifier training.")
         else:
             method_iter = _progress_iter(methods_to_run, "CLS methods", leave=False, total=len(methods_to_run))
-            simplefusion_label_counts: Optional[Dict[str, int]] = None
+
             for method in method_iter:
                 run_logger.log(f"Training PN classifier method {method}")
                 method_dir = _prepare_classifier_dir(cfg, method, anchor_name, target_name)
@@ -885,21 +885,17 @@ def main() -> None:
                         )
 
                     if fusion_dataset is None:
-                        run_logger.log("[simplefusion] Dataset preparation failed; skipping simple fusion head.")
+                        run_logger.log("[fusion] Dataset preparation failed; skipping simple fusion head.")
                     else:
-                        simplefusion_label_counts = _count_label_distribution(fusion_dataset["labels"])
-                        if debug_mode:
-                            print(f"[debug] simplefusion label counts: {simplefusion_label_counts}; PN anchor counts: {pn_counts_anchor}; PN target counts: {pn_counts_target}")
-
                         train_idx, val_idx = _overlap_split_indices(fusion_dataset, validation_fraction=cfg.cls_training.validation_fraction, seed = cfg.seed, )
                         if train_idx is None and val_idx is None:
-                            run_logger.log("[simplefusion] Insufficient class diversity for training; skipping simple fusion head.")
+                            run_logger.log("[fusion] Insufficient class diversity for training; skipping simple fusion head.")
                         else:
                             # 4. Split the data like this:
                             dl_tr, dl_val, metrics_summary_simple = _build_dataloaders(fusion_dataset, train_idx, val_idx, cfg,)
 
                             if len(dl_tr.dataset) == 0:
-                                run_logger.log("[simplefusion] Training loader is empty; skipping simple fusion head.")
+                                run_logger.log("[fusion] Training loader is empty; skipping simple fusion head.")
                             else:
                                 # 5. Train MLP (mlp) with dropout
                                 mlp, history_payload, evaluation_summary = _fusion_train_model(fusion_dataset, dl_tr, dl_val, cfg, device, mlp_hidden_dims, mlp_dropout, run_logger,)
@@ -944,14 +940,12 @@ def main() -> None:
                                     inference_outputs = {}
 
                                 # 7. Plot results using Common/cls/infer/infer_maps.write_prediction_outputs like write_prediction_outputs(prediction,stack,out_dir, pos_coords_by_region=pos_coord_map, neg_coords_by_region=neg_coord_map, )
-                                # Use tag of "Unified_head_simplefusion" in out_dir
                                 metrics_summary_simple = dict(metrics_summary_simple)
                                 metrics_summary_simple["train_size"] = int(train_idx.size)
                                 metrics_summary_simple["val_size"] = int(val_idx.size)
-                                if simplefusion_label_counts:
-                                    metrics_summary_simple["label_counts"] = simplefusion_label_counts
+
                                 fusion_summary = _fusion_export_results(fusion_dir, mlp, history_payload, evaluation_summary, metrics_summary_simple, inference_outputs,)
-                                metadata_payload.setdefault("simplefusion", fusion_summary)
+                                metadata_payload.setdefault("fusion 1-1 simple", fusion_summary)
                                 
                     
                     
@@ -1061,12 +1055,11 @@ def main() -> None:
                                     inference_outputs = {}
 
                                 # 7. Plot results using Common/cls/infer/infer_maps.write_prediction_outputs like write_prediction_outputs(prediction,stack,out_dir, pos_coords_by_region=pos_coord_map, neg_coords_by_region=neg_coord_map, )
-                                # Use tag of "Unified_head_simplefusion" in out_dir
                                 metrics_summary_strong = dict(metrics_summary_strong)
                                 metrics_summary_strong["train_size"] = int(train_idx.size)
                                 metrics_summary_strong["val_size"] = int(val_idx.size)
                                 fusion_summary = _fusion_export_results(fusion_dir, mlp, history_payload, evaluation_summary, metrics_summary_strong, inference_outputs,)
-                                metadata_payload.setdefault("strongfusion", fusion_summary)
+                                metadata_payload.setdefault("fusion 1-2 strong", fusion_summary)
 
                     # #################################### Training Classifier using strong fusion for all region ####################################
                     # NOT IMPLEMENTED YET
@@ -3711,98 +3704,98 @@ def _prepare_fusion_overlap_dataset(
     }
     return dataset
 
-def _prepare_simplefusion_dataset(
-    anchor_data: Optional[Dict[str, object]],
-    target_data: Optional[Dict[str, object]],
-    anchor_labels_override: Optional[Sequence[int]] = None,
-    target_labels_override: Optional[Sequence[int]] = None,
-) -> Optional[Dict[str, object]]:
-    if anchor_data is None or target_data is None:
-        return None
-    anchor_features_t = anchor_data.get("features")
-    target_features_t = target_data.get("features")
-    if anchor_features_t is None or target_features_t is None:
-        return None
-    anchor_np = anchor_features_t.detach().cpu().numpy().astype(np.float32, copy=False)
-    target_np = target_features_t.detach().cpu().numpy().astype(np.float32, copy=False)
-    if anchor_np.size == 0 and target_np.size == 0:
-        return None
-    dim_u = anchor_np.shape[1] if anchor_np.size else target_np.shape[1]
-    dim_v = target_np.shape[1] if target_np.size else anchor_np.shape[1]
-    zeros_anchor = np.zeros((anchor_np.shape[0], dim_v), dtype=np.float32)
-    zeros_target = np.zeros((target_np.shape[0], dim_u), dtype=np.float32)
-    anchor_concat = np.concatenate([anchor_np, zeros_anchor], axis=1) if anchor_np.size else np.empty((0, dim_u + dim_v), dtype=np.float32)
-    target_concat = np.concatenate([zeros_target, target_np], axis=1) if target_np.size else np.empty((0, dim_u + dim_v), dtype=np.float32)
-    feature_blocks = [arr for arr in (anchor_concat, target_concat) if arr.size]
-    combined_features = np.vstack(feature_blocks) if feature_blocks else np.empty((0, dim_u + dim_v), dtype=np.float32)
-    if anchor_labels_override is not None:
-        anchor_labels_np = np.asarray(anchor_labels_override, dtype=np.int16)
-    else:
-        anchor_labels_np = np.asarray(anchor_data.get("labels", np.empty(0, dtype=np.int16)), dtype=np.int16)
-    if anchor_labels_np.shape[0] and anchor_labels_np.shape[0] != anchor_np.shape[0]:
-        return None
+# def _prepare_simplefusion_dataset(
+#     anchor_data: Optional[Dict[str, object]],
+#     target_data: Optional[Dict[str, object]],
+#     anchor_labels_override: Optional[Sequence[int]] = None,
+#     target_labels_override: Optional[Sequence[int]] = None,
+# ) -> Optional[Dict[str, object]]:
+#     if anchor_data is None or target_data is None:
+#         return None
+#     anchor_features_t = anchor_data.get("features")
+#     target_features_t = target_data.get("features")
+#     if anchor_features_t is None or target_features_t is None:
+#         return None
+#     anchor_np = anchor_features_t.detach().cpu().numpy().astype(np.float32, copy=False)
+#     target_np = target_features_t.detach().cpu().numpy().astype(np.float32, copy=False)
+#     if anchor_np.size == 0 and target_np.size == 0:
+#         return None
+#     dim_u = anchor_np.shape[1] if anchor_np.size else target_np.shape[1]
+#     dim_v = target_np.shape[1] if target_np.size else anchor_np.shape[1]
+#     zeros_anchor = np.zeros((anchor_np.shape[0], dim_v), dtype=np.float32)
+#     zeros_target = np.zeros((target_np.shape[0], dim_u), dtype=np.float32)
+#     anchor_concat = np.concatenate([anchor_np, zeros_anchor], axis=1) if anchor_np.size else np.empty((0, dim_u + dim_v), dtype=np.float32)
+#     target_concat = np.concatenate([zeros_target, target_np], axis=1) if target_np.size else np.empty((0, dim_u + dim_v), dtype=np.float32)
+#     feature_blocks = [arr for arr in (anchor_concat, target_concat) if arr.size]
+#     combined_features = np.vstack(feature_blocks) if feature_blocks else np.empty((0, dim_u + dim_v), dtype=np.float32)
+#     if anchor_labels_override is not None:
+#         anchor_labels_np = np.asarray(anchor_labels_override, dtype=np.int16)
+#     else:
+#         anchor_labels_np = np.asarray(anchor_data.get("labels", np.empty(0, dtype=np.int16)), dtype=np.int16)
+#     if anchor_labels_np.shape[0] and anchor_labels_np.shape[0] != anchor_np.shape[0]:
+#         return None
 
-    if target_labels_override is not None:
-        target_labels_np = np.asarray(target_labels_override, dtype=np.int16)
-    else:
-        target_labels_np = np.asarray(target_data.get("labels", np.empty(0, dtype=np.int16)), dtype=np.int16)
-    if target_labels_np.shape[0] and target_labels_np.shape[0] != target_np.shape[0]:
-        return None
+#     if target_labels_override is not None:
+#         target_labels_np = np.asarray(target_labels_override, dtype=np.int16)
+#     else:
+#         target_labels_np = np.asarray(target_data.get("labels", np.empty(0, dtype=np.int16)), dtype=np.int16)
+#     if target_labels_np.shape[0] and target_labels_np.shape[0] != target_np.shape[0]:
+#         return None
 
-    combined_labels = np.concatenate([
-        anchor_labels_np,
-        target_labels_np,
-    ]).astype(np.int16, copy=False)
+#     combined_labels = np.concatenate([
+#         anchor_labels_np,
+#         target_labels_np,
+#     ]).astype(np.int16, copy=False)
 
-    metadata: List[Dict[str, object]] = []
-    sources: List[str] = []
-    row_cols: List[Optional[Tuple[int, int]]] = []
-    coords: List[Optional[Tuple[float, float]]] = []
-    for entry in anchor_data.get("metadata", []):
-        new_entry = dict(entry)
-        new_entry.setdefault("source", "anchor")
-        metadata.append(new_entry)
-    pair_ids_anchor = list(anchor_data.get("pair_ids") or range(anchor_np.shape[0]))
-    pair_sources_anchor = list(anchor_data.get("pair_sources") or [None] * anchor_np.shape[0])
-    row_cols.extend(anchor_data.get("row_cols", []))
-    coords.extend(anchor_data.get("coords", []))
-    sources.extend(["anchor"] * anchor_np.shape[0])
-    for entry in target_data.get("metadata", []):
-        new_entry = dict(entry)
-        new_entry.setdefault("source", "target")
-        metadata.append(new_entry)
-    pair_ids_target = list(target_data.get("pair_ids") or range(anchor_np.shape[0], anchor_np.shape[0] + target_np.shape[0]))
-    pair_sources_target = list(target_data.get("pair_sources") or [None] * target_np.shape[0])
-    row_cols.extend(target_data.get("row_cols", []))
-    coords.extend(target_data.get("coords", []))
-    sources.extend(["target"] * target_np.shape[0])
-    if len(pair_ids_anchor) != anchor_np.shape[0]:
-        pair_ids_anchor = list(range(anchor_np.shape[0]))
-    if len(pair_ids_target) != target_np.shape[0]:
-        offset = len(pair_ids_anchor)
-        pair_ids_target = list(range(offset, offset + target_np.shape[0]))
-    if len(pair_sources_anchor) != anchor_np.shape[0]:
-        pair_sources_anchor = [None] * anchor_np.shape[0]
-    if len(pair_sources_target) != target_np.shape[0]:
-        pair_sources_target = [None] * target_np.shape[0]
-    combined_pair_groups = pair_ids_anchor + pair_ids_target
-    combined_pair_sources = pair_sources_anchor + pair_sources_target
-    return {
-        "features": combined_features.astype(np.float32, copy=False),
-        "labels": combined_labels.astype(np.int16, copy=False),
-        "metadata": metadata,
-        "row_cols": row_cols,
-        "coords": coords,
-        "sources": sources,
-        "pair_groups": combined_pair_groups,
-        "pair_sources": combined_pair_sources,
-        "dim_u": dim_u,
-        "dim_v": dim_v,
-        "count_anchor": int(anchor_np.shape[0]),
-        "count_target": int(target_np.shape[0]),
-        "anchor_features": anchor_np,
-        "target_features": target_np,
-    }
+#     metadata: List[Dict[str, object]] = []
+#     sources: List[str] = []
+#     row_cols: List[Optional[Tuple[int, int]]] = []
+#     coords: List[Optional[Tuple[float, float]]] = []
+#     for entry in anchor_data.get("metadata", []):
+#         new_entry = dict(entry)
+#         new_entry.setdefault("source", "anchor")
+#         metadata.append(new_entry)
+#     pair_ids_anchor = list(anchor_data.get("pair_ids") or range(anchor_np.shape[0]))
+#     pair_sources_anchor = list(anchor_data.get("pair_sources") or [None] * anchor_np.shape[0])
+#     row_cols.extend(anchor_data.get("row_cols", []))
+#     coords.extend(anchor_data.get("coords", []))
+#     sources.extend(["anchor"] * anchor_np.shape[0])
+#     for entry in target_data.get("metadata", []):
+#         new_entry = dict(entry)
+#         new_entry.setdefault("source", "target")
+#         metadata.append(new_entry)
+#     pair_ids_target = list(target_data.get("pair_ids") or range(anchor_np.shape[0], anchor_np.shape[0] + target_np.shape[0]))
+#     pair_sources_target = list(target_data.get("pair_sources") or [None] * target_np.shape[0])
+#     row_cols.extend(target_data.get("row_cols", []))
+#     coords.extend(target_data.get("coords", []))
+#     sources.extend(["target"] * target_np.shape[0])
+#     if len(pair_ids_anchor) != anchor_np.shape[0]:
+#         pair_ids_anchor = list(range(anchor_np.shape[0]))
+#     if len(pair_ids_target) != target_np.shape[0]:
+#         offset = len(pair_ids_anchor)
+#         pair_ids_target = list(range(offset, offset + target_np.shape[0]))
+#     if len(pair_sources_anchor) != anchor_np.shape[0]:
+#         pair_sources_anchor = [None] * anchor_np.shape[0]
+#     if len(pair_sources_target) != target_np.shape[0]:
+#         pair_sources_target = [None] * target_np.shape[0]
+#     combined_pair_groups = pair_ids_anchor + pair_ids_target
+#     combined_pair_sources = pair_sources_anchor + pair_sources_target
+#     return {
+#         "features": combined_features.astype(np.float32, copy=False),
+#         "labels": combined_labels.astype(np.int16, copy=False),
+#         "metadata": metadata,
+#         "row_cols": row_cols,
+#         "coords": coords,
+#         "sources": sources,
+#         "pair_groups": combined_pair_groups,
+#         "pair_sources": combined_pair_sources,
+#         "dim_u": dim_u,
+#         "dim_v": dim_v,
+#         "count_anchor": int(anchor_np.shape[0]),
+#         "count_target": int(target_np.shape[0]),
+#         "anchor_features": anchor_np,
+#         "target_features": target_np,
+#     }
 
 
 def _trim_reembedding_entry(
@@ -4000,7 +3993,7 @@ def _align_overlap_embeddings_for_pn(
     _assign_pair_ids(target_slice, target_keys)
 
     if (anchor_slice is None or target_slice is None or anchor_labels.size == 0 or target_labels.size == 0):
-        run_logger.log("[simplefusion] Unable to align embeddings with PN labels; skipping fusion head.")
+        run_logger.log("[fusion @ _align_overlap_embeddings_for_pn] Unable to align embeddings with PN labels; skipping fusion head.")
         return
 
     return anchor_slice, target_slice, anchor_labels, target_labels
@@ -4223,6 +4216,7 @@ def _prepare_fusion_overlap_dataset_for_inference(
         "target_present": target_flags,
         "dim_u": dim_u,
         "dim_v": dim_v,
+        "fusion_method": method_key,
         "name": f"fusion_{method_key}",
     }
     return dataset
@@ -4371,12 +4365,13 @@ def _fusion_run_inference(
     return outputs
 
 
-def _prepare_simplefusion_inference_entry(
+def _prepare_inference_entry(
     entry: Dict[str, object],
     *,
     dim_u: int,
     dim_v: int,
     role: str,
+    method: str = "simple",
 ) -> Optional[Dict[str, object]]:
     features_t = entry.get("features")
     if features_t is None:
@@ -4384,10 +4379,49 @@ def _prepare_simplefusion_inference_entry(
     base_np = features_t.detach().cpu().numpy().astype(np.float32, copy=False)
     if base_np.size == 0:
         return None
+    method_key = method.lower()
+
+    def _pad(vec: np.ndarray, length: int) -> np.ndarray:
+        if vec.shape[1] == length:
+            return vec
+        if vec.shape[1] > length:
+            return vec[:, :length]
+        pad_width = length - vec.shape[1]
+        if pad_width <= 0:
+            return vec
+        zeros = np.zeros((vec.shape[0], pad_width), dtype=np.float32)
+        return np.concatenate([vec, zeros], axis=1)
+
     if role == "anchor":
-        padded = np.concatenate([base_np, np.zeros((base_np.shape[0], dim_v), dtype=np.float32)], axis=1)
+        anchor_vec = _pad(base_np, dim_u)
+        target_vec = np.zeros((base_np.shape[0], dim_v), dtype=np.float32)
     else:
-        padded = np.concatenate([np.zeros((base_np.shape[0], dim_u), dtype=np.float32), base_np], axis=1)
+        anchor_vec = np.zeros((base_np.shape[0], dim_u), dtype=np.float32)
+        target_vec = _pad(base_np, dim_v)
+
+    if method_key == "strong":
+        max_dim = max(dim_u, dim_v)
+        if max_dim <= 0:
+            max_dim = max(base_np.shape[1], 1)
+        anchor_common = _pad(anchor_vec, max_dim)
+        target_common = _pad(target_vec, max_dim)
+        diff_vec = np.abs(anchor_common - target_common)
+        prod_vec = anchor_common * target_common
+        norm_u = np.linalg.norm(anchor_common, axis=1, keepdims=True)
+        norm_v = np.linalg.norm(target_common, axis=1, keepdims=True)
+        cosine = np.divide(
+            (anchor_common * target_common).sum(axis=1, keepdims=True),
+            norm_u * norm_v + 1e-8,
+            out=np.zeros_like(norm_u),
+        )
+        anchor_present = role == "anchor"
+        target_present = role == "target"
+        missing_flag_value = 0.0 if (anchor_present and target_present) else 1.0
+        missing_flag = np.full_like(cosine, missing_flag_value, dtype=np.float32)
+        phi_parts = [anchor_vec, target_vec, diff_vec, prod_vec, cosine.astype(np.float32), missing_flag.astype(np.float32)]
+        padded = np.concatenate(phi_parts, axis=1)
+    else:
+        padded = np.concatenate([anchor_vec, target_vec], axis=1)
     row_cols = entry.get("row_cols_mask") or entry.get("row_cols") or []
     metadata_list = entry.get("metadata") or []
     labels_arr = entry.get("labels")
@@ -4425,8 +4459,8 @@ def _prepare_simplefusion_inference_entry(
 
 def _no_fusion_run_inference(
     dataset: Dict[str, object],
-    simplefusion_anchor_overlap: Optional[Dict[str, object]],
-    simplefusion_target_overlap: Optional[Dict[str, object]],
+    anchor_overlap: Optional[Dict[str, object]],
+    target_overlap: Optional[Dict[str, object]],
     mlp: nn.Module,
     overlap_mask: Optional[Dict[str, object]],
     device: torch.device,
@@ -4435,11 +4469,11 @@ def _no_fusion_run_inference(
 ) -> Dict[str, Dict[str, object]]:
     outputs: Dict[str, Dict[str, object]] = {}
     if overlap_mask is None:
-        run_logger.log("[simplefusion] Overlap mask unavailable; skipping inference exports.")
+        run_logger.log("[no_fusion] Overlap mask unavailable; skipping inference exports.")
         return outputs
     default_reference = _make_mask_reference(overlap_mask)
     if default_reference is None:
-        run_logger.log("[simplefusion] Failed to build mask reference; skipping inference exports.")
+        run_logger.log("[no_fusion] Failed to build mask reference; skipping inference exports.")
         return outputs
     stack = _MaskStack(overlap_mask)
 
@@ -4456,8 +4490,8 @@ def _no_fusion_run_inference(
     dim_u = dataset.get("dim_u")
     dim_v = dataset.get("dim_v")
 
-    anchor_dim = _feature_dim(simplefusion_anchor_overlap)
-    target_dim = _feature_dim(simplefusion_target_overlap)
+    anchor_dim = _feature_dim(anchor_overlap)
+    target_dim = _feature_dim(target_overlap)
     dataset_features = dataset.get("features")
     total_dim = int(dataset_features.shape[1]) if isinstance(dataset_features, np.ndarray) and dataset_features.ndim == 2 else None
 
@@ -4471,23 +4505,25 @@ def _no_fusion_run_inference(
         dim_v = max(total_dim - dim_u, 0)
 
     if dim_u is None or dim_v is None:
-        run_logger.log("[simplefusion] Unable to infer feature dimensions; skipping inference exports.")
+        run_logger.log("[no_fusion] Unable to infer feature dimensions; skipping inference exports.")
         return outputs
 
+    method_key = str(dataset.get("fusion_method") or "simple").lower()
     passes = max(1, int(getattr(cfg.cls_training, "mc_dropout_passes", 30)))
     for role_name, entry, role_flag in (
-        ("anchor", simplefusion_anchor_overlap, "anchor"),
-        ("target", simplefusion_target_overlap, "target"),
+        ("anchor", anchor_overlap, "anchor"),
+        ("target", target_overlap, "target"),
     ):
         print("[info] Inference for :", role_name)
-        inference_entry = _prepare_simplefusion_inference_entry(
+        inference_entry = _prepare_inference_entry(
             entry,
             dim_u=dim_u,
             dim_v=dim_v,
             role=role_flag,
+            method=method_key,
         ) if entry is not None else None
         if inference_entry is None:
-            run_logger.log(f"[simplefusion] No inference embeddings available for dataset {role_name}; skipping.")
+            run_logger.log(f"[no_fusion] No inference embeddings available for dataset {role_name}; skipping.")
             continue
         embedding_array, lookup, coord_list = inference_entry["tuple"]
         prediction = mc_predict_map_from_embeddings(
@@ -4598,10 +4634,10 @@ def _fusion_train_model(
         "loss": float("nan"),
         "weighted_loss": float("nan"),
     }
-    run_logger.log("[simplefusion] Training metrics:")
-    log_metrics("simplefusion train", train_eval, order=DEFAULT_METRIC_ORDER)
+    run_logger.log("[fusion] Training metrics:")
+    log_metrics("fusion train", train_eval, order=DEFAULT_METRIC_ORDER)
     if len(dl_val.dataset):
-        log_metrics("simplefusion val", val_eval, order=DEFAULT_METRIC_ORDER)
+        log_metrics("fusion val", val_eval, order=DEFAULT_METRIC_ORDER)
     history_payload: List[Dict[str, object]] = []
     for record in epoch_history:
         history_payload.append(
