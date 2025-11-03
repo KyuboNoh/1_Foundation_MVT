@@ -6,7 +6,7 @@ import math
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 from datetime import datetime, timezone
 
@@ -24,6 +24,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 from Common.data_utils import (
     clamp_coords_to_window,
     count_valid_window_centers,
+    filter_valid_raster_coords,
     load_stac_rasters,
     MultiRegionStack,
     export_window_center_visualizations,
@@ -40,6 +41,108 @@ from Common.cls.training.train_ssl import _collect_preview_samples, _plot_sample
 # TODO: later check it for AWS
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+Coord = Union[Tuple[int, int], Tuple[str, int, int]]
+CoordKey = Tuple[Optional[str], int, int]
+
+
+def _coord_key(coord: Union[Coord, Dict[str, Any]]) -> CoordKey:
+    if isinstance(coord, dict):
+        region = coord.get("region")
+        row = coord.get("row")
+        col = coord.get("col")
+        if row is None or col is None:
+            raise ValueError(f"Coordinate dictionary missing row/col: {coord}")
+        region_key = None if region is None else str(region)
+        return region_key, int(row), int(col)
+    if isinstance(coord, (tuple, list)):
+        if len(coord) == 3:
+            region, row, col = coord
+            region_key = None if region is None else str(region)
+            return region_key, int(row), int(col)
+        if len(coord) == 2:
+            row, col = coord
+            return None, int(row), int(col)
+    raise TypeError(f"Unsupported coordinate format: {coord!r}")
+
+
+def _draw_random_coord(stack: Any, window: int, rng: np.random.Generator) -> Coord:
+    if hasattr(stack, "random_coord"):
+        coord = stack.random_coord(window, rng)
+        if isinstance(coord, dict):
+            key = _coord_key(coord)
+            region, row, col = key
+            if region is None:
+                return (row, col)
+            return (region, row, col)
+        if isinstance(coord, (tuple, list)):
+            if len(coord) == 3:
+                region, row, col = coord
+                return (str(region), int(row), int(col))
+            if len(coord) == 2:
+                row, col = coord
+                return (int(row), int(col))
+    half = max(1, window // 2)
+    height = getattr(stack, "height", None)
+    width = getattr(stack, "width", None)
+    if height is None or width is None:
+        raise RuntimeError("Stack does not expose spatial dimensions for coordinate sampling")
+    max_row = max(half + 1, height - half)
+    max_col = max(half + 1, width - half)
+    row = int(rng.integers(half, max_row))
+    col = int(rng.integers(half, max_col))
+    clamped, _ = clamp_coords_to_window([(row, col)], stack, window)
+    if not clamped:
+        return (row, col)
+    coord = clamped[0]
+    if isinstance(coord, tuple) and len(coord) == 3:
+        region, r, c = coord
+        return (str(region), int(r), int(c))
+    r, c = coord
+    return (int(r), int(c))
+
+
+def _collect_unique_coords(
+    stack: Any,
+    window: int,
+    total_needed: int,
+    seed: int,
+) -> List[Coord]:
+    total_needed = int(total_needed)
+    if total_needed <= 0:
+        return []
+    rng = np.random.default_rng(int(seed))
+    coords: List[Coord] = []
+    seen: Set[CoordKey] = set()
+    attempts = 0
+    max_attempts = max(total_needed * 50, 1000)
+    batch_limit = 1024
+
+    while len(coords) < total_needed and attempts < max_attempts:
+        remaining = total_needed - len(coords)
+        batch_target = min(batch_limit, max(32, remaining))
+        batch: List[Coord] = []
+        while len(batch) < batch_target and attempts < max_attempts:
+            coord = _draw_random_coord(stack, window, rng)
+            attempts += 1
+            key = _coord_key(coord)
+            if key in seen:
+                continue
+            seen.add(key)
+            batch.append(coord)
+        if not batch:
+            continue
+        if getattr(stack, "kind", None) == "raster":
+            valid, _ = filter_valid_raster_coords(stack, batch, window, min_valid_fraction=0.0)
+        else:
+            valid = batch
+        coords.extend(valid)
+
+    if len(coords) < total_needed:
+        raise RuntimeError(
+            "Unable to collect sufficient unique validation coordinates; check raster coverage or reduce val_samples."
+        )
+    return coords[:total_needed]
+
 class SSLDataset(Dataset):
     def __init__(
         self,
@@ -50,26 +153,63 @@ class SSLDataset(Dataset):
         skip_nan: bool = True,
         max_resample_attempts: int = 32,
         debug_fraction: float = 100.0,
+        coords: Optional[Sequence[Coord]] = None,
+        exclude_coords: Optional[Iterable[Union[Coord, Dict[str, Any]]]] = None,
     ):
         self.stack, self.window = stack, window
         self._base_seed = int(seed)
         self.rng = np.random.default_rng(self._base_seed)
-        self.total_samples = int(n_samples)
         self.skip_nan = bool(skip_nan)
         self.max_resample_attempts = max(1, int(max_resample_attempts))
-        frac = float(debug_fraction)
-        if not np.isfinite(frac):
-            frac = 100.0
-        frac = min(max(frac, 0.0), 100.0)
-        self.debug_fraction = frac
-        if frac >= 100.0:
+        self.fixed_coords: Optional[List[Coord]] = None
+        if coords is not None:
+            formatted: List[Coord] = []
+            for coord in coords:
+                if isinstance(coord, dict):
+                    region = coord.get("region")
+                    row = coord.get("row")
+                    col = coord.get("col")
+                    if region is None:
+                        formatted.append((int(row), int(col)))
+                    else:
+                        formatted.append((str(region), int(row), int(col)))
+                elif isinstance(coord, (tuple, list)):
+                    if len(coord) == 3:
+                        region, row, col = coord
+                        formatted.append((str(region), int(row), int(col)))
+                    elif len(coord) == 2:
+                        row, col = coord
+                        formatted.append((int(row), int(col)))
+                    else:
+                        raise ValueError(f"Unsupported coordinate: {coord!r}")
+                else:
+                    raise TypeError(f"Unsupported coordinate type: {type(coord)}")
+            if not formatted:
+                raise ValueError("At least one coordinate must be provided when coords is not None")
+            self.fixed_coords = formatted
+            self.total_samples = len(self.fixed_coords)
             self.n = self.total_samples
+            self.debug_fraction = 100.0
             self._debug_mode = False
         else:
-            reduced = int(round(self.total_samples * frac / 100.0))
-            self.n = max(1, min(self.total_samples, reduced))
-            self._debug_mode = True
+            self.total_samples = int(n_samples)
+            frac = float(debug_fraction)
+            if not np.isfinite(frac):
+                frac = 100.0
+            frac = min(max(frac, 0.0), 100.0)
+            self.debug_fraction = frac
+            if frac >= 100.0:
+                self.n = self.total_samples
+                self._debug_mode = False
+            else:
+                reduced = int(round(self.total_samples * frac / 100.0))
+                self.n = max(1, min(self.total_samples, reduced))
+                self._debug_mode = True
         self._debug_cache: Dict[int, Dict[str, torch.Tensor]] = {}
+        self.exclude_keys: Set[CoordKey] = set()
+        if exclude_coords is not None:
+            for coord in exclude_coords:
+                self.exclude_keys.add(_coord_key(coord))
 
     def __len__(self):
         return self.n
@@ -93,82 +233,82 @@ class SSLDataset(Dataset):
         }
         return sample
 
+    def _read_patch_from_coord(self, coord: Coord) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        if isinstance(coord, dict):
+            region = coord.get("region")
+            row = coord.get("row")
+            col = coord.get("col")
+            coord = (region, row, col) if region is not None else (row, col)
+
+        if hasattr(self.stack, "resolve_region_stack"):
+            if isinstance(coord, (tuple, list)) and len(coord) == 3:
+                if hasattr(self.stack, "read_patch_with_mask"):
+                    return self.stack.read_patch_with_mask(coord, self.window)
+                patch = self.stack.read_patch(coord, self.window)
+                return patch, None
+            raise ValueError(f"Region-aware stacks require region coordinates, got {coord!r}")
+
+        # Single-region stack
+        if isinstance(coord, (tuple, list)):
+            if len(coord) == 2:
+                row, col = coord
+            elif len(coord) == 3:
+                _, row, col = coord
+            else:
+                raise ValueError(f"Unsupported coordinate {coord!r}")
+        else:
+            raise TypeError(f"Unsupported coordinate {coord!r}")
+
+        if hasattr(self.stack, "read_patch_with_mask"):
+            return self.stack.read_patch_with_mask(int(row), int(col), self.window)
+        patch = self.stack.read_patch(int(row), int(col), self.window)
+        return patch, None
+
     def _draw_patch(self, rng: np.random.Generator) -> Dict[str, torch.Tensor]:
-        if hasattr(self.stack, "sample_patch"):
-            attempts = self.max_resample_attempts if self.skip_nan else 1
-            last_patch = None
-            last_mask = None
-            for _ in range(attempts):
-                sample = self.stack.sample_patch(
-                    self.window,
-                    rng,
-                    skip_nan=self.skip_nan,
-                    max_attempts=self.max_resample_attempts,
-                )
-                patch = None
-                mask = None
-                if isinstance(sample, tuple):
-                    if len(sample) >= 1:
-                        patch = sample[0]
-                    if len(sample) >= 2:
-                        mask = sample[1]
-                else:
-                    patch = sample
-                if patch is None:
-                    continue
-                mask_no_feature = self._ensure_mask(mask, patch)
-                if mask_no_feature.all():
-                    last_patch, last_mask = patch, mask_no_feature
-                    continue
-                last_patch, last_mask = patch, mask_no_feature
-                return self._pack_sample(patch, mask_no_feature)
-
-            if last_patch is not None and last_mask is not None:
-                return self._pack_sample(last_patch, last_mask)
-            raise RuntimeError("sample_patch failed to provide a usable window; verify raster coverage")
-
         attempts = self.max_resample_attempts if self.skip_nan else 1
-        last_patch = None
-        last_mask = None
-        for _ in range(attempts):
-            if hasattr(self.stack, "random_coord"):
-                r, c = self.stack.random_coord(self.window, rng)
-            else:
-                half = max(1, self.window // 2)
-                max_row = max(half + 1, self.stack.height - half)
-                max_col = max(half + 1, self.stack.width - half)
-                r = int(rng.integers(half, max_row))
-                c = int(rng.integers(half, max_col))
-                (clamped_coord, _) = clamp_coords_to_window([(r, c)], self.stack, self.window)
-                r, c = clamped_coord[0]
-            if hasattr(self.stack, "read_patch_with_mask"):
-                x, mask = self.stack.read_patch_with_mask(r, c, self.window)
-            else:
-                x = self.stack.read_patch(r, c, self.window)
-                mask = None
-
-            mask_no_feature = self._ensure_mask(mask, x)
+        last_patch: Optional[np.ndarray] = None
+        last_mask: Optional[np.ndarray] = None
+        tries = 0
+        while tries < attempts:
+            coord = _draw_random_coord(self.stack, self.window, rng)
+            if self.exclude_keys and _coord_key(coord) in self.exclude_keys:
+                continue
+            patch, mask = self._read_patch_from_coord(coord)
+            mask_no_feature = self._ensure_mask(mask, patch)
             if mask_no_feature.all():
+                last_patch, last_mask = patch, mask_no_feature
+                tries += 1
                 continue
-            if self.skip_nan and not np.isfinite(x).all():
+            if self.skip_nan and not np.isfinite(patch).all():
+                last_patch, last_mask = patch, mask_no_feature
+                tries += 1
                 continue
-            last_patch = x
-            last_mask = mask_no_feature
-            return self._pack_sample(x, mask_no_feature)
+            return self._pack_sample(patch, mask_no_feature)
 
-        if self.skip_nan and last_patch is not None and last_mask is not None:
-            raise RuntimeError(
-                f"Failed to sample a finite patch after {self.max_resample_attempts} attempts; "
-                "consider disabling --skip-nan or checking raster nodata handling."
-            )
-        if last_patch is None:
-            raise RuntimeError(
-                "Unable to sample a patch from raster stack; verify raster coverage and metadata."
-            )
-        fallback_mask = last_mask if last_mask is not None else np.zeros(last_patch.shape[-2:], dtype=bool)
-        return self._pack_sample(last_patch, fallback_mask)
+        if last_patch is not None and last_mask is not None:
+            if self.skip_nan:
+                raise RuntimeError(
+                    f"Failed to sample a finite patch after {self.max_resample_attempts} attempts; "
+                    "consider disabling --skip-nan or checking raster nodata handling."
+                )
+            return self._pack_sample(last_patch, last_mask)
+        raise RuntimeError(
+            "Unable to sample a patch from raster stack; verify raster coverage and metadata."
+        )
+
+    def _sample_fixed_coord(self, coord: Coord) -> Dict[str, torch.Tensor]:
+        patch, mask = self._read_patch_from_coord(coord)
+        mask_no_feature = self._ensure_mask(mask, patch)
+        if mask_no_feature.all():
+            raise RuntimeError(f"Fixed coordinate {coord!r} produced no valid pixels")
+        if self.skip_nan and not np.isfinite(patch).all():
+            raise RuntimeError(f"Fixed coordinate {coord!r} contains NaN values; adjust validation sampling")
+        return self._pack_sample(patch, mask_no_feature)
 
     def __getitem__(self, idx):
+        if self.fixed_coords is not None:
+            coord = self.fixed_coords[int(idx) % len(self.fixed_coords)]
+            return self._sample_fixed_coord(coord)
         if self._debug_mode:
             key = int(idx) % self.n
             cached = self._debug_cache.get(key)
@@ -1349,6 +1489,15 @@ if __name__ == '__main__':
     if available_windows is not None:
         effective_val_samples = min(val_samples_requested, available_windows)
 
+    val_coords: List[Coord] = []
+    exclusion_keys: Set[CoordKey] = set()
+    if not args.button_inference and effective_val_samples > 0:
+        print(
+            f"[info] Sampling {effective_val_samples} unique validation window center(s) with seed {args.seed + 997}."
+        )
+        val_coords = _collect_unique_coords(stack, window_size, effective_val_samples, args.seed + 997)
+        exclusion_keys = {_coord_key(coord) for coord in val_coords}
+
     train_ds = SSLDataset(
         stack,
         window=window_size,
@@ -1357,6 +1506,7 @@ if __name__ == '__main__':
         skip_nan=args.skip_nan,
         max_resample_attempts=args.skip_nan_attempts,
         debug_fraction=args.button_debug_fraction,
+        exclude_coords=exclusion_keys if exclusion_keys else None,
     )
     train_details = [f"requested {train_samples_requested}"]
     if available_windows is not None:
@@ -1387,6 +1537,7 @@ if __name__ == '__main__':
             skip_nan=args.skip_nan,
             max_resample_attempts=args.skip_nan_attempts,
             debug_fraction=100.0,
+            coords=val_coords,
         )
         val_details = [f"requested {val_samples_requested}"]
         if available_windows is not None:
