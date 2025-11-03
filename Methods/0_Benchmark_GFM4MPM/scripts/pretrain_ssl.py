@@ -1473,8 +1473,6 @@ if __name__ == '__main__':
     train_samples_requested = max(1, int(train_samples_requested))
 
     effective_train_samples = train_samples_requested
-    if available_windows is not None:
-        effective_train_samples = max(1, min(train_samples_requested, available_windows))
 
     val_samples_requested = args.val_samples
     if val_samples_requested is None:
@@ -1486,15 +1484,22 @@ if __name__ == '__main__':
             val_samples_requested = max(1, effective_train_samples // 8)
     val_samples_requested = max(0, int(val_samples_requested))
     effective_val_samples = val_samples_requested
+    available_for_training: Optional[int] = available_windows
     if available_windows is not None:
         effective_val_samples = min(val_samples_requested, available_windows)
+        available_for_training = max(available_windows - effective_val_samples, 0)
+        if available_for_training <= 0:
+            raise RuntimeError(
+                "Validation samples consume all available window centers; reduce --val-samples or window size."
+            )
+
+    effective_train_samples = train_samples_requested
+    if available_for_training is not None:
+        effective_train_samples = max(1, min(train_samples_requested, available_for_training))
 
     val_coords: List[Coord] = []
     exclusion_keys: Set[CoordKey] = set()
     if not args.button_inference and effective_val_samples > 0:
-        print(
-            f"[info] Sampling {effective_val_samples} unique validation window center(s) with seed {args.seed + 997}."
-        )
         val_coords = _collect_unique_coords(stack, window_size, effective_val_samples, args.seed + 997)
         exclusion_keys = {_coord_key(coord) for coord in val_coords}
 
@@ -1509,8 +1514,10 @@ if __name__ == '__main__':
         exclude_coords=exclusion_keys if exclusion_keys else None,
     )
     train_details = [f"requested {train_samples_requested}"]
-    if available_windows is not None:
-        train_details.append(f"available {available_windows}")
+    if available_for_training is not None:
+        train_details.append(f"available after val {available_for_training}")
+        if effective_val_samples:
+            train_details.append(f"held-out {effective_val_samples}")
     if args.button_debug_fraction < 100.0:
         train_details.append(f"debug fraction {args.button_debug_fraction:.2f}%")
     print(f"[info] Training samples per epoch: {len(train_ds)} ({', '.join(train_details)})")
