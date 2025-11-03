@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import math
@@ -45,28 +46,19 @@ except Exception:  # pragma: no cover - optional dependency
     CRS = Transformer = None  # type: ignore[assignment]
 
 from .config import AlignmentConfig, load_config
-from .workspace import (
-    DatasetBundle,
-    OverlapAlignmentPair,
-    OverlapAlignmentWorkspace,
-    OverlapAlignmentLabels,
-)
+from .workspace import (DatasetBundle, OverlapAlignmentPair, OverlapAlignmentWorkspace, OverlapAlignmentLabels,)
 from .datasets import auto_coord_error
 from Common.overlap_debug_plot import save_overlap_debug_plot
 from sklearn.model_selection import train_test_split
 
-from Common.cls.infer.infer_maps import (
-    group_coords,
-    mc_predict_map_from_embeddings,
-    write_prediction_outputs,
-)
+from Common.cls.infer.infer_maps import (group_coords, mc_predict_map_from_embeddings, write_prediction_outputs,)
 from Common.cls.models.mlp_dropout import MLPDropout
-from Common.cls.training.train_cls import (
-    dataloader_metric_inputORembedding,
-    eval_classifier,
-    train_classifier,
-)
+from Common.cls.training.train_cls import (dataloader_metric_inputORembedding, eval_classifier, train_classifier,)
 from Common.metrics_logger import DEFAULT_METRIC_ORDER, log_metrics, normalize_metrics, save_metrics_json
+from Common.Unifying.Labels_TwoDatasets import (
+    _normalise_cross_matches, _prepare_classifier_labels, _build_aligned_pairs, _serialise_sample, _normalise_coord, _normalise_row_col)
+from Common.Unifying.Labels_TwoDatasets.splits import _overlap_split_indices
+
 
 INFERENCE_BATCH_SIZE = 2048
 
@@ -86,6 +78,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug", action="store_true", help="Enable debug diagnostics and save overlap figures.")
     parser.add_argument("--validation-split", type=float, default=0.2, help="Fraction of aligned pairs reserved for validation evaluation (set to 0 to disable).", )
     parser.add_argument("--train-dcca", action=argparse.BooleanOptionalAction, default=True, help="Train the DCCA projection heads (default: true). Use --no-train-dcca to disable.",)
+    parser.add_argument("--run-inference", action=argparse.BooleanOptionalAction, default=False, help="Run inference on aligned datasets after training (default: false).",)
     parser.add_argument("--read-dcca",  action=argparse.BooleanOptionalAction, default=False,help="Load existing DCCA projection head weights before training (default: false).",)
     parser.add_argument("--dcca-weights-path", type=str, default=None, help="Optional path to a saved DCCA checkpoint used when --read-dcca is enabled.",)
 
@@ -137,6 +130,7 @@ def main() -> None:
     cfg = load_config(config_path)
     print(cfg.dcca_training)
     print(cfg.cls_training)
+    
 
     if torch is None or nn is None or DataLoader is None:
         raise ImportError("Overlap alignment training requires PyTorch; install torch before running the trainer.")
@@ -167,6 +161,7 @@ def main() -> None:
         cfg.use_positive_augmentation = True
     debug_mode = bool(args.debug)
     device = torch.device("gpu" if torch.cuda.is_available() else "cpu")
+    run_logger = _RunLogger(cfg)
 
     train_dcca = bool(args.train_dcca)
     read_dcca = bool(args.read_dcca)
@@ -185,6 +180,7 @@ def main() -> None:
 
     workspace = OverlapAlignmentWorkspace(cfg)
     anchor_name, target_name = _dataset_pair(cfg)
+
     max_coord_error = auto_coord_error(workspace, anchor_name, target_name)
     pairs = list(workspace.iter_pairs(max_coord_error=max_coord_error))
     debug_overlap_stats = _compute_overlap_debug(pairs, anchor_name, target_name) if debug_mode else None
@@ -216,16 +212,24 @@ def main() -> None:
     pn_label_maps: Dict[str, Optional[Dict[str, set[Tuple[str, int, int]]]]] = {
         dataset_cfg.name: _load_pn_lookup(dataset_cfg.pn_split_path) for dataset_cfg in cfg.datasets
     }
+    dataset_region_filters: Dict[str, Optional[List[str]]] = {
+        dataset_cfg.name: dataset_cfg.region_filter for dataset_cfg in cfg.datasets
+    }
     for dataset_cfg in cfg.datasets:
         lookup = pn_label_maps.get(dataset_cfg.name)
         if not lookup:
             print(f"[info] PN labels unavailable for dataset {dataset_cfg.name}")
             continue
-        pos_count = len(lookup.get("pos", ()))
-        neg_count = len(lookup.get("neg", ()))
-        print(f"[info] PN label counts for {dataset_cfg.name}: pos={pos_count}, neg={neg_count}")
-
-
+        counts_filtered = _count_pn_lookup(lookup, dataset_cfg.region_filter)
+        region_desc = dataset_cfg.region_filter if dataset_cfg.region_filter else ["ALL"]
+        print(
+            "[info] PN label counts for {name} (regions={regions}): pos={pos}, neg={neg}".format(
+                name=dataset_cfg.name,
+                regions=",".join(region_desc),
+                pos=counts_filtered["positive"],
+                neg=counts_filtered["negative"],
+            )
+        )
 
     (anchor_vecs, target_vecs, label_hist, debug_data, 
      augmentation_stats, pair_metadata, pn_index_summary) = _build_aligned_pairs(
@@ -245,7 +249,8 @@ def main() -> None:
     label_cross_matches = label_matcher.build_label_matches(
         pairs=pairs,
         max_coord_error=max_coord_error,
-    )    
+    )
+    label_cross_matches = _normalise_cross_matches(label_cross_matches, anchor_name, target_name)
 
     if debug_mode:
         def _count_labels(entries: List[Dict[str, object]], field: str) -> Counter:
@@ -262,8 +267,8 @@ def main() -> None:
             return counter
         dataset1_match_counts = _count_labels(label_cross_matches, "label_in_dataset_1")
         dataset2_match_counts = _count_labels(label_cross_matches, "label_in_dataset_2")
-        print(f"[debug] label matches in {anchor_name}: {dict(dataset1_match_counts)}")
-        print(f"[debug] label matches in {target_name}: {dict(dataset2_match_counts)}")
+        print(f"[debug] label matches in {anchor_name} using label in {target_name}: {dict(dataset1_match_counts)}")
+        print(f"[debug] label matches in {target_name} using label in {target_name}: {dict(dataset2_match_counts)}")
 
     pairs_by_region = defaultdict(lambda: Counter())
     for meta in pair_metadata:
@@ -422,7 +427,6 @@ def main() -> None:
         except (TypeError, ValueError):
             dcca_eps_value = 1e-5
 
-        run_logger = _RunLogger(cfg)
         if read_dcca and weights_path is not None:
             run_logger.log(f"Reading DCCA weights from {weights_path}")
             run_logger.log(
@@ -497,8 +501,8 @@ def main() -> None:
             "augmentation_stats": augmentation_stats,
             "pn_index_summary": pn_index_summary,
             "pn_label_counts": {
-                "anchor": _count_pn_lookup(pn_label_maps.get(anchor_name)),
-                "target": _count_pn_lookup(pn_label_maps.get(target_name)),
+                "anchor": _count_pn_lookup(pn_label_maps.get(anchor_name), dataset_region_filters.get(anchor_name)),
+                "target": _count_pn_lookup(pn_label_maps.get(target_name), dataset_region_filters.get(target_name)),
             },
             "cross_index_matches": label_cross_matches,
         }
@@ -662,6 +666,24 @@ def main() -> None:
 
     #################################### Training Classifier after Overlap Alignment ####################################
     if args.train_cls:
+        
+        if not train_dcca:
+            projector_missing = ('projector_a' not in locals() or projector_a is None or
+                                 'projector_b' not in locals() or projector_b is None)
+            weights_candidate = _resolve_dcca_weights_path(cfg, args.dcca_weights_path)
+            if projector_missing:
+                if weights_candidate is None or not weights_candidate.exists():
+                    raise FileNotFoundError(
+                        "DCCA projection heads are required for classifier training but no weights were found. "
+                        "Provide --dcca-weights-path or ensure overlap_alignment_stage1.pt exists."
+                    )
+                run_logger.log(f"[cls] Loading DCCA projection heads from {weights_candidate}")
+                (state_a_dict, state_b_dict), _ = _load_pretrained_dcca_state(weights_candidate)
+                projector_a = _projection_head_from_state(state_a_dict).to(device)
+                projector_b = _projection_head_from_state(state_b_dict).to(device)
+            else:
+                projector_a = projector_a.to(device)
+                projector_b = projector_b.to(device)
 
         classifier_results: Dict[str, Dict[str, object]] = {}
         projector_a.eval()
@@ -703,19 +725,6 @@ def main() -> None:
                 run_logger.log(f"[cls] projector unavailable for dataset {dataset_name}; skipping.")
                 continue
 
-            # sample_set = _collect_classifier_samples(
-            #     workspace=workspace,
-            #     label_matcher = label_matcher,
-            #     dataset_name=dataset_name,
-            #     pn_lookup=pn_label_maps.get(dataset_name),
-            #     label_cross_matches = label_cross_matches, 
-            #     projector=projector,
-            #     device=device,
-            #     run_logger=run_logger,
-            #     overlap_mask=overlap_mask_info,
-            #     apply_overlap_filter=False,
-            # )
-
             sample_set = _collect_classifier_samples(
                 workspace=workspace,
                 dataset_name=dataset_name,
@@ -727,20 +736,9 @@ def main() -> None:
                 apply_overlap_filter=False,
             )
 
-            # method1_data, method2_data = _prepare_classifier_inputs(
-            #     anchor_name=anchor_name,
-            #     target_name=target_name,
-            #     sample_sets=sample_sets,
-            #     validation_fraction=validation_split,
-            #     seed=int(cfg.seed),
-            # )
-            # pn_counts_anchor = _count_pn_lookup(pn_label_maps.get(anchor_name))
-            # pn_counts_target = _count_pn_lookup(pn_label_maps.get(target_name))
-            # if debug_mode:
-            #     print(f"[debug] PN label counts anchor: {pn_counts_anchor}, target: {pn_counts_target}")
-        if sample_set:
-            sample_sets[dataset_name] = sample_set
-            label_summary_meta[dataset_name] = _summarise_sample_labels(sample_set)
+            if sample_set:
+                sample_sets[dataset_name] = sample_set
+                label_summary_meta[dataset_name] = _summarise_sample_labels(sample_set)
 
         # 1. compute u from embeddings of dataset A (all region - but overlap-aware) and trained DCCA
         DCCAEmbedding_anchor_all = reembedding_DCCA(workspace, anchor_name, projector_a, device, overlap_mask=overlap_mask_info, mask_only=False, )
@@ -751,21 +749,64 @@ def main() -> None:
         # 2-2. read v (take only overlap region) (simplefusion_target)
         DCCAEmbedding_target_overlap = _extract_reembedding_overlap(DCCAEmbedding_target_all, overlap_mask_info)
 
-        index_label_anchor_all, index_label_anchor_overlap, index_label_target_all, index_label_target_overlap = _prepare_classifier_labels(
-            workspace=workspace,
-            label_matcher = label_matcher,
-            dataset_name=dataset_name,
+        (
+            index_label_anchor_all,
+            index_label_anchor_overlap,
+            index_label_target_all,
+            index_label_target_overlap,
+        ) = _prepare_classifier_labels(
+            meta_anchor_all=DCCAEmbedding_anchor_all,
+            meta_anchor_overlap=DCCAEmbedding_anchor_overlap,
+            meta_target_all=DCCAEmbedding_target_all,
+            meta_target_overlap=DCCAEmbedding_target_overlap,
             overlapregion_label=cfg.cls_training.overlapregion_label,
-            label_cross_matches = label_cross_matches, 
-            pn_lookup=pn_label_maps.get(dataset_name),
+            label_cross_matches=label_cross_matches,
+            sample_sets=sample_sets,
+            pn_label_maps=pn_label_maps,
             anchor_name=anchor_name,
             target_name=target_name,
-            sample_sets=sample_sets,
-            validation_fraction=validation_split,
+            debug=debug_mode,
+            run_logger=run_logger,
+            label_matcher=label_matcher,
         )
-            
-        pn_counts_anchor = _count_pn_lookup(pn_label_maps.get(anchor_name))
-        pn_counts_target = _count_pn_lookup(pn_label_maps.get(target_name))
+
+        if debug_mode:
+            def _summarise_label_indices(tag: str, payload: Dict[str, object]) -> None:
+                labels_raw = payload.get("labels") if payload else []
+                if isinstance(labels_raw, np.ndarray):
+                    labels_list = labels_raw.tolist()
+                else:
+                    labels_list = list(labels_raw or [])
+                counts = _count_label_distribution(labels_list)
+                coords_raw = payload.get("coords") if payload else []
+                pos_coords: List[Tuple[float, float]] = []
+                neg_coords: List[Tuple[float, float]] = []
+                for lbl, coord in zip(labels_list, coords_raw or []):
+                    if coord is None:
+                        continue
+                    try:
+                        if int(lbl) > 0:
+                            pos_coords.append(coord)
+                        else:
+                            neg_coords.append(coord)
+                    except Exception:
+                        continue
+                run_logger.log(
+                    "[debug] {tag} counts {counts}, pos_coords={pos}, neg_coords={neg}".format(
+                        tag=tag,
+                        counts=counts,
+                        pos=len(pos_coords),
+                        neg=len(neg_coords),
+                    )
+                )
+
+            _summarise_label_indices("anchor_all", index_label_anchor_all)
+            _summarise_label_indices("anchor_overlap", index_label_anchor_overlap)
+            _summarise_label_indices("target_all", index_label_target_all)
+            _summarise_label_indices("target_overlap", index_label_target_overlap)
+
+        pn_counts_anchor = _count_pn_lookup(pn_label_maps.get(anchor_name), dataset_region_filters.get(anchor_name))
+        pn_counts_target = _count_pn_lookup(pn_label_maps.get(target_name), dataset_region_filters.get(target_name))
         if debug_mode:
             print(f"[debug] PN label counts anchor: {pn_counts_anchor}, target: {pn_counts_target}")
 
@@ -794,116 +835,114 @@ def main() -> None:
                 if method == 1:
                     
                     #################################### Training Classifier using simple fusion ####################################
-                    run_logger.log(f"Training PN classifier method {method} - simple fusion head")
                     # Construct MLP classifier using "simple fusion" unified method - [u, v] inputs
-                    # 1. read u (take only overlap region) (simplefusion_anchor)
-
-                    # 2. read v (take only overlap region) (simplefusion_target)
-
-                    aligned_anchor_overlap, aligned_target_overlap, aligned_labels = _align_overlap_embeddings_for_pn(
+                    run_logger.log(f"Training PN classifier method {method} - simple fusion head")
+                    # 1. read u (take only overlap region) 
+                    # 2. read v (take only overlap region)
+                    (
+                        aligned_embedding_anchor_overlap,
+                        aligned_embedding_target_overlap,
+                        aligned_labels_anchor_overlap,
+                        aligned_labels_target_overlap,
+                    ) = _align_overlap_embeddings_for_pn(
                         DCCAEmbedding_anchor_overlap,
                         DCCAEmbedding_target_overlap,
-                        pn_label_maps=pn_label_maps,
+                        index_label_anchor_overlap=index_label_anchor_overlap,
+                        index_label_target_overlap=index_label_target_overlap,
                         anchor_name=anchor_name,
                         target_name=target_name,
                     )
-                    if aligned_anchor_overlap is None or aligned_target_overlap is None or aligned_labels.size == 0:
-                        run_logger.log("[simplefusion] Unable to align overlap embeddings with PN labels; skipping simple fusion head.")
-                        continue
-
-                    def embedding_size(entry):
-                        if not entry:
-                            return 0
-                        feats = entry.get("features")
-                        if isinstance(feats, torch.Tensor):
-                            return feats.size(0)
-                        if feats is not None:
-                            return len(feats)
-                        indices = entry.get("indices")
-                        return len(indices) if indices is not None else 0
-                    if debug_mode:
-                        print(
-                            "[debug] Embedding sizes:",
-                            embedding_size(DCCAEmbedding_anchor_all),
-                            embedding_size(DCCAEmbedding_target_all),
-                            embedding_size(aligned_anchor_overlap),
-                            embedding_size(aligned_target_overlap),
-                        )
 
                     # 3. concatenate [u, v] and prepare label (synthesize positive (positivie_all=[positive from A, positive from B]) and negative samples)
-                    simplefusion_labels = aligned_labels
-                    # simplefusion_dataset = _prepare_simplefusion_dataset(
-                    #     aligned_anchor_overlap,
-                    #     aligned_target_overlap,
-                    #     anchor_labels_override=simplefusion_labels,
-                    # )
-                    simplefusion_dataset = _prepare_simplefusion_dataset(
-                        aligned_anchor_overlap,
-                        aligned_target_overlap,
-                        label,,,,,
-                        anchor_labels_override=simplefusion_labels,
+                    fusion_dataset = _prepare_fusion_overlap_dataset(
+                        aligned_embedding_anchor_overlap,
+                        aligned_embedding_target_overlap,
+                        aligned_labels_anchor_overlap, 
+                        aligned_labels_target_overlap,
+                        anchor_name=anchor_name,
+                        target_name=target_name,
+                        method_id="simple"
                     )
 
-                    if simplefusion_dataset is not None:
-                        simplefusion_label_counts = _count_label_distribution(simplefusion_dataset["labels"])
-                        if debug_mode:
-                            print(
-                                f"[debug] simplefusion label counts: {simplefusion_label_counts}; "
-                                f"PN anchor counts: {pn_counts_anchor}; "
-                                f"PN target counts: {pn_counts_target}"
-                            )
+                    if debug_mode:
+                        print(
+                            "[debug] overlap embedding sizes:",
+                            DCCAEmbedding_anchor_overlap["features"].shape if DCCAEmbedding_anchor_overlap else None,
+                            DCCAEmbedding_target_overlap["features"].shape if DCCAEmbedding_target_overlap else None,
+                            len(index_label_anchor_overlap["labels"]) if index_label_anchor_overlap else 0,
+                            len(index_label_target_overlap["labels"]) if index_label_target_overlap else 0,
+                        )
+                        print(
+                            "[debug] overlap alignment sizes:",
+                            aligned_embedding_anchor_overlap["features"].shape if aligned_embedding_anchor_overlap else None,
+                            aligned_embedding_target_overlap["features"].shape if aligned_embedding_target_overlap else None,
+                            aligned_labels_anchor_overlap.size,
+                            aligned_labels_target_overlap.size,
+                        )
+                        print(
+                            "[debug] prepared data sizes:",
+                            fusion_dataset["features"].shape if fusion_dataset else None,
+                            fusion_dataset["labels"].size,
+                        )
 
-                    if simplefusion_dataset is None:
+                    if fusion_dataset is None:
                         run_logger.log("[simplefusion] Dataset preparation failed; skipping simple fusion head.")
                     else:
-                        split_indices = _simplefusion_split_indices(
-                            simplefusion_dataset,
-                            validation_split,
-                            cfg.seed,
-                        )
-                        if split_indices is None:
+                        simplefusion_label_counts = _count_label_distribution(fusion_dataset["labels"])
+                        if debug_mode:
+                            print(f"[debug] simplefusion label counts: {simplefusion_label_counts}; PN anchor counts: {pn_counts_anchor}; PN target counts: {pn_counts_target}")
+
+                        train_idx, val_idx = _overlap_split_indices(fusion_dataset, validation_fraction=cfg.cls_training.validation_fraction, seed = cfg.seed, )
+                        if train_idx is None and val_idx is None:
                             run_logger.log("[simplefusion] Insufficient class diversity for training; skipping simple fusion head.")
                         else:
-                            train_idx, val_idx = split_indices
+                            # 4. Split the data like this:
+                            dl_tr, dl_val, metrics_summary_simple = _simplefusion_build_dataloaders(fusion_dataset, train_idx, val_idx, cfg,)
 
-                            # 4. Split the data like this:     
-                            # Xtr, Xval, ytr, yval = train_test_split(coords, labels, test_size=args.test_ratio, stratify=labels, random_state=args.random_seed)
-                            dl_tr, dl_val, metrics_summary_simple = _simplefusion_build_dataloaders(
-                                simplefusion_dataset,
-                                train_idx,
-                                val_idx,
-                                cfg,
-                            )
                             if len(dl_tr.dataset) == 0:
                                 run_logger.log("[simplefusion] Training loader is empty; skipping simple fusion head.")
                             else:
                                 # 5. Train MLP (mlp) with dropout
-                                # mlp = MLPDropout(in_dim=in_dim, hidden_dims=hidden_dims, p=float(args.mlp_dropout))
-                                mlp_simple, history_payload, evaluation_summary = _simplefusion_train_model(
-                                    simplefusion_dataset,
-                                    dl_tr,
-                                    dl_val,
-                                    cfg,
-                                    device,
-                                    mlp_hidden_dims,
-                                    mlp_dropout,
-                                    run_logger,
-                                )
+                                mlp, history_payload, evaluation_summary = _simplefusion_train_model(fusion_dataset, dl_tr, dl_val, cfg, device, mlp_hidden_dims, mlp_dropout, run_logger,)
 
-                                simplefusion_dir = Path(method_dir) / "Unified_head_simplefusion"
+                                fusion_dir = Path(method_dir) / "Unified_head_simplefusion"
 
                                 # 6. run inference across overlap datasets after training
                                 # Use function this "    prediction = mc_predict_map_from_embeddings(precomputed_embeddings_map,mlp,stack,passes=args.passes,show_progress=True,save_prediction=args.save_prediction,save_path=out_dir,)"
-                                inference_outputs = _simplefusion_run_inference(
-                                    simplefusion_dataset,
-                                    DCCAEmbedding_anchor_overlap,
-                                    DCCAEmbedding_target_overlap,
-                                    mlp_simple,
-                                    overlap_mask_info,
-                                    device,
-                                    cfg,
-                                    run_logger,
-                                )
+                                if args.run_inference:
+                                    inference_outputs = _no_fusion_run_inference(
+                                        fusion_dataset,
+                                        DCCAEmbedding_anchor_overlap,
+                                        DCCAEmbedding_target_overlap,
+                                        mlp,
+                                        overlap_mask_info,
+                                        device,
+                                        cfg,
+                                        run_logger,
+                                    )
+
+                                    # TODO: Prepare fusion dataset for inference and use _no_fusion_run_inference
+                                    # Prepare fusion dataset for inference; mind that the number of embeddings are different within overlaping region by datasets due to different resolution. 
+                                    # Mind that the all data should be matched to construct phi (phi = [u;v] or phi = [u; v; |u-v|; u*v; cosine(u,v)]) pairs for inference.
+                                    # The matching should be based on coordinates within DCCAEmbedding_anchor_overlap, DCCAEmbedding_target_overlap.
+                                    fusion_dataset_for_inference = _prepare_fusion_overlap_dataset_for_inference(
+                                        DCCAEmbedding_anchor_overlap,
+                                        DCCAEmbedding_target_overlap,
+                                        method_id="simple"
+                                    )
+
+                                    inference_output = _fusion_run_inference(
+                                        fusion_dataset_for_inference,
+                                        mlp,
+                                        overlap_mask_info,
+                                        device,
+                                        cfg,
+                                        run_logger,
+                                    )
+
+                                    inference_outputs.append(inference_output)
+                                else:
+                                    inference_outputs = None
 
                                 # 7. Plot results using Common/cls/infer/infer_maps.write_prediction_outputs like write_prediction_outputs(prediction,stack,out_dir, pos_coords_by_region=pos_coord_map, neg_coords_by_region=neg_coord_map, )
                                 # Use tag of "Unified_head_simplefusion" in out_dir
@@ -912,259 +951,116 @@ def main() -> None:
                                 metrics_summary_simple["val_size"] = int(val_idx.size)
                                 if simplefusion_label_counts:
                                     metrics_summary_simple["label_counts"] = simplefusion_label_counts
-
-                                simplefusion_summary = _simplefusion_export_results(
-                                    simplefusion_dir,
-                                    mlp_simple,
-                                    history_payload,
-                                    evaluation_summary,
-                                    metrics_summary_simple,
-                                    inference_outputs,
-                                )
-                                metadata_payload.setdefault("simplefusion", simplefusion_summary)
-
-                    exit()
-                    #################################### Training Classifier using strong fusion for all region ####################################
-                    run_logger.log(f"Training PN classifier method {method} - strong fusion head for all region")
-                    strongfusion_dataset_all: Optional[Dict[str, object]] = None
-                    strongfusion_inference_map_all: Dict[str, Optional[Dict[str, object]]] = {}
-                    strongfusion_mask_map_all: Dict[str, Dict[str, object]] = {}
-
-                    # Construct MLP classifier using "strong fusion" unified method - ϕ=[u;v;∣u−v∣;u⊙v;cos(u,v)] inputs - all region
-                    # 1. read u (all region)
-                    strongfusion_anchor_all = DCCAEmbedding_anchor_all
-
-                    # 2. read v (all region)
-                    strongfusion_target_all = DCCAEmbedding_target_all
-
-                    # 3. prepare ϕ (overlap region) and prepare label (overlap region) (synthesize positive (positivie_all=[positive from A, positive from B]) and negative samples)
-                    strongfusion_prepared = _prepare_strongfusion_dataset_all(
-                        cfg=cfg,
-                        dataset_meta_map=dataset_meta_map,
-                        anchor_name=anchor_name,
-                        target_name=target_name,
-                        anchor_all=strongfusion_anchor_all,
-                        target_all=strongfusion_target_all,
-                        run_logger=run_logger,
-                    )
-
-
-                    if strongfusion_prepared is None:
-                        run_logger.log("[strongfusion] Dataset preparation failed; skipping strong fusion head.")
-                    else:
-                        strongfusion_dataset, strongfusion_inference_map, strongfusion_mask_map = strongfusion_prepared
-                        strongfusion_dataset_all = strongfusion_dataset
-                        strongfusion_inference_map_all = strongfusion_inference_map
-                        strongfusion_mask_map_all = strongfusion_mask_map
-                        train_rows, val_rows = _strongfusion_map_method1_indices(
-                            strongfusion_dataset,
-                            method1_data,
-                            anchor_name,
-                            target_name,
-                            run_logger,
-                        )
-                        if train_rows.size == 0:
-                            run_logger.log("[strongfusion] No training samples aligned to the unified grid; skipping strong fusion head.")
-                        else:
-                            dl_tr_strong, dl_val_strong, metrics_summary_strong = _strongfusion_build_dataloaders(
-                                strongfusion_dataset,
-                                train_rows,
-                                val_rows,
-                                cfg,
-                            )
-                            if len(dl_tr_strong.dataset) == 0:
-                                run_logger.log("[strongfusion] Training loader is empty; skipping strong fusion head.")
-                            else:
-                                # 4. Train MLP (mlp) with dropout
-                                # Here, ϕ is constructed as follows:
-                                #   For samples in R (overlap region): provide both u and v.
-                                #   For samples in A\R (anchor-only region): set v=0. and add a binary mask bit b_missing=1 into the feature vector so the head knows B is absent
-                                #   For samples in B\R (target-only region): set u=0. and add a binary mask bit b_missing=1 into the feature vector so the head knows A is absent
-                                #   Then compute ϕ as:
-                                #       ϕ = [u; v; |u-v|; u⊙v; cos(u,v); b_missing]                                
-                                mlp_strong, history_payload_strong, evaluation_summary_strong = _strongfusion_train_model(
-                                    strongfusion_dataset,
-                                    dl_tr_strong,
-                                    dl_val_strong,
-                                    cfg,
-                                    device,
-                                    mlp_hidden_dims,
-                                    mlp_dropout,
-                                    run_logger,
-                                )
-                                # 5. run inference across full datasets after training
-                                # Use function this "    prediction = mc_predict_map_from_embeddings(precomputed_embeddings_map,mlp,stack,passes=args.passes,show_progress=True,save_prediction=args.save_prediction,save_path=out_dir,)"
-                                # precomputed_embeddings_map is now ϕ                                
-                                strongfusion_dir = Path(method_dir) / "Unified_head_strongfusion_regionall"
-                                inference_outputs_strong = _strongfusion_run_inference(
-                                    strongfusion_dir,
-                                    strongfusion_inference_map,
-                                    strongfusion_mask_map,
-                                    mlp_strong,
-                                    cfg,
-                                    device,
-                                    run_logger,
-                                )
-                                metrics_summary_strong = dict(metrics_summary_strong)
-                                metrics_summary_strong["train_size"] = int(train_rows.size)
-                                metrics_summary_strong["val_size"] = int(val_rows.size)
-                                metrics_summary_strong["label_counts"] = {
-                                    "anchor": pn_counts_anchor,
-                                    "target": pn_counts_target,
-                                }
-                                labels_arr = strongfusion_dataset.get("labels")
-                                if isinstance(labels_arr, np.ndarray):
-                                    if train_rows.size:
-                                        train_labels = labels_arr[train_rows]
-                                        train_pos = int(train_labels.sum())
-                                        metrics_summary_strong["train_positive"] = train_pos
-                                        metrics_summary_strong["train_negative"] = int(train_rows.size) - train_pos
-                                    if val_rows.size:
-                                        val_labels = labels_arr[val_rows]
-                                        val_pos = int(val_labels.sum())
-                                        metrics_summary_strong["val_positive"] = val_pos
-                                        metrics_summary_strong["val_negative"] = int(val_rows.size) - val_pos
-
-
-                                # 6-1. Plot results (all region) using write_prediction_outputs(prediction,stack,out_dir, pos_coords_by_region=pos_coord_map, neg_coords_by_region=neg_coord_map, )
-                                # 6-2. Plot results (overlap region; for zoomed version) using write_prediction_outputs(prediction,stack,out_dir, pos_coords_by_region=pos_coord_map, neg_coords_by_region=neg_coord_map, )
-                                # Use tag of "Unified_head_strongfusion_regionall" in out_dir
-
-                                strongfusion_summary = _strongfusion_export_results(
-                                    strongfusion_dir,
-                                    mlp_strong,
-                                    history_payload_strong,
-                                    evaluation_summary_strong,
-                                    metrics_summary_strong,
-                                    inference_outputs_strong,
-                                )
-                                metadata_payload.setdefault("strongfusion_regionall", strongfusion_summary)
-
-                    #################################### Training Classifier using strong fusion for overlap region ####################################
+                                fusion_summary = _fusion_export_results(fusion_dir, mlp, history_payload, evaluation_summary, metrics_summary_simple, inference_outputs,)
+                                metadata_payload.setdefault("simplefusion", fusion_summary)
+                                
                     run_logger.log(f"Training PN classifier method {method} - strong fusion head for overlap region")
                     
-                    # Construct MLP classifier using "strong fusion" unified method - ϕ=[u;v;∣u−v∣;u⊙v;cos(u,v)] inputs - overlap region only
+                    
 
-                    # 1. read u (take only overlap region)
-                    DCCAEmbedding_anchor_overlap = _extract_reembedding_overlap(DCCAEmbedding_anchor_all, overlap_mask_info)
+                    #################################### Training Classifier using strong fusion for overlap region ####################################
+                    # Construct MLP classifier using "strong fusion" unified method - ϕ=[u;v;∣u−v∣;u⊙v;cos(u,v)] inputs - overlap region only
+                    run_logger.log(f"Training PN classifier method {method} - simple fusion head")
+                    # 1. read u (take only overlap region) 
                     # 2. read v (take only overlap region)
-                    DCCAEmbedding_target_overlap = _extract_reembedding_overlap(DCCAEmbedding_target_all, overlap_mask_info)
+                    (
+                        aligned_embedding_anchor_overlap,
+                        aligned_embedding_target_overlap,
+                        aligned_labels_anchor_overlap,
+                        aligned_labels_target_overlap,
+                    ) = _align_overlap_embeddings_for_pn(
+                        DCCAEmbedding_anchor_overlap,
+                        DCCAEmbedding_target_overlap,
+                        index_label_anchor_overlap=index_label_anchor_overlap,
+                        index_label_target_overlap=index_label_target_overlap,
+                        anchor_name=anchor_name,
+                        target_name=target_name,
+                    )
 
                     # 3. prepare ϕ (overlap region) and prepare label (overlap region) (synthesize positive (positivie_all=[positive from A, positive from B]) and negative samples)
-                    strongfusion_overlap_source = strongfusion_dataset_all
-                    inference_map_overlap_source = strongfusion_inference_map_all
-                    mask_map_overlap = strongfusion_mask_map_all
-                    if strongfusion_overlap_source is None or not inference_map_overlap_source:
-                        strongfusion_prepared_overlap = _prepare_strongfusion_dataset_all(
-                            cfg=cfg,
-                            dataset_meta_map=dataset_meta_map,
-                            anchor_name=anchor_name,
-                            target_name=target_name,
-                            anchor_all=strongfusion_anchor_all,
-                            target_all=strongfusion_target_all,
-                            run_logger=run_logger,
+                    fusion_dataset = _prepare_fusion_overlap_dataset(
+                        aligned_embedding_anchor_overlap,
+                        aligned_embedding_target_overlap,
+                        aligned_labels_anchor_overlap, 
+                        aligned_labels_target_overlap,
+                        anchor_name=anchor_name,
+                        target_name=target_name,
+                        method_id="strong"
+                    )
+
+                    if debug_mode:
+                        print(
+                            "[debug] overlap embedding sizes:",
+                            DCCAEmbedding_anchor_overlap["features"].shape if DCCAEmbedding_anchor_overlap else None,
+                            DCCAEmbedding_target_overlap["features"].shape if DCCAEmbedding_target_overlap else None,
+                            len(index_label_anchor_overlap["labels"]) if index_label_anchor_overlap else 0,
+                            len(index_label_target_overlap["labels"]) if index_label_target_overlap else 0,
                         )
-                        if strongfusion_prepared_overlap is not None:
-                            strongfusion_overlap_source, inference_map_overlap_source, mask_map_overlap = strongfusion_prepared_overlap
-                            strongfusion_dataset_all = strongfusion_overlap_source
-                            strongfusion_inference_map_all = inference_map_overlap_source
-                            strongfusion_mask_map_all = mask_map_overlap
-                    if strongfusion_overlap_source is None or not inference_map_overlap_source:
-                        run_logger.log("[strongfusion-overlap] Dataset preparation failed; skipping strong fusion overlap head.")
+                        print(
+                            "[debug] overlap alignment sizes:",
+                            aligned_embedding_anchor_overlap["features"].shape if aligned_embedding_anchor_overlap else None,
+                            aligned_embedding_target_overlap["features"].shape if aligned_embedding_target_overlap else None,
+                            aligned_labels_anchor_overlap.size,
+                            aligned_labels_target_overlap.size,
+                        )
+                        print(
+                            "[debug] prepared data sizes:",
+                            fusion_dataset["features"].shape if fusion_dataset else None,
+                            fusion_dataset["labels"].size,
+                        )
+
+                    if fusion_dataset is None:
+                        run_logger.log("[simplefusion] Dataset preparation failed; skipping simple fusion head.")
                     else:
-                        filtered_payload = _strongfusion_filter_overlap_dataset(
-                            strongfusion_overlap_source,
-                            inference_map_overlap_source,
-                        )
-                        if filtered_payload is None:
-                            run_logger.log("[strongfusion-overlap] No overlapping unified positions; skipping strong fusion overlap head.")
+                        simplefusion_label_counts = _count_label_distribution(fusion_dataset["labels"])
+                        if debug_mode:
+                            print(f"[debug] simplefusion label counts: {simplefusion_label_counts}; PN anchor counts: {pn_counts_anchor}; PN target counts: {pn_counts_target}")
+
+                        train_idx, val_idx = _overlap_split_indices(fusion_dataset, validation_fraction=cfg.cls_training.validation_fraction, seed = cfg.seed, )
+                        if train_idx is None and val_idx is None:
+                            run_logger.log("[simplefusion] Insufficient class diversity for training; skipping simple fusion head.")
                         else:
-                            strongfusion_dataset_overlap, strongfusion_inference_map_overlap = filtered_payload
-                            train_rows_overlap, val_rows_overlap = _strongfusion_map_method1_indices(
-                                strongfusion_dataset_overlap,
-                                method1_data,
-                                anchor_name,
-                                target_name,
-                                run_logger,
-                            )
-                            if train_rows_overlap.size == 0:
-                                run_logger.log("[strongfusion-overlap] No labelled overlap samples aligned to the unified grid; skipping strong fusion overlap head.")
+                            # 4. Split the data like this:
+                            dl_tr, dl_val, metrics_summary_simple = _simplefusion_build_dataloaders(fusion_dataset, train_idx, val_idx, cfg,)
+
+                            if len(dl_tr.dataset) == 0:
+                                run_logger.log("[simplefusion] Training loader is empty; skipping simple fusion head.")
                             else:
-                                dl_tr_overlap, dl_val_overlap, metrics_summary_overlap = _strongfusion_build_dataloaders(
-                                    strongfusion_dataset_overlap,
-                                    train_rows_overlap,
-                                    val_rows_overlap,
-                                    cfg,
-                                )
-                                if len(dl_tr_overlap.dataset) == 0:
-                                    run_logger.log("[strongfusion-overlap] Training loader is empty; skipping strong fusion overlap head.")
+                                # 5. Train MLP (mlp) with dropout
+                                mlp, history_payload, evaluation_summary = _simplefusion_train_model(fusion_dataset, dl_tr, dl_val, cfg, device, mlp_hidden_dims, mlp_dropout, run_logger,)
+
+                                fusion_dir = Path(method_dir) / "Unified_head_simplefusion"
+
+                                # 6. run inference across overlap datasets after training
+                                
+                                if args.run_inference:
+                                    inference_outputs = _no_fusion_run_inference(
+                                        fusion_dataset,
+                                        DCCAEmbedding_anchor_overlap,
+                                        DCCAEmbedding_target_overlap,
+                                        mlp,
+                                        overlap_mask_info,
+                                        device,
+                                        cfg,
+                                        run_logger,
+                                    )
                                 else:
-                                    # 4. Train MLP (mlp) with dropout
-                                    mlp_strong_overlap, history_payload_overlap, evaluation_summary_overlap = _strongfusion_train_model(
-                                        strongfusion_dataset_overlap,
-                                        dl_tr_overlap,
-                                        dl_val_overlap,
-                                        cfg,
-                                        device,
-                                        mlp_hidden_dims,
-                                        mlp_dropout,
-                                        run_logger,
-                                    )
-                                    # Here, ϕ is constructed as follows:
-                                    #   For samples in R (overlap region): provide both u and v.
-                                    # 5. run inference across full datasets after training
-                                    strongfusion_overlap_dir = Path(method_dir) / "Unified_head_strongfusion_regionoverlap"
-                                    inference_outputs_overlap = _strongfusion_run_inference(
-                                        strongfusion_overlap_dir,
-                                        strongfusion_inference_map_overlap,
-                                        mask_map_overlap,
-                                        mlp_strong_overlap,
-                                        cfg,
-                                        device,
-                                        run_logger,
-                                    )
-                                    # Use function this "    prediction = mc_predict_map_from_embeddings(precomputed_embeddings_map,mlp,stack,passes=args.passes,show_progress=True,save_prediction=args.save_prediction,save_path=out_dir,)"
-                                    # precomputed_embeddings_map is now ϕ
-                                    # 6. Plot results using write_prediction_outputs(prediction,stack,out_dir, pos_coords_by_region=pos_coord_map, neg_coords_by_region=neg_coord_map, )
-                                    metrics_summary_overlap = dict(metrics_summary_overlap)
-                                    metrics_summary_overlap["train_size"] = int(train_rows_overlap.size)
-                                    metrics_summary_overlap["val_size"] = int(val_rows_overlap.size)
-                                    if simplefusion_label_counts:
-                                        metrics_summary_overlap["label_counts_anchor"] = simplefusion_label_counts
-                                    else:
-                                        metrics_summary_overlap["label_counts_anchor"] = pn_counts_anchor
-                                    labels_overlap = strongfusion_dataset_overlap.get("labels")
-                                    if isinstance(labels_overlap, np.ndarray):
-                                        if train_rows_overlap.size:
-                                            train_labels_overlap = labels_overlap[train_rows_overlap]
-                                            train_pos_overlap = int(train_labels_overlap.sum())
-                                            metrics_summary_overlap["train_positive"] = train_pos_overlap
-                                            metrics_summary_overlap["train_negative"] = int(train_rows_overlap.size) - train_pos_overlap
-                                        if val_rows_overlap.size:
-                                            val_labels_overlap = labels_overlap[val_rows_overlap]
-                                            val_pos_overlap = int(val_labels_overlap.sum())
-                                            metrics_summary_overlap["val_positive"] = val_pos_overlap
-                                            metrics_summary_overlap["val_negative"] = int(val_rows_overlap.size) - val_pos_overlap
-                                    strongfusion_overlap_summary = _strongfusion_export_results(
-                                        strongfusion_overlap_dir,
-                                        mlp_strong_overlap,
-                                        history_payload_overlap,
-                                        evaluation_summary_overlap,
-                                        metrics_summary_overlap,
-                                        inference_outputs_overlap,
-                                    )
-                                    metadata_payload.setdefault("strongfusion_regionoverlap", strongfusion_overlap_summary)
+                                    inference_outputs = None
 
-                    # 4. Train MLP (mlp) with dropout
-                    # Here, ϕ is constructed as follows:
-                    #   For samples in R (overlap region): provide both u and v.
-                    # 5. run inference across full datasets after training
-                    # Use function this "    prediction = mc_predict_map_from_embeddings(precomputed_embeddings_map,mlp,stack,passes=args.passes,show_progress=True,save_prediction=args.save_prediction,save_path=out_dir,)"
-                    # precomputed_embeddings_map is now ϕ
-                    # 6. Plot results using write_prediction_outputs(prediction,stack,out_dir, pos_coords_by_region=pos_coord_map, neg_coords_by_region=neg_coord_map, )
-                    # # Use tag of "Unified_head_strongfusion_regionoverlap" in out_dir
+                                # 7. Plot results using Common/cls/infer/infer_maps.write_prediction_outputs like write_prediction_outputs(prediction,stack,out_dir, pos_coords_by_region=pos_coord_map, neg_coords_by_region=neg_coord_map, )
+                                # Use tag of "Unified_head_simplefusion" in out_dir
+                                metrics_summary_simple = dict(metrics_summary_simple)
+                                metrics_summary_simple["train_size"] = int(train_idx.size)
+                                metrics_summary_simple["val_size"] = int(val_idx.size)
+                                if simplefusion_label_counts:
+                                    metrics_summary_simple["label_counts"] = simplefusion_label_counts
+                                fusion_summary = _fusion_export_results(fusion_dir, mlp, history_payload, evaluation_summary, metrics_summary_simple, inference_outputs,)
+                                metadata_payload.setdefault("simplefusion", fusion_summary)
 
-
+                exit()
+                    # #################################### Training Classifier using strong fusion for all region ####################################
+                    # NOT IMPLEMENTED YET
+                
                 elif method == 2:
                     anchor_data = method2_data.get("anchor")
                     target_data = method2_data.get("target")
@@ -1293,7 +1189,31 @@ def main() -> None:
 
 
 
+if torch is not None:
+    class ProjectionHead(nn.Module):
+        def __init__(self, in_dim: int, out_dim: int, *, num_layers: int = 2):
+            super().__init__()
+            if num_layers < 1:
+                raise ValueError("ProjectionHead requires at least one layer.")
+            hidden_dim = max(out_dim, min(in_dim, 512))
+            layers: List[nn.Module] = []
+            prev_dim = in_dim
+            if num_layers == 1:
+                layers.append(nn.Linear(prev_dim, out_dim))
+            else:
+                for _ in range(num_layers - 1):
+                    layers.append(nn.Linear(prev_dim, hidden_dim))
+                    layers.append(nn.ReLU(inplace=True))
+                    prev_dim = hidden_dim
+                layers.append(nn.Linear(prev_dim, out_dim))
+            self.net = nn.Sequential(*layers)
 
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.net(x)
+else:
+    class ProjectionHead:  # type: ignore[too-many-ancestors]
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("ProjectionHead requires PyTorch. Install torch before training.")
 
 
 def _filter_singular_values(singular_values: torch.Tensor, drop_ratio: float) -> Tuple[torch.Tensor, Dict[str, object]]:
@@ -3634,12 +3554,289 @@ def _make_mask_reference(mask_info: Optional[Dict[str, object]]) -> Optional[Dic
         "boundary_mask": boundary_mask,
     }
 
+def _prepare_fusion_overlap_dataset(
+    anchor_data: Optional[Dict[str, object]],
+    target_data: Optional[Dict[str, object]],
+    anchor_labels_override: Optional[Sequence[int]] = None,
+    target_labels_override: Optional[Sequence[int]] = None,
+    *,
+    anchor_name: str,
+    target_name: str,
+    method_id: str = "Simple",
+) -> Optional[Dict[str, object]]:
+    # For "simple" method, we use phi = [u; v],
+    # For "strong" method, we use phi = [u; v; |u-v|; u*v; cosine(u,v)]
+
+
+    method_key = method_id.lower()
+
+    if anchor_data is None and target_data is None:
+        return None
+
+    def _extract_entry(
+        entry: Optional[Dict[str, object]],
+        labels_override: Optional[Sequence[int]],
+        default_source: str,
+    ) -> Dict[str, object]:
+        if entry is None:
+            return {
+                "features": np.empty((0, 0), dtype=np.float32),
+                "labels": np.empty(0, dtype=np.int16),
+                "pair_ids": [],
+                "pair_sources": [],
+                "metadata": [],
+                "row_cols": [],
+                "coords": [],
+            }
+
+        feats = entry.get("features")
+        if isinstance(feats, torch.Tensor):
+            features_np = feats.detach().cpu().numpy().astype(np.float32, copy=False)
+        elif isinstance(feats, np.ndarray):
+            features_np = feats.astype(np.float32, copy=False)
+        else:
+            features_np = np.asarray(feats, dtype=np.float32)
+            if features_np.ndim == 1:
+                features_np = features_np.reshape(-1, features_np.shape[0])
+
+        labels_val: Optional[np.ndarray]
+        if labels_override is not None:
+            labels_val = np.asarray(labels_override, dtype=np.int16)
+        else:
+            raw_labels = entry.get("labels")
+            if raw_labels is None:
+                labels_val = np.empty(0, dtype=np.int16)
+            elif isinstance(raw_labels, torch.Tensor):
+                labels_val = raw_labels.detach().cpu().numpy().astype(np.int16, copy=False)
+            else:
+                labels_val = np.asarray(raw_labels, dtype=np.int16)
+
+        count = features_np.shape[0]
+        if labels_val.size == 0:
+            labels_np = np.zeros(count, dtype=np.int16)
+        elif labels_val.shape[0] == count:
+            labels_np = labels_val.astype(np.int16, copy=False)
+        else:
+            raise ValueError("Mismatch between feature and label counts in overlap dataset.")
+
+        raw_pair_ids = entry.get("pair_ids") or range(count)
+        pair_ids = [int(pid) for pid in raw_pair_ids]
+        if len(pair_ids) != count:
+            pair_ids = list(range(count))
+
+        raw_sources = entry.get("pair_sources") or []
+        pair_sources = [
+            str(raw_sources[idx]) if idx < len(raw_sources) and raw_sources[idx] is not None else default_source
+            for idx in range(count)
+        ]
+
+        raw_metadata = entry.get("metadata") or []
+        metadata: List[Dict[str, object]] = []
+        for idx in range(count):
+            meta = {}
+            if idx < len(raw_metadata) and isinstance(raw_metadata[idx], dict):
+                meta = dict(raw_metadata[idx])
+            meta.setdefault("pair_id", pair_ids[idx])
+            meta.setdefault("pair_label_source", pair_sources[idx])
+            metadata.append(meta)
+
+        raw_rowcols = entry.get("row_cols") or entry.get("row_cols_mask") or []
+        row_cols: List[Optional[Tuple[int, int]]] = []
+        for idx in range(count):
+            rc = raw_rowcols[idx] if idx < len(raw_rowcols) else None
+            if isinstance(rc, (list, tuple)) and len(rc) >= 2:
+                try:
+                    rc = (int(rc[0]), int(rc[1]))
+                except Exception:
+                    rc = None
+            else:
+                rc = None
+            row_cols.append(rc)
+
+        raw_coords = entry.get("coords") or []
+        coords: List[Optional[Tuple[float, float]]] = []
+        for idx in range(count):
+            coord = raw_coords[idx] if idx < len(raw_coords) else None
+            if isinstance(coord, (list, tuple)) and len(coord) >= 2:
+                coords.append((float(coord[0]), float(coord[1])))
+            else:
+                coords.append(None)
+
+        return {
+            "features": features_np,
+            "labels": labels_np,
+            "pair_ids": pair_ids,
+            "pair_sources": pair_sources,
+            "metadata": metadata,
+            "row_cols": row_cols,
+            "coords": coords,
+        }
+
+    try:
+        anchor_info = _extract_entry(anchor_data, anchor_labels_override, anchor_name)
+        target_info = _extract_entry(target_data, target_labels_override, target_name)
+    except ValueError:
+        return None
+
+    dim_u = anchor_info["features"].shape[1] if anchor_info["features"].size else (
+        target_info["features"].shape[1] if target_info["features"].size else 0
+    )
+    dim_v = target_info["features"].shape[1] if target_info["features"].size else (
+        anchor_info["features"].shape[1] if anchor_info["features"].size else 0
+    )
+
+    if dim_u <= 0 and dim_v <= 0:
+        return None
+
+    if method_key == "simple":
+        features_parts: List[np.ndarray] = []
+        label_parts: List[np.ndarray] = []
+        metadata: List[Dict[str, object]] = []
+        row_cols: List[Optional[Tuple[int, int]]] = []
+        coords: List[Optional[Tuple[float, float]]] = []
+        sources: List[str] = []
+        pair_groups: List[int] = []
+        pair_sources: List[str] = []
+
+        if anchor_info["features"].size:
+            zeros_v = np.zeros((anchor_info["features"].shape[0], dim_v), dtype=np.float32)
+            features_parts.append(np.concatenate([anchor_info["features"], zeros_v], axis=1))
+            label_parts.append(anchor_info["labels"])
+            metadata.extend(anchor_info["metadata"])
+            row_cols.extend(anchor_info["row_cols"])
+            coords.extend(anchor_info["coords"])
+            sources.extend(["anchor"] * anchor_info["features"].shape[0])
+            pair_groups.extend(anchor_info["pair_ids"])
+            pair_sources.extend(anchor_info["pair_sources"])
+
+        if target_info["features"].size:
+            zeros_u = np.zeros((target_info["features"].shape[0], dim_u), dtype=np.float32)
+            features_parts.append(np.concatenate([zeros_u, target_info["features"]], axis=1))
+            label_parts.append(target_info["labels"])
+            metadata.extend(target_info["metadata"])
+            row_cols.extend(target_info["row_cols"])
+            coords.extend(target_info["coords"])
+            sources.extend(["target"] * target_info["features"].shape[0])
+            pair_groups.extend(target_info["pair_ids"])
+            pair_sources.extend(target_info["pair_sources"])
+
+        if not features_parts or not label_parts:
+            return None
+
+        combined_features = np.vstack(features_parts).astype(np.float32, copy=False)
+        combined_labels = np.concatenate(label_parts).astype(np.int16, copy=False)
+
+    elif method_key == "strong":
+        anchor_map = {pid: idx for idx, pid in enumerate(anchor_info["pair_ids"])}
+        target_map = {pid: idx for idx, pid in enumerate(target_info["pair_ids"])}
+        pair_ids = sorted(set(anchor_map.keys()) | set(target_map.keys()))
+        if not pair_ids:
+            return None
+
+        features_list: List[np.ndarray] = []
+        labels_list: List[int] = []
+        metadata: List[Dict[str, object]] = []
+        pair_sources: List[str] = []
+        row_cols: List[Optional[Tuple[int, int]]] = []
+        coords: List[Optional[Tuple[float, float]]] = []
+        sources: List[str] = []
+
+        for pid in pair_ids:
+            anchor_idx = anchor_map.get(pid)
+            target_idx = target_map.get(pid)
+            u_vec = anchor_info["features"][anchor_idx] if anchor_idx is not None else np.zeros(dim_u, dtype=np.float32)
+            v_vec = target_info["features"][target_idx] if target_idx is not None else np.zeros(dim_v, dtype=np.float32)
+            if u_vec.shape[0] != v_vec.shape[0]:
+                dim = max(u_vec.shape[0], v_vec.shape[0])
+                u_tmp = np.zeros(dim, dtype=np.float32)
+                v_tmp = np.zeros(dim, dtype=np.float32)
+                u_tmp[: u_vec.shape[0]] = u_vec
+                v_tmp[: v_vec.shape[0]] = v_vec
+                u_vec, v_vec = u_tmp, v_tmp
+
+            diff_vec = np.abs(u_vec - v_vec)
+            prod_vec = u_vec * v_vec
+            norm_u = float(np.linalg.norm(u_vec))
+            norm_v = float(np.linalg.norm(v_vec))
+            cosine_val = float(np.dot(u_vec, v_vec) / (norm_u * norm_v + 1e-8)) if norm_u > 0 and norm_v > 0 else 0.0
+            missing_flag = 0.0 if anchor_idx is not None and target_idx is not None else 1.0
+
+            phi = np.concatenate(
+                [
+                    u_vec,
+                    v_vec,
+                    diff_vec,
+                    prod_vec,
+                    np.asarray([cosine_val, missing_flag], dtype=np.float32),
+                ],
+                dtype=np.float32,
+            )
+            features_list.append(phi)
+
+            if anchor_idx is not None and anchor_idx < len(anchor_info["labels"]):
+                label_val = int(anchor_info["labels"][anchor_idx])
+                source_val = anchor_info["pair_sources"][anchor_idx]
+            elif target_idx is not None and target_idx < len(target_info["labels"]):
+                label_val = int(target_info["labels"][target_idx])
+                source_val = target_info["pair_sources"][target_idx]
+            else:
+                label_val = 0
+                source_val = "unknown"
+            labels_list.append(label_val)
+            pair_sources.append(str(source_val) if source_val else "unknown")
+
+            meta_entry: Dict[str, object] = {"pair_id": int(pid), "pair_label_source": pair_sources[-1]}
+            if anchor_idx is not None and anchor_idx < len(anchor_info["metadata"]):
+                meta_entry["anchor_metadata"] = anchor_info["metadata"][anchor_idx]
+            if target_idx is not None and target_idx < len(target_info["metadata"]):
+                meta_entry["target_metadata"] = target_info["metadata"][target_idx]
+            metadata.append(meta_entry)
+
+            row_col_val = None
+            if anchor_idx is not None and anchor_idx < len(anchor_info["row_cols"]):
+                row_col_val = anchor_info["row_cols"][anchor_idx]
+            if row_col_val is None and target_idx is not None and target_idx < len(target_info["row_cols"]):
+                row_col_val = target_info["row_cols"][target_idx]
+            row_cols.append(row_col_val)
+
+            coord_val = None
+            if anchor_idx is not None and anchor_idx < len(anchor_info["coords"]):
+                coord_val = anchor_info["coords"][anchor_idx]
+            if coord_val is None and target_idx is not None and target_idx < len(target_info["coords"]):
+                coord_val = target_info["coords"][target_idx]
+            coords.append(coord_val)
+
+            sources.append("pair")
+
+        combined_features = np.vstack(features_list).astype(np.float32, copy=False)
+        combined_labels = np.asarray(labels_list, dtype=np.int16)
+        pair_groups = [int(pid) for pid in pair_ids]
+
+    else:
+        raise NotImplementedError(f"Unsupported combination method ID: {method_id}")
+
+    if combined_features.size == 0 or combined_labels.size == 0:
+        return None
+
+    return {
+        "features": combined_features.astype(np.float32, copy=False),
+        "labels": combined_labels.astype(np.int16, copy=False),
+        "metadata": metadata,
+        "row_cols": row_cols,
+        "coords": coords,
+        "sources": sources,
+        "pair_groups": pair_groups,
+        "pair_sources": pair_sources,
+        "dim_u": int(dim_u),
+        "dim_v": int(dim_v),
+    }
+
 
 def _prepare_simplefusion_dataset(
     anchor_data: Optional[Dict[str, object]],
     target_data: Optional[Dict[str, object]],
-    *,
     anchor_labels_override: Optional[Sequence[int]] = None,
+    target_labels_override: Optional[Sequence[int]] = None,
 ) -> Optional[Dict[str, object]]:
     if anchor_data is None or target_data is None:
         return None
@@ -3662,18 +3859,22 @@ def _prepare_simplefusion_dataset(
     if anchor_labels_override is not None:
         anchor_labels_np = np.asarray(anchor_labels_override, dtype=np.int16)
     else:
-        anchor_labels_np = anchor_data.get("labels", np.empty(0, dtype=np.int16))
-    if target_data is not None:
-        if anchor_labels_override is not None and len(anchor_labels_np) == target_np.shape[0]:
-            target_labels_np = anchor_labels_np
-        else:
-            target_labels_np = target_data.get("labels", np.empty(0, dtype=np.int16))
+        anchor_labels_np = np.asarray(anchor_data.get("labels", np.empty(0, dtype=np.int16)), dtype=np.int16)
+    if anchor_labels_np.shape[0] and anchor_labels_np.shape[0] != anchor_np.shape[0]:
+        return None
+
+    if target_labels_override is not None:
+        target_labels_np = np.asarray(target_labels_override, dtype=np.int16)
     else:
-        target_labels_np = np.empty(0, dtype=np.int16)
+        target_labels_np = np.asarray(target_data.get("labels", np.empty(0, dtype=np.int16)), dtype=np.int16)
+    if target_labels_np.shape[0] and target_labels_np.shape[0] != target_np.shape[0]:
+        return None
+
     combined_labels = np.concatenate([
         anchor_labels_np,
         target_labels_np,
     ]).astype(np.int16, copy=False)
+
     metadata: List[Dict[str, object]] = []
     sources: List[str] = []
     row_cols: List[Optional[Tuple[int, int]]] = []
@@ -3682,6 +3883,8 @@ def _prepare_simplefusion_dataset(
         new_entry = dict(entry)
         new_entry.setdefault("source", "anchor")
         metadata.append(new_entry)
+    pair_ids_anchor = list(anchor_data.get("pair_ids") or range(anchor_np.shape[0]))
+    pair_sources_anchor = list(anchor_data.get("pair_sources") or [None] * anchor_np.shape[0])
     row_cols.extend(anchor_data.get("row_cols", []))
     coords.extend(anchor_data.get("coords", []))
     sources.extend(["anchor"] * anchor_np.shape[0])
@@ -3689,9 +3892,22 @@ def _prepare_simplefusion_dataset(
         new_entry = dict(entry)
         new_entry.setdefault("source", "target")
         metadata.append(new_entry)
+    pair_ids_target = list(target_data.get("pair_ids") or range(anchor_np.shape[0], anchor_np.shape[0] + target_np.shape[0]))
+    pair_sources_target = list(target_data.get("pair_sources") or [None] * target_np.shape[0])
     row_cols.extend(target_data.get("row_cols", []))
     coords.extend(target_data.get("coords", []))
     sources.extend(["target"] * target_np.shape[0])
+    if len(pair_ids_anchor) != anchor_np.shape[0]:
+        pair_ids_anchor = list(range(anchor_np.shape[0]))
+    if len(pair_ids_target) != target_np.shape[0]:
+        offset = len(pair_ids_anchor)
+        pair_ids_target = list(range(offset, offset + target_np.shape[0]))
+    if len(pair_sources_anchor) != anchor_np.shape[0]:
+        pair_sources_anchor = [None] * anchor_np.shape[0]
+    if len(pair_sources_target) != target_np.shape[0]:
+        pair_sources_target = [None] * target_np.shape[0]
+    combined_pair_groups = pair_ids_anchor + pair_ids_target
+    combined_pair_sources = pair_sources_anchor + pair_sources_target
     return {
         "features": combined_features.astype(np.float32, copy=False),
         "labels": combined_labels.astype(np.int16, copy=False),
@@ -3699,6 +3915,8 @@ def _prepare_simplefusion_dataset(
         "row_cols": row_cols,
         "coords": coords,
         "sources": sources,
+        "pair_groups": combined_pair_groups,
+        "pair_sources": combined_pair_sources,
         "dim_u": dim_u,
         "dim_v": dim_v,
         "count_anchor": int(anchor_np.shape[0]),
@@ -3740,92 +3958,173 @@ def _trim_reembedding_entry(
             trimmed[key] = _take_sequence(entry[key])
 
     return trimmed
-
-
+    
 def _align_overlap_embeddings_for_pn(
     anchor_entry: Optional[Dict[str, object]],
     target_entry: Optional[Dict[str, object]],
     *,
     anchor_name: str,
     target_name: str,
-    pn_label_maps: Dict[str, Optional[Dict[str, set[Tuple[str, int, int]]]]],
-) -> Tuple[Optional[Dict[str, object]], Optional[Dict[str, object]], np.ndarray]:
-    if anchor_entry is None or target_entry is None:
-        return anchor_entry, target_entry, np.asarray([], dtype=np.int16)
+    index_label_anchor_overlap: Optional[Dict[str, object]] = None,
+    index_label_target_overlap: Optional[Dict[str, object]] = None,
+) -> Tuple[
+    Optional[Dict[str, object]],
+    Optional[Dict[str, object]],
+    np.ndarray,
+    np.ndarray,
+]:
+    if anchor_entry is None and target_entry is None:
+        return None, None, np.asarray([], dtype=np.int16), np.asarray([], dtype=np.int16)
 
-    def _normalise_key(region: Optional[str], row: int, col: int) -> Tuple[Optional[str], int, int]:
-        reg = str(region).upper() if region is not None else None
-        return (reg, int(row), int(col))
+    def _parse_source_tag(value: Optional[str], default: str) -> str:
+        raw = str(value or "")
+        if not raw:
+            return default
+        tag = raw.split("_", 1)[0]
+        return tag or default
 
-    def _build_position_index(entry: Dict[str, object]) -> Dict[Tuple[Optional[str], int, int], int]:
-        index: Dict[Tuple[Optional[str], int, int], int] = {}
-        metadata_list = entry.get("metadata") or []
-        row_cols_mask = entry.get("row_cols_mask") or entry.get("row_cols") or []
-        for pos, meta in enumerate(metadata_list):
-            region = meta.get("region")
-            row_col = meta.get("row_col")
-            if row_col is None and pos < len(row_cols_mask):
-                row_col = row_cols_mask[pos]
-            if row_col is None:
-                continue
+    def _coerce_positions(values: Sequence[object]) -> List[int]:
+        positions: List[int] = []
+        for val in values:
             try:
-                row_val = int(row_col[0])
-                col_val = int(row_col[1])
+                positions.append(int(val))
             except Exception:
                 continue
-            keys = []
-            if region is not None:
-                keys.append(_normalise_key(region, row_val, col_val))
-            keys.append(_normalise_key(None, row_val, col_val))
-            for key in keys:
-                index.setdefault(key, pos)
-        return index
+        return positions
 
-    anchor_index = _build_position_index(anchor_entry)
-    target_index = _build_position_index(target_entry)
+    def _resolve_reference(
+        source_dataset: str,
+        *,
+        is_anchor: bool,
+        dataset_index: Optional[int],
+        cross_index: Optional[int],
+        position: int,
+    ) -> int:
+        ref_idx: Optional[int]
+        if source_dataset == anchor_name:
+            ref_idx = dataset_index if is_anchor else cross_index
+        elif source_dataset == target_name:
+            ref_idx = cross_index if is_anchor else dataset_index
+        else:
+            ref_idx = dataset_index if dataset_index is not None else cross_index
+        if ref_idx is None:
+            ref_idx = position
+        return int(ref_idx)
 
-    anchor_lookup = pn_label_maps.get(anchor_name) or {}
-    anchor_pos_set = anchor_lookup.get("pos", set())
-    anchor_neg_set = anchor_lookup.get("neg", set())
+    def _prepare_slice(
+        entry: Optional[Dict[str, object]],
+        index_payload: Optional[Dict[str, object]],
+        default_source: str,
+        *,
+        is_anchor: bool,
+    ) -> Tuple[Optional[Dict[str, object]], np.ndarray, List[Tuple[str, int]]]:
+        if entry is None or not index_payload:
+            return None, np.asarray([], dtype=np.int16), []
 
-    label_map: Dict[Tuple[Optional[str], int, int], int] = {}
-    for key in anchor_pos_set:
-        try:
-            region, row, col = key
-            label_map[_normalise_key(region, row, col)] = 1
-        except Exception:
-            continue
-    for key in anchor_neg_set:
-        try:
-            region, row, col = key
-            norm_key = _normalise_key(region, row, col)
-            label_map.setdefault(norm_key, 0)
-        except Exception:
-            continue
+        source_dataset = _parse_source_tag(index_payload.get("source"), default_source)
+        positions_raw = index_payload.get("positions") or []
+        labels_raw = index_payload.get("labels") or []
+        dataset_indices_raw = index_payload.get("dataset_indices") or []
+        cross_indices_raw = index_payload.get("cross_source_indices") or []
 
-    kept_anchor_positions: List[int] = []
-    kept_target_positions: List[int] = []
+        valid_items: List[Tuple[int, int, Optional[int], Optional[int]]] = []
+        max_len = min(len(positions_raw), len(labels_raw))
+        for idx in range(max_len):
+            try:
+                position = int(positions_raw[idx])
+            except Exception:
+                continue
+            try:
+                label_int = 1 if int(labels_raw[idx]) > 0 else 0
+            except Exception:
+                continue
+            dataset_idx = None
+            if idx < len(dataset_indices_raw):
+                try:
+                    dataset_idx = int(dataset_indices_raw[idx])
+                except Exception:
+                    dataset_idx = None
+            cross_idx = None
+            if idx < len(cross_indices_raw):
+                try:
+                    cross_idx = int(cross_indices_raw[idx])
+                except Exception:
+                    cross_idx = None
+            valid_items.append((position, label_int, dataset_idx, cross_idx))
 
-    for key, _ in label_map.items():
-        anchor_pos = anchor_index.get(key)
-        if anchor_pos is None and key[0] is not None:
-            anchor_pos = anchor_index.get((None, key[1], key[2]))
-        if anchor_pos is None:
-            continue
-        target_pos = target_index.get(key)
-        if target_pos is None and key[0] is not None:
-            target_pos = target_index.get((None, key[1], key[2]))
-        if target_pos is None:
-            continue
-        kept_anchor_positions.append(anchor_pos)
-        kept_target_positions.append(target_pos)
+        if not valid_items:
+            return None, np.asarray([], dtype=np.int16), []
 
-    if not kept_anchor_positions or not kept_target_positions:
-        return None, None, np.asarray([], dtype=np.int16)
+        positions = [item[0] for item in valid_items]
+        trimmed = _trim_reembedding_entry(entry, positions)
+        if trimmed is None:
+            return None, np.asarray([], dtype=np.int16), []
 
-    anchor_trimmed = _trim_reembedding_entry(anchor_entry, kept_anchor_positions)
-    target_trimmed = _trim_reembedding_entry(target_entry, kept_target_positions)
-    return anchor_trimmed, target_trimmed, 
+        labels_arr = np.asarray([item[1] for item in valid_items], dtype=np.int16)
+        pair_keys: List[Tuple[str, int]] = []
+        for position, _, dataset_idx, cross_idx in valid_items:
+            ref_idx = _resolve_reference(
+                source_dataset,
+                is_anchor=is_anchor,
+                dataset_index=dataset_idx,
+                cross_index=cross_idx,
+                position=position,
+            )
+            pair_keys.append((source_dataset, ref_idx))
+
+        trimmed["pair_sources"] = [key[0] for key in pair_keys]
+        # pair_ids populated after shared dictionary is built
+
+        return trimmed, labels_arr, pair_keys
+
+    anchor_slice, anchor_labels, anchor_keys = _prepare_slice(
+        anchor_entry,
+        index_label_anchor_overlap,
+        anchor_name,
+        is_anchor=True,
+    )
+    target_slice, target_labels, target_keys = _prepare_slice(
+        target_entry,
+        index_label_target_overlap,
+        target_name,
+        is_anchor=False,
+    )
+
+    pair_key_to_id: Dict[Tuple[str, int], int] = {}
+    next_pair_id = 0
+
+    def _assign_pair_ids(
+        slice_entry: Optional[Dict[str, object]],
+        keys: List[Tuple[str, int]],
+    ) -> None:
+        nonlocal next_pair_id
+        if slice_entry is None or not keys:
+            return
+        pair_ids: List[int] = []
+        for key in keys:
+            if key not in pair_key_to_id:
+                pair_key_to_id[key] = next_pair_id
+                next_pair_id += 1
+            pair_ids.append(pair_key_to_id[key])
+        slice_entry["pair_ids"] = pair_ids
+        pair_sources = slice_entry.get("pair_sources") or []
+        metadata_list = slice_entry.get("metadata") or []
+        for idx, meta in enumerate(metadata_list):
+            if not isinstance(meta, dict):
+                continue
+            if idx < len(pair_ids):
+                meta.setdefault("pair_id", pair_ids[idx])
+            if idx < len(pair_sources):
+                meta.setdefault("pair_label_source", pair_sources[idx])
+
+    _assign_pair_ids(anchor_slice, anchor_keys)
+    _assign_pair_ids(target_slice, target_keys)
+
+    if (anchor_slice is None or target_slice is None or anchor_labels.size == 0 or target_labels.size == 0):
+        run_logger.log("[simplefusion] Unable to align embeddings with PN labels; skipping fusion head.")
+        return
+
+    return anchor_slice, target_slice, anchor_labels, target_labels
 
 
 def _prepare_simplefusion_inference_entry(
@@ -3879,32 +4178,6 @@ def _prepare_simplefusion_inference_entry(
         "coords": coords,
     }
 
-
-def _simplefusion_split_indices(
-    dataset: Dict[str, object],
-    validation_fraction: float,
-    seed: int,
-) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    features = dataset.get("features")
-    labels = dataset.get("labels")
-    if features is None or labels is None:
-        return None
-    total = features.shape[0]
-    if total <= 1 or np.unique(labels).size <= 1:
-        return None
-    validation_fraction = max(0.0, min(float(validation_fraction), 0.9))
-    if validation_fraction <= 0.0 or total < 4:
-        train_idx = np.arange(total, dtype=int)
-        val_idx = np.empty(0, dtype=int)
-        return train_idx, val_idx
-    stratify = labels if np.unique(labels).size > 1 else None
-    train_idx, val_idx = train_test_split(
-        np.arange(total, dtype=int),
-        test_size=validation_fraction,
-        stratify=stratify,
-        random_state=int(seed),
-    )
-    return np.asarray(train_idx, dtype=int), np.asarray(val_idx, dtype=int)
 
 
 def _simplefusion_build_dataloaders(
@@ -3983,7 +4256,7 @@ def _simplefusion_train_model(
     return mlp, history_payload, evaluation_summary
 
 
-def _simplefusion_run_inference(
+def _no_fusion_run_inference(
     dataset: Dict[str, object],
     simplefusion_anchor_overlap: Optional[Dict[str, object]],
     simplefusion_target_overlap: Optional[Dict[str, object]],
@@ -4002,13 +4275,44 @@ def _simplefusion_run_inference(
         run_logger.log("[simplefusion] Failed to build mask reference; skipping inference exports.")
         return outputs
     stack = _MaskStack(overlap_mask)
-    dim_u = dataset["dim_u"]
-    dim_v = dataset["dim_v"]
+
+    def _feature_dim(entry: Optional[Dict[str, object]]) -> Optional[int]:
+        if not entry:
+            return None
+        feats = entry.get("features")
+        if isinstance(feats, torch.Tensor):
+            return int(feats.shape[1])
+        if isinstance(feats, np.ndarray):
+            return int(feats.shape[1])
+        return None
+
+    dim_u = dataset.get("dim_u")
+    dim_v = dataset.get("dim_v")
+
+    anchor_dim = _feature_dim(simplefusion_anchor_overlap)
+    target_dim = _feature_dim(simplefusion_target_overlap)
+    dataset_features = dataset.get("features")
+    total_dim = int(dataset_features.shape[1]) if isinstance(dataset_features, np.ndarray) and dataset_features.ndim == 2 else None
+
+    if dim_u is None:
+        dim_u = anchor_dim
+    if dim_v is None:
+        dim_v = target_dim
+    if dim_u is None and dim_v is not None and total_dim is not None:
+        dim_u = max(total_dim - dim_v, 0)
+    if dim_v is None and dim_u is not None and total_dim is not None:
+        dim_v = max(total_dim - dim_u, 0)
+
+    if dim_u is None or dim_v is None:
+        run_logger.log("[simplefusion] Unable to infer feature dimensions; skipping inference exports.")
+        return outputs
+
     passes = max(1, int(getattr(cfg.cls_training, "mc_dropout_passes", 30)))
     for role_name, entry, role_flag in (
         ("anchor", simplefusion_anchor_overlap, "anchor"),
         ("target", simplefusion_target_overlap, "target"),
     ):
+        print("[info] Inference for :", role_name)
         inference_entry = _prepare_simplefusion_inference_entry(
             entry,
             dim_u=dim_u,
@@ -4059,28 +4363,28 @@ def _simplefusion_run_inference(
     return outputs
 
 
-def _simplefusion_export_results(
-    simplefusion_dir: Path,
+def _fusion_export_results(
+    fusion_dir: Path,
     mlp: nn.Module,
     history_payload: List[Dict[str, object]],
     evaluation_summary: Dict[str, Dict[str, float]],
     metrics_summary: Dict[str, object],
     inference_outputs: Dict[str, Dict[str, object]],
 ) -> Dict[str, object]:
-    simplefusion_dir.mkdir(parents=True, exist_ok=True)
+    fusion_dir.mkdir(parents=True, exist_ok=True)
     metrics_payload = dict(metrics_summary)
     metrics_payload["evaluation"] = evaluation_summary
     metrics_payload["history"] = history_payload
-    metrics_path = simplefusion_dir / "metrics.json"
+    metrics_path = fusion_dir / "metrics.json"
     try:
         save_metrics_json(metrics_payload, metrics_path)
     except Exception as exc:
-        raise RuntimeError(f"Failed to save simplefusion metrics: {exc}")
-    state_path = simplefusion_dir / "classifier.pt"
+        raise RuntimeError(f"Failed to save fusion metrics: {exc}")
+    state_path = fusion_dir / "classifier.pt"
     torch.save({"state_dict": mlp.state_dict()}, state_path)
     inference_summary: Dict[str, object] = {}
     for dataset_name, payload in inference_outputs.items():
-        out_dir = simplefusion_dir / dataset_name
+        out_dir = fusion_dir / dataset_name
         write_prediction_outputs(
             payload["prediction"],
             payload["default_reference"],
@@ -5103,11 +5407,39 @@ def _count_label_distribution(labels: Sequence[int]) -> Dict[str, int]:
     return counts
 
 
-def _count_pn_lookup(pn_lookup: Optional[Dict[str, set[Tuple[str, int, int]]]]) -> Dict[str, int]:
+def _count_pn_lookup(
+    pn_lookup: Optional[Dict[str, set[Tuple[str, int, int]]]],
+    region_filter: Optional[Sequence[str]] = None,
+) -> Dict[str, int]:
     if not pn_lookup:
         return {"positive": 0, "negative": 0}
-    pos = len(pn_lookup.get("pos", ()))
-    neg = len(pn_lookup.get("neg", ()))
+
+    def _normalise_region(value: Optional[object]) -> str:
+        if value is None:
+            return "NONE"
+        return str(value).upper()
+
+    allowed_regions: Optional[set[str]] = None
+    if region_filter:
+        allowed_regions = {str(region).upper() for region in region_filter if region is not None}
+
+    def _count(entries: Iterable[Tuple[str, int, int]]) -> int:
+        if entries is None:
+            return 0
+        if not allowed_regions:
+            return sum(1 for _ in entries)
+
+        total = 0
+        for region_value, _, _ in entries:
+            region_key = _normalise_region(region_value)
+            if region_key in allowed_regions:
+                total += 1
+            elif region_key == "NONE" and ("GLOBAL" in allowed_regions or "ALL" in allowed_regions):
+                total += 1
+        return total
+
+    pos = _count(pn_lookup.get("pos", ()))
+    neg = _count(pn_lookup.get("neg", ()))
     return {"positive": int(pos), "negative": int(neg)}
 
 
@@ -5457,6 +5789,30 @@ def _load_pretrained_dcca_state(path: Path) -> Tuple[Tuple[Dict[str, torch.Tenso
     if summary is not None and not isinstance(summary, dict):
         summary = None
     return (state_a, state_b), summary
+
+
+def _projection_head_from_state(state_dict: Dict[str, torch.Tensor]) -> nn.Module:
+    weight_keys = [key for key in state_dict.keys() if key.endswith(".weight")]
+    if not weight_keys:
+        raise ValueError("DCCA state dict does not contain linear layer weights.")
+    def _layer_index(key: str) -> int:
+        parts = key.split(".")
+        for part in parts:
+            if part.isdigit():
+                return int(part)
+        return 0
+    sorted_keys = sorted(weight_keys, key=_layer_index)
+    first_weight = state_dict[sorted_keys[0]]
+    last_weight = state_dict[sorted_keys[-1]]
+    if first_weight.ndim != 2 or last_weight.ndim != 2:
+        raise ValueError("Unexpected weight tensor shape in DCCA state dict.")
+    in_dim = int(first_weight.size(1))
+    out_dim = int(last_weight.size(0))
+    num_layers = len(sorted_keys)
+    head = ProjectionHead(in_dim, out_dim, num_layers=num_layers)
+    head.load_state_dict(state_dict, strict=True)
+    return head
+
 def _load_augmented_embeddings(path: Path, region_filter: Optional[Sequence[str]]) -> Tuple[Dict[str, List[np.ndarray]], int]:
     mapping: Dict[str, List[np.ndarray]] = {}
     count = 0
@@ -5553,481 +5909,14 @@ def _print_augmentation_usage(
         f"total_pairs_with_aug={total_pairs}"
     )
 
-def _build_aligned_pairs(
-    pairs: Sequence[OverlapAlignmentPair],
-    *,
-    anchor_name: str,
-    target_name: str,
-    use_positive_only: bool,
-    aggregator: str,
-    gaussian_sigma: Optional[float],
-    debug: bool,
-    dataset_meta_map: Dict[str, Dict[str, object]],
-    anchor_augment_map: Optional[Dict[str, List[np.ndarray]]] = None,
-    target_augment_map: Optional[Dict[str, List[np.ndarray]]] = None,
-    pn_label_maps: Optional[Dict[str, Optional[Dict[str, set[Tuple[str, int, int]]]]]] = None,
-) -> Tuple[
-    List[torch.Tensor],
-    List[torch.Tensor],
-    Counter,
-    Optional[Dict[str, List[Dict[str, object]]]],
-    Dict[str, int],
-    List[Dict[str, object]],
-    Dict[str, Dict[str, Dict[str, object]]],
-]:
-    anchor_augment_map = anchor_augment_map or {}
-    target_augment_map = target_augment_map or {}
-    pn_index_tracker: Dict[str, Dict[str, Dict[str, set[int]]]] = {}
-
-    pn_label_maps = pn_label_maps or {}
-
-    def _register_index(record, dataset_key: str) -> None:
-        if not dataset_key:
-            return
-        lookup = pn_label_maps.get(dataset_key)
-        if not lookup:
-            return
-        region_val = getattr(record, "region", None)
-        row_col_val = getattr(record, "row_col", None)
-        if region_val is None or row_col_val is None:
-            return
-        try:
-            row_val = int(row_col_val[0])
-            col_val = int(row_col_val[1])
-        except Exception:
-            return
-        region_key = str(region_val).upper()
-        key = (region_key, row_val, col_val)
-        label_bucket: Optional[str] = None
-        pos_lookup = lookup.get("pos")
-        if pos_lookup and key in pos_lookup:
-            label_bucket = "pos"
-        neg_lookup = lookup.get("neg")
-        if neg_lookup and key in neg_lookup:
-            label_bucket = "neg"
-        if label_bucket is None:
-            return
-        idx_val = getattr(record, "index", None)
-        if idx_val is None:
-            return
-        try:
-            idx_int = int(idx_val)
-        except Exception:
-            return
-        dataset_bucket = pn_index_tracker.setdefault(dataset_key, {})
-        region_bucket = dataset_bucket.setdefault(region_key, {"pos": set(), "neg": set()})
-        region_bucket[label_bucket].add(idx_int)
-
-    def _finalise_pn_index_summary() -> Dict[str, Dict[str, Dict[str, object]]]:
-        summary: Dict[str, Dict[str, Dict[str, object]]] = {}
-        for dataset_name, regions in pn_index_tracker.items():
-            region_summary: Dict[str, Dict[str, object]] = {}
-            for region_name, label_sets in regions.items():
-                pos_sorted = sorted(label_sets.get("pos", ()))
-                neg_sorted = sorted(label_sets.get("neg", ()))
-                region_summary[region_name] = {
-                    "pos_count": len(pos_sorted),
-                    "neg_count": len(neg_sorted),
-                    "pos_original_indices": pos_sorted,
-                    "neg_original_indices": neg_sorted,
-                    "pos_reindexed_pairs": [
-                        {"reindexed": re_idx, "original": original_idx}
-                        for re_idx, original_idx in enumerate(pos_sorted)
-                    ],
-                    "neg_reindexed_pairs": [
-                        {"reindexed": re_idx, "original": original_idx}
-                        for re_idx, original_idx in enumerate(neg_sorted)
-                    ],
-                }
-            summary[dataset_name] = region_summary
-        return summary
-
-    grouped: Dict[str, Dict[str, object]] = {}
-    anchor_aug_added = 0
-    target_aug_added = 0
-    label_hist: Counter = Counter()
-    debug_data: Optional[Dict[str, object]] = None
-    if debug:
-        debug_data = {
-            "anchor_positive": {},
-            "target_positive": {},
-            "selected_pairs": [],
-            "anchor_name": anchor_name,
-            "target_name": target_name,
-        }
-
-    for pair in pairs:
-        anchor_record, target_record = pair.anchor_record, pair.target_record
-        anchor_ds, target_ds = pair.anchor_dataset, pair.target_dataset
-
-        if anchor_ds != anchor_name or target_ds != target_name:
-            if pair.target_dataset == anchor_name and pair.anchor_dataset == target_name:
-                anchor_record, target_record = pair.target_record, pair.anchor_record
-                anchor_ds, target_ds = pair.target_dataset, pair.anchor_dataset
-            else:
-                continue
-
-        anchor_label = int(anchor_record.label)
-        target_label = int(target_record.label)
-
-        if debug_data is not None:
-            if anchor_label == 1:
-                _add_debug_sample(debug_data["anchor_positive"], anchor_record, anchor_name, dataset_meta_map.get(anchor_name, {}))
-            if target_label == 1:
-                _add_debug_sample(debug_data["target_positive"], target_record, target_name, dataset_meta_map.get(target_name, {}))
-
-        if use_positive_only and anchor_label != 1:
-            continue
-        if use_positive_only and target_label != 1:
-            continue
-
-        _register_index(anchor_record, anchor_ds)
-        _register_index(target_record, target_ds)
-
-        label_key = _label_key(anchor_label, target_label, anchor_name, target_name)
-        label_hist[label_key] += 1
-
-        if debug_data is not None:
-            if anchor_label == 1 and target_label == 1:
-                anchor_sample = _add_debug_sample(debug_data["anchor_positive"], anchor_record, anchor_name, dataset_meta_map.get(anchor_name, {}))
-                target_sample = _add_debug_sample(debug_data["target_positive"], target_record, target_name, dataset_meta_map.get(target_name, {}))
-                if anchor_sample is not None and target_sample is not None:
-                    debug_data["selected_pairs"].append({"anchor": anchor_sample, "target": target_sample})
-
-        tile_id = anchor_record.tile_id
-        grouped.setdefault(tile_id, {
-            "anchor": anchor_record,
-            "targets": [],
-            "weights": [],
-        })
-        grouped[tile_id]["targets"].append(target_record)
-        grouped[tile_id]["weights"].append(_pair_weight(anchor_record, target_record, gaussian_sigma))
-
-    anchor_vecs: List[torch.Tensor] = []
-    target_vecs: List[torch.Tensor] = []
-    pair_metadata: List[Dict[str, object]] = []
-
-    for entry in grouped.values():
-        targets: List = entry["targets"]
-        if not targets:
-            continue
-        aggregated, normalized_weights, target_stack = _aggregate_targets(entry['anchor'], targets, entry['weights'], aggregator)
-        if aggregated is None:
-            continue
-        anchor_tensor = torch.from_numpy(entry['anchor'].embedding).float()
-        anchor_vecs.append(anchor_tensor)
-        target_vecs.append(aggregated.clone())
-        meta_entry = _make_pair_meta(
-            anchor_record=entry["anchor"],
-            targets=targets,
-            weights=normalized_weights,
-            is_augmented=False,
-        )
-        pair_metadata.append(meta_entry)
-        anchor_aug_list = anchor_augment_map.get(entry['anchor'].tile_id, [])
-        for aug_emb in anchor_aug_list:
-            aug_tensor = torch.from_numpy(np.asarray(aug_emb, dtype=np.float32)).float()
-            if aug_tensor.shape != anchor_tensor.shape:
-                continue
-            anchor_vecs.append(aug_tensor)
-            target_vecs.append(aggregated.clone())
-            label_hist[label_key] += 1
-            anchor_aug_added += 1
-            meta_anchor_aug = _make_pair_meta(
-                anchor_record=entry["anchor"],
-                targets=targets,
-                weights=normalized_weights,
-                is_augmented=True,
-                augmentation_role="anchor",
-            )
-            pair_metadata.append(meta_anchor_aug)
-
-        for idx_target, target_record in enumerate(targets):
-            aug_list = target_augment_map.get(target_record.tile_id, [])
-            if not aug_list:
-                continue
-            for aug_emb in aug_list:
-                aug_tensor = torch.from_numpy(np.asarray(aug_emb, dtype=np.float32)).float()
-                if aug_tensor.shape != target_stack[idx_target].shape:
-                    continue
-                modified_stack = target_stack.clone()
-                modified_stack[idx_target] = aug_tensor
-                aggregated_aug = torch.matmul(normalized_weights.unsqueeze(0), modified_stack).squeeze(0)
-                anchor_vecs.append(anchor_tensor.clone())
-                target_vecs.append(aggregated_aug)
-                label_hist[label_key] += 1
-                target_aug_added += 1
-                meta_target_aug = _make_pair_meta(
-                    anchor_record=entry["anchor"],
-                    targets=targets,
-                    weights=normalized_weights,
-                    is_augmented=True,
-                    augmentation_role="target",
-                )
-                pair_metadata.append(meta_target_aug)
 
 
-    aug_stats = {
-        "anchor_augmented_pairs": int(anchor_aug_added),
-        "target_augmented_pairs": int(target_aug_added),
-        "selected_pairs_augmented": int(anchor_aug_added + target_aug_added),
-    }
-
-    pn_index_summary = _finalise_pn_index_summary()
-
-    if debug_data is not None:
-        anchor_serialised = [_serialise_sample(sample) for sample in debug_data["anchor_positive"].values()]
-        target_serialised = [_serialise_sample(sample) for sample in debug_data["target_positive"].values()]
-        pair_serialised = [
-            {
-                "anchor": _serialise_sample(pair["anchor"]),
-                "target": _serialise_sample(pair["target"]),
-            }
-            for pair in debug_data["selected_pairs"]
-        ]
-        debug_payload = {
-            "anchor_positive": anchor_serialised,
-            "target_positive": target_serialised,
-            "selected_pairs": pair_serialised,
-            "anchor_name": anchor_name,
-            "target_name": target_name,
-            'anchor_augmented_pairs': int(anchor_aug_added),
-            'target_augmented_pairs': int(target_aug_added),
-        }
-        debug_payload["pn_index_summary"] = pn_index_summary
-        debug_payload = None
-
-    return anchor_vecs, target_vecs, label_hist, debug_payload, aug_stats, pair_metadata, pn_index_summary
-
-def _add_debug_sample(
-    store: Dict[str, Dict[str, object]],
-    record,
-    dataset_name: str,
-    dataset_meta: Optional[Dict[str, object]],
-    *,
-    is_augmented: bool = False,
-) -> Optional[Dict[str, object]]:
-    if record.coord is None or any(math.isnan(c) for c in record.coord[:2]):
-        return None
-    coord = (float(record.coord[0]), float(record.coord[1]))
-    sample = store.get(record.tile_id)
-    if sample is None:
-        sample = {
-            "tile_id": record.tile_id,
-            "coord": coord,
-            "dataset": dataset_name,
-        }
-        window = record.window_size
-        pixel_res = record.pixel_resolution
-        if window is None and dataset_meta:
-            spacing = dataset_meta.get("window_spacing") or dataset_meta.get("pixel_resolution") or dataset_meta.get("min_resolution")
-            if spacing is not None:
-                pixel_res = float(spacing)
-                window = (1, 1)
-        if window is not None:
-            sample["window_size"] = [int(window[0]), int(window[1])]
-        if pixel_res is None and dataset_meta:
-            pixel_res = dataset_meta.get("pixel_resolution") or dataset_meta.get("min_resolution")
-        if pixel_res is not None:
-            sample["pixel_resolution"] = float(pixel_res)
-        if window is not None and pixel_res is not None:
-            width = window[1] * float(pixel_res)
-            height = window[0] * float(pixel_res)
-            sample["footprint"] = [width, height]
-        sample["is_augmented"] = bool(is_augmented)
-        store[record.tile_id] = sample
-    return sample
-
-def _serialise_sample(sample: Dict[str, object]) -> Dict[str, object]:
-    coord = sample.get("coord")
-    coord_list = [float(coord[0]), float(coord[1])] if coord is not None else None
-    data: Dict[str, object] = {
-        "tile_id": sample.get("tile_id"),
-    }
-    if coord_list is not None:
-        data["coord"] = coord_list
-    if sample.get("dataset") is not None:
-        data["dataset"] = sample["dataset"]
-    if "window_size" in sample and sample["window_size"] is not None:
-        data["window_size"] = [int(sample["window_size"][0]), int(sample["window_size"][1])]
-    if "pixel_resolution" in sample and sample["pixel_resolution"] is not None:
-        data["pixel_resolution"] = float(sample["pixel_resolution"])
-    if sample.get("footprint") is not None:
-        data["footprint"] = [float(sample["footprint"][0]), float(sample["footprint"][1])]
-    if sample.get("is_augmented"):
-        data["is_augmented"] = True
-    return data
-
-def _label_key(anchor_label: int, target_label: int, anchor_name: str, target_name: str) -> str:
-    if anchor_label == 1 and target_label == 1:
-        return "positive_common"
-    if anchor_label == 1 and target_label != 1:
-        return f"positive_{anchor_name}"
-    if anchor_label != 1 and target_label == 1:
-        return f"positive_{target_name}"
-    return "unlabelled"
 
 
-def _pair_weight(anchor_record, target_record, gaussian_sigma: Optional[float]) -> float:
-    if gaussian_sigma is None:
-        return 1.0
-    if anchor_record.coord is None or target_record.coord is None:
-        return 1.0
-    anchor_xy = np.asarray(anchor_record.coord, dtype=float)
-    target_xy = np.asarray(target_record.coord, dtype=float)
-    if anchor_xy.size < 2 or target_xy.size < 2:
-        return 1.0
-    dist = float(np.linalg.norm(anchor_xy[:2] - target_xy[:2]))
-    if dist <= 0.0:
-        return 1.0
-    weight = math.exp(- (dist ** 2) / (2.0 * (gaussian_sigma ** 2)))
-    return float(weight + 1e-8)
 
 
-def _aggregate_targets(anchor_record, targets: Sequence, weights: Sequence[float], aggregator: str) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
-    if aggregator != "weighted_pool":
-        raise NotImplementedError(f"Aggregator '{aggregator}' is not implemented yet.")
-
-    embeddings = [torch.from_numpy(target.embedding).float() for target in targets]
-    if not embeddings:
-        return None, torch.empty(0), torch.empty(0)
-    stacked = torch.stack(embeddings)
-    weight_tensor = torch.tensor(weights, dtype=torch.float32)
-    if torch.isnan(weight_tensor).any() or float(weight_tensor.sum()) <= 0:
-        weight_tensor = torch.ones_like(weight_tensor)
-    weight_tensor = weight_tensor / weight_tensor.sum()
-    aggregated = torch.matmul(weight_tensor.unsqueeze(0), stacked).squeeze(0)
-    return aggregated, weight_tensor, stacked
 
 
-def _normalise_coord(coord: Optional[Sequence[float]]) -> Optional[Tuple[float, float]]:
-    if coord is None:
-        return None
-    try:
-        x = float(coord[0])
-        y = float(coord[1])
-    except Exception:
-        return None
-    if not (math.isfinite(x) and math.isfinite(y)):
-        return None
-    return (x, y)
-
-
-def _normalise_row_col(value: Optional[Sequence[object]]) -> Optional[Tuple[int, int]]:
-    if value is None:
-        return None
-    try:
-        row = int(value[0])
-        col = int(value[1])
-    except Exception:
-        return None
-    return (row, col)
-
-
-def _weighted_average_coord(
-    coords: Sequence[Optional[Tuple[float, float]]],
-    weights: Sequence[float],
-) -> Optional[Tuple[float, float]]:
-    total_weight = 0.0
-    accum_x = 0.0
-    accum_y = 0.0
-    for coord, weight in zip(coords, weights):
-        if coord is None:
-            continue
-        try:
-            w = float(weight)
-        except Exception:
-            continue
-        if not math.isfinite(w) or w <= 0:
-            continue
-        accum_x += coord[0] * w
-        accum_y += coord[1] * w
-        total_weight += w
-    if total_weight <= 0:
-        return None
-    return (accum_x / total_weight, accum_y / total_weight)
-
-
-def _make_pair_meta(
-    anchor_record,
-    targets: Sequence,
-    weights: Optional[torch.Tensor],
-    is_augmented: bool,
-    augmentation_role: Optional[str] = None,
-) -> Dict[str, object]:
-    anchor_row_col = _normalise_row_col(getattr(anchor_record, "row_col", None))
-    target_row_cols = [_normalise_row_col(getattr(target, "row_col", None)) for target in targets]
-    target_coords = [_normalise_coord(getattr(target, "coord", None)) for target in targets]
-    target_tile_ids = [getattr(target, "tile_id", None) for target in targets]
-    target_labels = [int(getattr(target, "label", 0)) for target in targets]
-    target_regions = [getattr(target, "region", None) for target in targets]
-    try:
-        anchor_index = int(getattr(anchor_record, "index"))
-    except Exception:
-        anchor_index = None
-    target_indices: List[Optional[int]] = []
-    for target in targets:
-        try:
-            target_indices.append(int(getattr(target, "index")))
-        except Exception:
-            target_indices.append(None)
-    weights_list: Optional[List[float]] = None
-    weighted_coord: Optional[Tuple[float, float]] = None
-    if isinstance(weights, torch.Tensor) and weights.numel() == len(targets):
-        weights_cpu = weights.detach().cpu()
-        weights_list = [float(w) for w in weights_cpu.tolist()]
-        weighted_coord = _weighted_average_coord(target_coords, weights_list)
-
-    meta: Dict[str, object] = {
-        "anchor_tile_id": getattr(anchor_record, "tile_id", None),
-        "anchor_coord": _normalise_coord(getattr(anchor_record, "coord", None)),
-        "anchor_region": getattr(anchor_record, "region", None),
-        "anchor_label": int(getattr(anchor_record, "label", 0)),
-        "anchor_row_col": anchor_row_col,
-        "target_tile_ids": target_tile_ids,
-        "target_coords": target_coords,
-        "target_labels": target_labels,
-        "target_regions": target_regions,
-        "target_row_cols": target_row_cols,
-        "target_weights": weights_list,
-        "target_weighted_coord": weighted_coord,
-        "is_augmented": bool(is_augmented),
-        "anchor_index": anchor_index,
-        "target_indices": target_indices,
-    }
-    if augmentation_role is not None:
-        meta["augmentation_role"] = augmentation_role
-    return meta
-
-
-if torch is not None:
-
-    class ProjectionHead(nn.Module):
-        def __init__(self, in_dim: int, out_dim: int, *, num_layers: int = 2):
-            super().__init__()
-            if num_layers < 1:
-                raise ValueError("ProjectionHead requires at least one layer.")
-            hidden_dim = max(out_dim, min(in_dim, 512))
-            layers: List[nn.Module] = []
-            prev_dim = in_dim
-            if num_layers == 1:
-                layers.append(nn.Linear(prev_dim, out_dim))
-            else:
-                for _ in range(num_layers - 1):
-                    layers.append(nn.Linear(prev_dim, hidden_dim))
-                    layers.append(nn.ReLU(inplace=True))
-                    prev_dim = hidden_dim
-                layers.append(nn.Linear(prev_dim, out_dim))
-            self.net = nn.Sequential(*layers)
-
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            return self.net(x)
-
-else:
-
-    class ProjectionHead:  # type: ignore[too-many-ancestors]
-        def __init__(self, *args, **kwargs):
-            raise RuntimeError("ProjectionHead requires PyTorch. Install torch before training.")
 
 
 def _matrix_inverse_sqrt(mat: torch.Tensor, eps: float) -> torch.Tensor:

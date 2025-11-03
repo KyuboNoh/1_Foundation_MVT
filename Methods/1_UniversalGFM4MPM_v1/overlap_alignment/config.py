@@ -94,11 +94,12 @@ def _coerce_config_section(
     data = _config_to_kwargs(seed_cfg)
     extras = data.pop("extras", {})
     if isinstance(seed_cfg, ConfigDCCA):
-        recognised_float = {"lr", "validation_fraction", "dcca_eps", "singular_value_drop_ratio", "tcc_ratio"}
+        recognised_float = {"lr", "weight_decay", "validation_fraction", "dcca_eps", "singular_value_drop_ratio", "tcc_ratio"}
     else:
-        recognised_float = {"lr", "validation_fraction"}
+        recognised_float = {"lr", "weight_decay", "validation_fraction"}
     recognised_int = {"batch_size", "epochs", "mc_dropout_passes", "projection_dim"}
-    recognised_keys = set(recognised_float) | set(recognised_int) | {"mlp_hidden_dims"}
+    recognised_str = {"overlapregion_label"} if issubclass(config_type, ConfigCLS) else set()
+    recognised_keys = set(recognised_float) | set(recognised_int) | {"mlp_hidden_dims"} | recognised_str
     alias_map = alias_map or {}
     if not isinstance(section, dict):
         cfg = config_type(**data)
@@ -122,6 +123,9 @@ def _coerce_config_section(
                 data[canonical] = float(value)
             except (TypeError, ValueError):
                 continue
+            continue
+        if canonical in recognised_str:
+            data[canonical] = str(value)
             continue
         extras[canonical] = value
     cfg = config_type(**data)

@@ -21,7 +21,7 @@ python -m Methods.1_UniversalGFM4MPM_v1.overlap_alignment.train --config ./ufm_v
 ## Stage-2 Train CLS after Overlap Alignment Training
 
 ```bash
-python -m Methods.1_UniversalGFM4MPM_v1.overlap_alignment.train --config ./ufm_v1_config_wsl_debug.json --train-cls --read-dcca --no-train-dcca --dcca-weights-path /home/wslqubuntu24/Research/Data/1_Foundation_MVT_Result/2_UFM_v1/UFM_v1_experiments/DCCA_posneg_dim128/overlap_alignment_stage1.pt --debug
+python -m Methods.1_UniversalGFM4MPM_v1.overlap_alignment.train --config ./ufm_v1_config_wsl_debug.json --train-cls --read-dcca --no-train-dcca --dcca-weights-path /home/wslqubuntu24/Research/Data/1_Foundation_MVT_Result/2_UFM_v1/Ex1_DCCA_dim128/overlap_alignment_stage1_dcca.pt --debug
 ```
 
 ## Stage-1+2 Overlap Alignment Training (positive-only)
