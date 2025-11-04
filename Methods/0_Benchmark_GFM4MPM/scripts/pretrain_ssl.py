@@ -1569,7 +1569,8 @@ if __name__ == '__main__':
     # TODO: Make it generalized for future development... How so?
     worker_count = 8
     if getattr(stack, "kind", None) == "raster":
-        worker_count = 0
+        # worker_count = 0  # previous behaviour: force single-threaded I/O
+        worker_count = min(8, os.cpu_count() or 8)
     train_dl = DataLoader(
         train_ds,
         batch_size=args.batch,
@@ -1600,7 +1601,8 @@ if __name__ == '__main__':
             val_ds,
             batch_size=val_batch,
             shuffle=False,
-            num_workers=worker_count,
+            # num_workers=worker_count,
+            num_workers=min(8, os.cpu_count() or 8) if getattr(stack, "kind", None) == "raster" else worker_count,
             pin_memory=True,
         )
     elif not args.button_inference:
