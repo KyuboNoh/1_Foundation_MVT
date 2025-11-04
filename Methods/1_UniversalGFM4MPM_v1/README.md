@@ -48,6 +48,28 @@ Outputs:
 - `overlap_alignment_stage1_metrics.json` – JSON dump of the summary and the
   full epoch history (loss, mean canonical correlation) for downstream analysis.
 
+## Overlap Utility Helpers
+
+Several helper functions in `overlap_alignment/train.py` are being prepared for
+promotion into `Common/Unifying/Labels_TwoDatasets` so v2 can reuse them:
+
+- `align_overlap_embeddings_for_pn_one_to_one(z_a, z_b)` (now published under
+  `Common/Unifying/Labels_TwoDatasets/fusion_utils.py`) trims the re-embedding payloads
+  down to the spatial overlap and aligns their PN labels, emitting paired
+  `z_a ∈ ℝ^{N×d_a}` / `z_b ∈ ℝ^{N×d_b}` tensors plus consistent `pair_ids`.
+- `prepare_fusion_overlap_dataset_one_to_one(...)` consumes the aligned payloads and
+  constructs the fused feature table `φ(u,v)` used to train the PN head. It
+  supports both the simple `[u; v]` template and the strong
+  `[u; v; |u−v|; u⊙v; cos(u,v); m]` template, bundling metadata/labels alongside
+  the fused matrix.
+- `prepare_fusion_overlap_dataset_for_inference(...)` mirrors the previous
+  function but emits NumPy tensors and lookup tables suited for inference over
+  raster grids. It works with method_id `v1_simple` or `v1_strong` for this package. 
+
+These descriptions should be kept in sync once the helpers move into the shared
+module so downstream tooling (v2 transformer aggregators, distillation logic,
+etc.) can discover their expected inputs and outputs quickly.
+
 ## Next steps
 
 - Implement overlap alignment losses on top of `OverlapAlignmentWorkspace.iter_pairs`.

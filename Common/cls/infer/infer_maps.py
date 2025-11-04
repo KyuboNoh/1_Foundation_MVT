@@ -233,7 +233,7 @@ def _mc_predict_single_region(
         parent_dir = os.path.dirname(target_path)
         if parent_dir:
             os.makedirs(parent_dir, exist_ok=True)
-        np.save(target_path, predictions)
+        np.savez_compressed(target_path, predictions=predictions)
 
     with np.errstate(invalid="ignore"):
         mean_map = np.divide(mean_map, counts, where=counts > 0)
