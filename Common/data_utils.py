@@ -639,69 +639,69 @@ def _filter_valid_raster_coords_integral(
     valid: List[RegionCoord] = []
     invalid: List[RegionCoord] = []
 
-    try:
-        for coord in iterator:
-            if hasattr(stack, "resolve_region_stack"):
-                region, row, col = coord
-                region_stack = stack.resolve_region_stack(region)
-                if region_stack is None:
-                    invalid.append(coord)
-                    continue
-            else:
-                region_stack = stack
-                if isinstance(coord, (tuple, list)):
-                    if len(coord) == 3:
-                        _, row, col = coord
-                    elif len(coord) == 2:
-                        row, col = coord
-                    else:
-                        invalid.append(coord)
-                        continue
+    # try:
+    for coord in iterator:
+        if hasattr(stack, "resolve_region_stack"):
+            region, row, col = coord
+            region_stack = stack.resolve_region_stack(region)
+            if region_stack is None:
+                invalid.append(coord)
+                continue
+        else:
+            region_stack = stack
+            if isinstance(coord, (tuple, list)):
+                if len(coord) == 3:
+                    _, row, col = coord
+                elif len(coord) == 2:
+                    row, col = coord
                 else:
                     invalid.append(coord)
                     continue
-
-            row_int = int(row)
-            col_int = int(col)
-
-            key = (region, row_int, col_int) if hasattr(stack, "resolve_region_stack") else (row_int, col_int)
-            cached = cache.get(key)
-            if cached is not None:
-                (valid if cached else invalid).append(coord)
-                continue
-
-            integral_info = _ensure_integral_mask(region_stack)
-            if integral_info is None:
-                return None  # fallback to patch-based method
-            integral, (height, width) = integral_info
-
-            r0 = max(row_int - half, 0)
-            r1 = min(r0 + window, height)
-            if r1 <= r0:
-                cache[key] = False
-                invalid.append(coord)
-                continue
-            c0 = max(col_int - half, 0)
-            c1 = min(c0 + window, width)
-            if c1 <= c0:
-                cache[key] = False
+            else:
                 invalid.append(coord)
                 continue
 
-            area = (r1 - r0) * (c1 - c0)
-            if area <= 0:
-                cache[key] = False
-                invalid.append(coord)
-                continue
+        row_int = int(row)
+        col_int = int(col)
 
-            count_valid = _window_sum(integral, r0, c0, r1, c1)
-            fraction = count_valid / float(area)
-            is_valid = count_valid > 0 and fraction >= min_valid_fraction
-            cache[key] = is_valid
-            (valid if is_valid else invalid).append(coord)
-    finally:
-        if use_progress:
-            print("[info] Validate raster windows completed (integral).")
+        key = (region, row_int, col_int) if hasattr(stack, "resolve_region_stack") else (row_int, col_int)
+        cached = cache.get(key)
+        if cached is not None:
+            (valid if cached else invalid).append(coord)
+            continue
+
+        integral_info = _ensure_integral_mask(region_stack)
+        if integral_info is None:
+            return None  # fallback to patch-based method
+        integral, (height, width) = integral_info
+
+        r0 = max(row_int - half, 0)
+        r1 = min(r0 + window, height)
+        if r1 <= r0:
+            cache[key] = False
+            invalid.append(coord)
+            continue
+        c0 = max(col_int - half, 0)
+        c1 = min(c0 + window, width)
+        if c1 <= c0:
+            cache[key] = False
+            invalid.append(coord)
+            continue
+
+        area = (r1 - r0) * (c1 - c0)
+        if area <= 0:
+            cache[key] = False
+            invalid.append(coord)
+            continue
+
+        count_valid = _window_sum(integral, r0, c0, r1, c1)
+        fraction = count_valid / float(area)
+        is_valid = count_valid > 0 and fraction >= min_valid_fraction
+        cache[key] = is_valid
+        (valid if is_valid else invalid).append(coord)
+    # finally:
+    #     if use_progress:
+    #         print("[info] Validate raster windows completed (integral).")
 
     return valid, invalid
 
