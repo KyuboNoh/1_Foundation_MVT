@@ -717,9 +717,11 @@ def _filter_valid_raster_coords_patch(
     invalid: List[RegionCoord] = []
 
     iterator = coords_list
-    # use_progress = tqdm is not None and len(coords_list) > 0
-    # if use_progress:
-    #     iterator = tqdm(coords_list, desc="Validate raster windows")
+    use_progress = tqdm is not None and len(coords_list) > 500
+    progress = None
+    if use_progress:
+        progress = tqdm(coords_list, desc="filter_valid_raster_coords", unit="coord", leave=False)
+        iterator = progress
 
     for coord in iterator:
         try:
@@ -762,6 +764,9 @@ def _filter_valid_raster_coords_patch(
         is_valid = not mask_bool.all() and valid_fraction >= min_valid_fraction
         cache[key] = is_valid
         (valid if is_valid else invalid).append(coord)
+
+    if progress is not None:
+        progress.close()
 
     return valid, invalid
 
