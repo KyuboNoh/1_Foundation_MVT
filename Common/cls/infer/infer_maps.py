@@ -128,7 +128,7 @@ def _mc_predict_single_region(
     save_path: str = None,
 ):
     torch_mod = _require_torch()
-    embedding_array: Optional[np.ndarray] = None
+    embedding_array = None
     embedding_lookup: Optional[Dict[Tuple[int, int], int]] = None
     embedding_coords: Optional[Sequence[Tuple[int, int]]] = None
     if precomputed_embeddings is not None:
@@ -140,12 +140,26 @@ def _mc_predict_single_region(
     if embedding_lookup is None:
         raise ValueError("precomputed_embeddings is required.")
 
-    mlp.eval().to(device)
+    device_cls = torch_mod.device
+    device_obj = device if isinstance(device, device_cls) else device_cls(device)
+    mlp = mlp.to(device_obj)
+    mlp.eval()
     for module in mlp.modules():
         if isinstance(module, nn.Dropout):
             module.train()
         elif isinstance(module, nn.modules.batchnorm._BatchNorm):
             module.eval()
+    def _to_tensor(array_like: Any) -> Optional[torch.Tensor]:
+        if array_like is None:
+            return None
+        if torch_mod.is_tensor(array_like):
+            tensor = array_like.detach()
+        else:
+            tensor = torch_mod.as_tensor(array_like)
+        tensor = tensor.to(device_obj, dtype=torch_mod.float32)
+        return tensor.contiguous()
+
+    embedding_tensor = _to_tensor(embedding_array)
     H, W = stack.height, stack.width
     mean_map = np.zeros((H, W), dtype=np.float32)
     var_map  = np.zeros((H, W), dtype=np.float32)
@@ -170,30 +184,32 @@ def _mc_predict_single_region(
         iterator = tqdm(centers, desc=desc)
     elif show_progress and tqdm is None:
         print("[warn] tqdm not installed; progress bar disabled.")
-    for r, c in iterator:
-        zs = None
-        if embedding_lookup is not None and embedding_array is not None:
-            idx = embedding_lookup.get((int(r), int(c)))
-            if idx is not None:
-                emb_vec = np.asarray(embedding_array[idx], dtype=np.float32)
-                zs = torch_mod.from_numpy(emb_vec.reshape(1, -1)).to(device)
-        if zs is None:
-            missing_embeddings += 1
-        preds = []
-        for _ in range(passes):
-            p = mlp(zs)
-            preds.append(p.item())
+    with torch_mod.no_grad():
+        for r, c in iterator:
+            zs = None
+            if embedding_lookup is not None and embedding_tensor is not None:
+                idx = embedding_lookup.get((int(r), int(c)))
+                if idx is not None:
+                    zs = embedding_tensor[idx].unsqueeze(0)
+            if zs is None:
+                missing_embeddings += 1
+                continue
+            if passes > 1:
+                batch = zs.repeat(passes, 1)
+                preds_tensor = mlp(batch).view(-1)
+            else:
+                preds_tensor = mlp(zs).view(-1)
+            mu = float(preds_tensor.mean().item())
+            sig2 = float(preds_tensor.var(unbiased=False).item()) if preds_tensor.numel() > 1 else 0.0
 
-        mu = float(np.mean(preds)); sig2 = float(np.var(preds))
+            # Update only the center pixel
+            mean_map[r, c] += mu
+            var_map[r, c]  += sig2
+            counts[r, c]   += 1
 
-        # Update only the center pixel
-        mean_map[r, c] += mu
-        var_map[r, c]  += sig2
-        counts[r, c]   += 1
-
-        if save_prediction:
-            prediction_buffer[next_row] = (r, c, mu, sig2)
-            next_row += 1
+            if save_prediction:
+                prediction_buffer[next_row] = (r, c, mu, sig2)
+                next_row += 1
 
     if save_prediction:
         predictions = prediction_buffer[:next_row]
