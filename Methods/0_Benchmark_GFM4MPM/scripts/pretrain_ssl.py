@@ -211,8 +211,52 @@ class SSLDataset(Dataset):
             for coord in exclude_coords:
                 self.exclude_keys.add(_coord_key(coord))
 
+        self._prefetched_training_coords: Optional[List[Coord]] = None
+        if coords is None:
+            prefetched = self._prefetch_training_coords()
+            if prefetched:
+                rng_shuffle = np.random.default_rng(self._base_seed)
+                rng_shuffle.shuffle(prefetched)
+                self._prefetched_training_coords = prefetched
+                self.fixed_coords = prefetched
+                self.total_samples = len(prefetched)
+                if self._debug_mode:
+                    limited = int(round(len(prefetched) * self.debug_fraction / 100.0))
+                    limited = max(1, min(len(prefetched), limited))
+                    self.fixed_coords = prefetched[:limited]
+                    self.n = limited
+                    self._debug_mode = False
+                else:
+                    self.n = len(prefetched)
+
+
     def __len__(self):
         return self.n
+
+    def _prefetch_training_coords(self) -> Optional[List[Coord]]:
+        if getattr(self.stack, "kind", None) != "raster":
+            return None
+        total_needed = int(self.total_samples)
+        if total_needed <= 0:
+            return None
+        try:
+            coords = _collect_unique_coords(
+                self.stack,
+                self.window,
+                total_needed,
+                self._base_seed,
+            )
+        except Exception:
+            return None
+        if not coords:
+            return None
+        if self.exclude_keys:
+            filtered = [coord for coord in coords if _coord_key(coord) not in self.exclude_keys]
+        else:
+            filtered = coords
+        if not filtered:
+            return None
+        return filtered
 
     @staticmethod
     def _ensure_mask(mask: Optional[np.ndarray], patch: np.ndarray) -> np.ndarray:

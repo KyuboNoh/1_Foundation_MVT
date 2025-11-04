@@ -32,12 +32,12 @@
       "tcc_ratio": 0.0005
     },
     "step2_CLS": {
+      "overlapregion_label": "BC",
       "batch_size": 16,
       "epochs": 60,
       "lr": 0.0005,
       "mlp_hidden_dims": [256, 128, 64, 32],
       "validation_fraction": 0.3,
-      "overlapregion_label": "BC",
       "mc_dropout_passes" : 10
     }
   }

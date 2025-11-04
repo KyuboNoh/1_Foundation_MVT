@@ -93,7 +93,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         choices=[1, 2],
         default=1,
-        help="PN classifier training method to use (1 [Unified CLS] or 2 [Independent CLS]; default: 1).",
+        help="PN classifier training method to use (1 [Overlap region; Use labels from chosen 'overlapregion_label' in config] or 2 [No label in overlapping region]; default: 1).",
     )
     parser.add_argument(
         "--mlp-hidden-dims",
@@ -832,124 +832,6 @@ def main() -> None:
                 results: Dict[str, object] = {}
                 
                 if method == 1:
-                    
-                    #################################### Training Classifier using simple fusion ####################################
-                    # Construct MLP classifier using "simple fusion" unified method - [u, v] inputs
-                    run_logger.log(f"Training PN classifier method {method} - simple fusion head")
-                    # 1. read u (take only overlap region) 
-                    # 2. read v (take only overlap region)
-                    (
-                        aligned_embedding_anchor_overlap,
-                        aligned_embedding_target_overlap,
-                        aligned_labels_anchor_overlap,
-                        aligned_labels_target_overlap,
-                    ) = _align_overlap_embeddings_for_pn(
-                        DCCAEmbedding_anchor_overlap,
-                        DCCAEmbedding_target_overlap,
-                        index_label_anchor_overlap=index_label_anchor_overlap,
-                        index_label_target_overlap=index_label_target_overlap,
-                        anchor_name=anchor_name,
-                        target_name=target_name,
-                    )
-
-                    # 3. concatenate [u, v] and prepare label (synthesize positive (positivie_all=[positive from A, positive from B]) and negative samples)
-                    fusion_dataset = _prepare_fusion_overlap_dataset(
-                        aligned_embedding_anchor_overlap,
-                        aligned_embedding_target_overlap,
-                        aligned_labels_anchor_overlap, 
-                        aligned_labels_target_overlap,
-                        anchor_name=anchor_name,
-                        target_name=target_name,
-                        method_id="simple"
-                    )
-
-                    if debug_mode:
-                        print(
-                            "[debug] overlap embedding sizes:",
-                            DCCAEmbedding_anchor_overlap["features"].shape if DCCAEmbedding_anchor_overlap else None,
-                            DCCAEmbedding_target_overlap["features"].shape if DCCAEmbedding_target_overlap else None,
-                            len(index_label_anchor_overlap["labels"]) if index_label_anchor_overlap else 0,
-                            len(index_label_target_overlap["labels"]) if index_label_target_overlap else 0,
-                        )
-                        print(
-                            "[debug] overlap alignment sizes:",
-                            aligned_embedding_anchor_overlap["features"].shape if aligned_embedding_anchor_overlap else None,
-                            aligned_embedding_target_overlap["features"].shape if aligned_embedding_target_overlap else None,
-                            aligned_labels_anchor_overlap.size,
-                            aligned_labels_target_overlap.size,
-                        )
-                        print(
-                            "[debug] prepared data sizes:",
-                            fusion_dataset["features"].shape if fusion_dataset else None,
-                            fusion_dataset["labels"].size,
-                        )
-
-                    if fusion_dataset is None:
-                        run_logger.log("[fusion] Dataset preparation failed; skipping simple fusion head.")
-                    else:
-                        train_idx, val_idx = _overlap_split_indices(fusion_dataset, validation_fraction=cfg.cls_training.validation_fraction, seed = cfg.seed, )
-                        if train_idx is None and val_idx is None:
-                            run_logger.log("[fusion] Insufficient class diversity for training; skipping simple fusion head.")
-                        else:
-                            # 4. Split the data like this:
-                            dl_tr, dl_val, metrics_summary_simple = _build_dataloaders(fusion_dataset, train_idx, val_idx, cfg,)
-
-                            if len(dl_tr.dataset) == 0:
-                                run_logger.log("[fusion] Training loader is empty; skipping simple fusion head.")
-                            else:
-                                # 5. Train MLP (mlp) with dropout
-                                mlp, history_payload, evaluation_summary = _fusion_train_model(fusion_dataset, dl_tr, dl_val, cfg, device, mlp_hidden_dims, mlp_dropout, run_logger,)
-
-                                fusion_dir = Path(method_dir) / "Fusion_Method_1_1_Unified_head_simplefusion"
-
-                                # 6. run inference across overlap datasets after training
-                                if args.run_inference:
-                                    inference_outputs = _no_fusion_run_inference(
-                                        fusion_dataset,
-                                        DCCAEmbedding_anchor_overlap,
-                                        DCCAEmbedding_target_overlap,
-                                        mlp,
-                                        overlap_mask_info,
-                                        device,
-                                        cfg,
-                                        run_logger,
-                                    )
-
-                                    # Prepare fusion dataset for inference; mind that the number of embeddings are different within overlaping region by datasets due to different resolution. 
-                                    # Mind that the all data should be matched to construct phi (phi = [u;v] or phi = [u; v; |u-v|; u*v; cosine(u,v)]) pairs for inference.
-                                    # The matching should be based on coordinates within DCCAEmbedding_anchor_overlap, DCCAEmbedding_target_overlap.
-                                    fusion_dataset_for_inference = _prepare_fusion_overlap_dataset_for_inference(
-                                        DCCAEmbedding_anchor_overlap,
-                                        DCCAEmbedding_target_overlap,
-                                        method_id="simple"
-                                    )
-
-                                    if fusion_dataset_for_inference is not None:
-                                        fusion_output = _fusion_run_inference(
-                                            fusion_dataset_for_inference,
-                                            mlp,
-                                            overlap_mask_info,
-                                            device,
-                                            cfg,
-                                            run_logger,
-                                            method_id="simple",
-                                        )
-                                        for key, value in fusion_output.items():
-                                            inference_outputs.setdefault(key, value)
-                                else:
-                                    inference_outputs = {}
-
-                                # 7. Plot results using Common/cls/infer/infer_maps.write_prediction_outputs like write_prediction_outputs(prediction,stack,out_dir, pos_coords_by_region=pos_coord_map, neg_coords_by_region=neg_coord_map, )
-                                metrics_summary_simple = dict(metrics_summary_simple)
-                                metrics_summary_simple["train_size"] = int(train_idx.size)
-                                metrics_summary_simple["val_size"] = int(val_idx.size)
-
-                                fusion_summary = _fusion_export_results(fusion_dir, mlp, history_payload, evaluation_summary, metrics_summary_simple, inference_outputs,)
-                                metadata_payload.setdefault("fusion 1-1 simple", fusion_summary)
-                                
-                    
-                    
-
                     #################################### Training Classifier using strong fusion for overlap region ####################################
                     # Construct MLP classifier using "strong fusion" unified method - ϕ=[u;v;∣u−v∣;u⊙v;cos(u,v)] inputs - overlap region only
                     run_logger.log(f"Training PN classifier method {method} - strong fusion head for overlap region")
@@ -1016,41 +898,29 @@ def main() -> None:
                                 run_logger.log("[strongfusion] Training loader is empty; skipping strong fusion head.")
                             else:
                                 # 5. Train MLP (mlp) with dropout
-                                mlp, history_payload, evaluation_summary = _fusion_train_model(fusion_dataset, dl_tr, dl_val, cfg, device, mlp_hidden_dims, mlp_dropout, run_logger,)
-
+                                mlp_strong, history_payload, evaluation_summary = _fusion_train_model(fusion_dataset, dl_tr, dl_val, cfg, device, mlp_hidden_dims, mlp_dropout, run_logger,)
                                 fusion_dir = Path(method_dir) / "Fusion_Method_1_2_Unified_head_strongfusion"
 
                                 # 6. run inference across overlap datasets after training
-                                
                                 if args.run_inference:
-                                    inference_outputs = _no_fusion_run_inference(
-                                        fusion_dataset,
-                                        DCCAEmbedding_anchor_overlap,
-                                        DCCAEmbedding_target_overlap,
-                                        mlp,
-                                        overlap_mask_info,
-                                        device,
-                                        cfg,
-                                        run_logger,
-                                    )
-
+                                    # Prepare fusion dataset for inference; mind that the number of embeddings are different within overlaping region by datasets due to different resolution. 
+                                    # Mind that the all data should be matched to construct phi (phi = [u;v] or phi = [u; v; |u-v|; u*v; cosine(u,v)]) pairs for inference.
+                                    # The matching should be based on coordinates within DCCAEmbedding_anchor_overlap, DCCAEmbedding_target_overlap.
                                     fusion_dataset_for_inference = _prepare_fusion_overlap_dataset_for_inference(
                                         DCCAEmbedding_anchor_overlap,
                                         DCCAEmbedding_target_overlap,
                                         method_id="strong",
                                     )
                                     if fusion_dataset_for_inference is not None:
-                                        fusion_output = _fusion_run_inference(
+                                        inference_outputs = _fusion_run_inference(
                                             fusion_dataset_for_inference,
-                                            mlp,
+                                            mlp_strong,
                                             overlap_mask_info,
                                             device,
                                             cfg,
                                             run_logger,
                                             method_id="strong",
                                         )
-                                        for key, value in fusion_output.items():
-                                            inference_outputs.setdefault(key, value)
                                 else:
                                     inference_outputs = {}
 
@@ -1058,12 +928,115 @@ def main() -> None:
                                 metrics_summary_strong = dict(metrics_summary_strong)
                                 metrics_summary_strong["train_size"] = int(train_idx.size)
                                 metrics_summary_strong["val_size"] = int(val_idx.size)
-                                fusion_summary = _fusion_export_results(fusion_dir, mlp, history_payload, evaluation_summary, metrics_summary_strong, inference_outputs,)
+                                fusion_summary = _fusion_export_results(fusion_dir, mlp_strong, history_payload, evaluation_summary, metrics_summary_strong, inference_outputs,)
                                 metadata_payload.setdefault("fusion 1-2 strong", fusion_summary)
+
+                    #################################### Training Classifier using simple fusion ####################################
+                    # Construct MLP classifier using "simple fusion" unified method - [u, v] inputs
+                    run_logger.log(f"Training PN classifier method {method} - simple fusion head")
+                    # 1. read u (take only overlap region) 
+                    # 2. read v (take only overlap region)
+                    (
+                        aligned_embedding_anchor_overlap,
+                        aligned_embedding_target_overlap,
+                        aligned_labels_anchor_overlap,
+                        aligned_labels_target_overlap,
+                    ) = _align_overlap_embeddings_for_pn(
+                        DCCAEmbedding_anchor_overlap,
+                        DCCAEmbedding_target_overlap,
+                        index_label_anchor_overlap=index_label_anchor_overlap,
+                        index_label_target_overlap=index_label_target_overlap,
+                        anchor_name=anchor_name,
+                        target_name=target_name,
+                    )
+
+                    # 3. concatenate [u, v] and prepare label (synthesize positive (positivie_all=[positive from A, positive from B]) and negative samples)
+                    fusion_dataset = _prepare_fusion_overlap_dataset(
+                        aligned_embedding_anchor_overlap,
+                        aligned_embedding_target_overlap,
+                        aligned_labels_anchor_overlap, 
+                        aligned_labels_target_overlap,
+                        anchor_name=anchor_name,
+                        target_name=target_name,
+                        method_id="simple"
+                    )
+
+                    if debug_mode:
+                        print(
+                            "[debug] overlap embedding sizes:",
+                            DCCAEmbedding_anchor_overlap["features"].shape if DCCAEmbedding_anchor_overlap else None,
+                            DCCAEmbedding_target_overlap["features"].shape if DCCAEmbedding_target_overlap else None,
+                            len(index_label_anchor_overlap["labels"]) if index_label_anchor_overlap else 0,
+                            len(index_label_target_overlap["labels"]) if index_label_target_overlap else 0,
+                        )
+                        print(
+                            "[debug] overlap alignment sizes:",
+                            aligned_embedding_anchor_overlap["features"].shape if aligned_embedding_anchor_overlap else None,
+                            aligned_embedding_target_overlap["features"].shape if aligned_embedding_target_overlap else None,
+                            aligned_labels_anchor_overlap.size,
+                            aligned_labels_target_overlap.size,
+                        )
+                        print(
+                            "[debug] prepared data sizes:",
+                            fusion_dataset["features"].shape if fusion_dataset else None,
+                            fusion_dataset["labels"].size,
+                        )
+
+                    if fusion_dataset is None:
+                        run_logger.log("[fusion] Dataset preparation failed; skipping simple fusion head.")
+                    else:
+                        train_idx, val_idx = _overlap_split_indices(fusion_dataset, validation_fraction=cfg.cls_training.validation_fraction, seed = cfg.seed, )
+                        if train_idx is None and val_idx is None:
+                            run_logger.log("[fusion] Insufficient class diversity for training; skipping simple fusion head.")
+                        else:
+                            # 4. Split the data like this:
+                            dl_tr, dl_val, metrics_summary_simple = _build_dataloaders(fusion_dataset, train_idx, val_idx, cfg,)
+
+                            if len(dl_tr.dataset) == 0:
+                                run_logger.log("[fusion] Training loader is empty; skipping simple fusion head.")
+                            else:
+                                # 5. Train MLP (mlp) with dropout
+                                mlp_simple, history_payload, evaluation_summary = _fusion_train_model(fusion_dataset, dl_tr, dl_val, cfg, device, mlp_hidden_dims, mlp_dropout, run_logger,)
+
+                                fusion_dir = Path(method_dir) / "Fusion_Method_1_1_Unified_head_simplefusion"
+
+                                # 6. run inference across overlap datasets after training
+                                if args.run_inference:
+                                    # Prepare fusion dataset for inference; mind that the number of embeddings are different within overlaping region by datasets due to different resolution. 
+                                    # Mind that the all data should be matched to construct phi (phi = [u;v] or phi = [u; v; |u-v|; u*v; cosine(u,v)]) pairs for inference.
+                                    # The matching should be based on coordinates within DCCAEmbedding_anchor_overlap, DCCAEmbedding_target_overlap.
+                                    fusion_dataset_for_inference = _prepare_fusion_overlap_dataset_for_inference(
+                                        DCCAEmbedding_anchor_overlap,
+                                        DCCAEmbedding_target_overlap,
+                                        method_id="simple"
+                                    )
+
+                                    if fusion_dataset_for_inference is not None:
+                                        inference_outputs = _fusion_run_inference(
+                                            fusion_dataset_for_inference,
+                                            mlp_simple,
+                                            overlap_mask_info,
+                                            device,
+                                            cfg,
+                                            run_logger,
+                                            method_id="simple",
+                                        )
+                                else:
+                                    inference_outputs = {}
+
+                                # 7. Plot results using Common/cls/infer/infer_maps.write_prediction_outputs like write_prediction_outputs(prediction,stack,out_dir, pos_coords_by_region=pos_coord_map, neg_coords_by_region=neg_coord_map, )
+                                metrics_summary_simple = dict(metrics_summary_simple)
+                                metrics_summary_simple["train_size"] = int(train_idx.size)
+                                metrics_summary_simple["val_size"] = int(val_idx.size)
+
+                                fusion_summary = _fusion_export_results(fusion_dir, mlp_simple, history_payload, evaluation_summary, metrics_summary_simple, inference_outputs,)
+                                metadata_payload.setdefault("fusion 1-1 simple", fusion_summary)
+
 
                     # #################################### Training Classifier using strong fusion for all region ####################################
                     # NOT IMPLEMENTED YET
-                
+                    #
+                    
                 elif method == 2:
                     exit()
 
@@ -4365,219 +4338,6 @@ def _fusion_run_inference(
     return outputs
 
 
-def _prepare_inference_entry(
-    entry: Dict[str, object],
-    *,
-    dim_u: int,
-    dim_v: int,
-    role: str,
-    method: str = "simple",
-) -> Optional[Dict[str, object]]:
-    features_t = entry.get("features")
-    if features_t is None:
-        return None
-    base_np = features_t.detach().cpu().numpy().astype(np.float32, copy=False)
-    if base_np.size == 0:
-        return None
-    method_key = method.lower()
-
-    def _pad(vec: np.ndarray, length: int) -> np.ndarray:
-        if vec.shape[1] == length:
-            return vec
-        if vec.shape[1] > length:
-            return vec[:, :length]
-        pad_width = length - vec.shape[1]
-        if pad_width <= 0:
-            return vec
-        zeros = np.zeros((vec.shape[0], pad_width), dtype=np.float32)
-        return np.concatenate([vec, zeros], axis=1)
-
-    if role == "anchor":
-        anchor_vec = _pad(base_np, dim_u)
-        target_vec = np.zeros((base_np.shape[0], dim_v), dtype=np.float32)
-    else:
-        anchor_vec = np.zeros((base_np.shape[0], dim_u), dtype=np.float32)
-        target_vec = _pad(base_np, dim_v)
-
-    if method_key == "strong":
-        max_dim = max(dim_u, dim_v)
-        if max_dim <= 0:
-            max_dim = max(base_np.shape[1], 1)
-        anchor_common = _pad(anchor_vec, max_dim)
-        target_common = _pad(target_vec, max_dim)
-        diff_vec = np.abs(anchor_common - target_common)
-        prod_vec = anchor_common * target_common
-        norm_u = np.linalg.norm(anchor_common, axis=1, keepdims=True)
-        norm_v = np.linalg.norm(target_common, axis=1, keepdims=True)
-        cosine = np.divide(
-            (anchor_common * target_common).sum(axis=1, keepdims=True),
-            norm_u * norm_v + 1e-8,
-            out=np.zeros_like(norm_u),
-        )
-        anchor_present = role == "anchor"
-        target_present = role == "target"
-        missing_flag_value = 0.0 if (anchor_present and target_present) else 1.0
-        missing_flag = np.full_like(cosine, missing_flag_value, dtype=np.float32)
-        phi_parts = [anchor_vec, target_vec, diff_vec, prod_vec, cosine.astype(np.float32), missing_flag.astype(np.float32)]
-        padded = np.concatenate(phi_parts, axis=1)
-    else:
-        padded = np.concatenate([anchor_vec, target_vec], axis=1)
-    row_cols = entry.get("row_cols_mask") or entry.get("row_cols") or []
-    metadata_list = entry.get("metadata") or []
-    labels_arr = entry.get("labels")
-    lookup: Dict[Tuple[int, int], int] = {}
-    coords: List[Tuple[int, int]] = []
-    kept_features: List[np.ndarray] = []
-    kept_labels: List[int] = []
-    kept_metadata: List[Dict[str, object]] = []
-    for idx, rowcol in enumerate(row_cols):
-        if rowcol is None:
-            continue
-        r, c = int(rowcol[0]), int(rowcol[1])
-        lookup[(r, c)] = len(kept_features)
-        coords.append((r, c))
-        kept_features.append(padded[idx])
-        if labels_arr is not None and idx < len(labels_arr):
-            kept_labels.append(int(labels_arr[idx]))
-        else:
-            kept_labels.append(0)
-        if idx < len(metadata_list):
-            kept_metadata.append(metadata_list[idx])
-        else:
-            kept_metadata.append({})
-    if not kept_features:
-        return None
-    embedding_array = np.asarray(kept_features, dtype=np.float32)
-    labels_np = np.asarray(kept_labels, dtype=np.int16)
-    return {
-        "tuple": (embedding_array, lookup, coords),
-        "metadata": kept_metadata,
-        "labels": labels_np,
-        "coords": coords,
-    }
-
-
-def _no_fusion_run_inference(
-    dataset: Dict[str, object],
-    anchor_overlap: Optional[Dict[str, object]],
-    target_overlap: Optional[Dict[str, object]],
-    mlp: nn.Module,
-    overlap_mask: Optional[Dict[str, object]],
-    device: torch.device,
-    cfg: AlignmentConfig,
-    run_logger: "_RunLogger",
-) -> Dict[str, Dict[str, object]]:
-    outputs: Dict[str, Dict[str, object]] = {}
-    if overlap_mask is None:
-        run_logger.log("[no_fusion] Overlap mask unavailable; skipping inference exports.")
-        return outputs
-    default_reference = _make_mask_reference(overlap_mask)
-    if default_reference is None:
-        run_logger.log("[no_fusion] Failed to build mask reference; skipping inference exports.")
-        return outputs
-    stack = _MaskStack(overlap_mask)
-
-    def _feature_dim(entry: Optional[Dict[str, object]]) -> Optional[int]:
-        if not entry:
-            return None
-        feats = entry.get("features")
-        if isinstance(feats, torch.Tensor):
-            return int(feats.shape[1])
-        if isinstance(feats, np.ndarray):
-            return int(feats.shape[1])
-        return None
-
-    dim_u = dataset.get("dim_u")
-    dim_v = dataset.get("dim_v")
-
-    anchor_dim = _feature_dim(anchor_overlap)
-    target_dim = _feature_dim(target_overlap)
-    dataset_features = dataset.get("features")
-    total_dim = int(dataset_features.shape[1]) if isinstance(dataset_features, np.ndarray) and dataset_features.ndim == 2 else None
-
-    if dim_u is None:
-        dim_u = anchor_dim
-    if dim_v is None:
-        dim_v = target_dim
-    if dim_u is None and dim_v is not None and total_dim is not None:
-        dim_u = max(total_dim - dim_v, 0)
-    if dim_v is None and dim_u is not None and total_dim is not None:
-        dim_v = max(total_dim - dim_u, 0)
-
-    if dim_u is None or dim_v is None:
-        run_logger.log("[no_fusion] Unable to infer feature dimensions; skipping inference exports.")
-        return outputs
-
-    method_key = str(dataset.get("fusion_method") or "simple").lower()
-    passes = max(1, int(getattr(cfg.cls_training, "mc_dropout_passes", 30)))
-    for role_name, entry, role_flag in (
-        ("anchor", anchor_overlap, "anchor"),
-        ("target", target_overlap, "target"),
-    ):
-        print("[info] Inference for :", role_name)
-        inference_entry = _prepare_inference_entry(
-            entry,
-            dim_u=dim_u,
-            dim_v=dim_v,
-            role=role_flag,
-            method=method_key,
-        ) if entry is not None else None
-        if inference_entry is None:
-            run_logger.log(f"[no_fusion] No inference embeddings available for dataset {role_name}; skipping.")
-            continue
-        embedding_array, lookup, coord_list = inference_entry["tuple"]
-        prediction = mc_predict_map_from_embeddings(
-            {"GLOBAL": (embedding_array, lookup, coord_list)},
-            mlp,
-            stack,
-            passes=passes,
-            device=str(device),
-            show_progress=True,
-        )
-        if isinstance(prediction, tuple):
-            mean_map, std_map = prediction
-            prediction_payload = {"GLOBAL": {"mean": mean_map, "std": std_map}}
-        else:
-            global_payload = prediction.get("GLOBAL") if isinstance(prediction, dict) else {}
-            mean_map = global_payload.get("mean") if isinstance(global_payload, dict) else None
-            std_map = global_payload.get("std") if isinstance(global_payload, dict) else None
-            prediction_payload = prediction
-        labels_arr = inference_entry["labels"]
-        coords = inference_entry["coords"]
-        metadata = inference_entry["metadata"]
-        pos_coords = [
-            (meta.get("region") or "GLOBAL", int(coord[0]), int(coord[1]))
-            for lbl, coord, meta in zip(labels_arr, coord_list, metadata)
-            if lbl > 0
-        ]
-        neg_coords = [
-            (meta.get("region") or "GLOBAL", int(coord[0]), int(coord[1]))
-            for lbl, coord, meta in zip(labels_arr, coord_list, metadata)
-            if lbl <= 0
-        ]
-        pos_map = group_coords(pos_coords, stack) if pos_coords else {}
-        neg_map = group_coords(neg_coords, stack) if neg_coords else {}
-        mean_values = [float(mean_map[r, c]) if mean_map is not None else float("nan") for r, c in coord_list]
-        std_values = [float(std_map[r, c]) if std_map is not None else float("nan") for r, c in coord_list]
-        outputs[role_name] = {
-            "prediction": prediction_payload,
-            "default_reference": default_reference,
-            "pos_map": pos_map,
-            "neg_map": neg_map,
-            "counts": {
-                "pos": int(sum(len(group) for group in pos_map.values())),
-                "neg": int(sum(len(group) for group in neg_map.values())),
-            },
-            "row_cols": coord_list,
-            "coords": coords,
-            "labels": labels_arr.tolist(),
-            "metadata": metadata,
-            "mean_values": mean_values,
-            "std_values": std_values,
-        }
-    return outputs
-
-
 def _build_dataloaders(
     dataset: Dict[str, object],
     train_idx: np.ndarray,
@@ -6261,6 +6021,230 @@ def _maybe_save_debug_figures(cfg: AlignmentConfig, debug_data: Optional[Dict[st
 #     }
 #     classifier_info["inference"] = inference_payload
 
+
+
+# def _prepare_inference_entry(
+#     entry: Dict[str, object],
+#     *,
+#     dim_u: int,
+#     dim_v: int,
+#     role: str,
+#     method: str = "simple",
+# ) -> Optional[Dict[str, object]]:
+#     features_t = entry.get("features")
+#     if features_t is None:
+#         return None
+#     if isinstance(features_t, torch.Tensor):
+#         base_tensor = features_t.detach().to(dtype=torch.float32)
+#     elif isinstance(features_t, np.ndarray):
+#         base_tensor = torch.from_numpy(features_t.astype(np.float32, copy=False))
+#     else:
+#         base_tensor = torch.as_tensor(features_t, dtype=torch.float32)
+#     if base_tensor.ndim != 2 or base_tensor.numel() == 0:
+#         return None
+
+#     method_key = method.lower()
+#     num_rows = base_tensor.shape[0]
+
+#     def _pad_tensor(tensor: torch.Tensor, target_dim: int) -> torch.Tensor:
+#         if target_dim <= 0:
+#             return tensor.new_zeros(tensor.shape[0], 0)
+#         current = tensor.shape[1]
+#         if current == target_dim:
+#             return tensor
+#         if current > target_dim:
+#             return tensor[:, :target_dim]
+#         pad_width = target_dim - current
+#         zeros = tensor.new_zeros(tensor.shape[0], pad_width)
+#         return torch.cat([tensor, zeros], dim=1)
+
+#     if role == "anchor":
+#         anchor_vec = _pad_tensor(base_tensor, dim_u if dim_u > 0 else base_tensor.shape[1])
+#         target_vec = base_tensor.new_zeros(num_rows, max(dim_v, 0))
+#         anchor_present = True
+#         target_present = False
+#     else:
+#         anchor_vec = base_tensor.new_zeros(num_rows, max(dim_u, 0))
+#         target_vec = _pad_tensor(base_tensor, dim_v if dim_v > 0 else base_tensor.shape[1])
+#         anchor_present = False
+#         target_present = True
+
+#     if method_key == "strong":
+#         max_dim = max(dim_u, dim_v, base_tensor.shape[1], 1)
+#         anchor_common = _pad_tensor(anchor_vec, max_dim)
+#         target_common = _pad_tensor(target_vec, max_dim)
+#         diff_vec = torch.abs(anchor_common - target_common)
+#         prod_vec = anchor_common * target_common
+#         norm_u = torch.linalg.norm(anchor_common, dim=1, keepdim=True)
+#         norm_v = torch.linalg.norm(target_common, dim=1, keepdim=True)
+#         dot = (anchor_common * target_common).sum(dim=1, keepdim=True)
+#         cosine = dot / (norm_u * norm_v + 1e-8)
+#         missing_flag_val = 0.0 if (anchor_present and target_present) else 1.0
+#         missing_flag = torch.full_like(cosine, missing_flag_val)
+#         phi_parts = [anchor_vec, target_vec, diff_vec, prod_vec, cosine.to(torch.float32), missing_flag.to(torch.float32)]
+#         padded = torch.cat(phi_parts, dim=1)
+#     else:
+#         padded = torch.cat([anchor_vec, target_vec], dim=1)
+
+#     row_cols = entry.get("row_cols_mask") or entry.get("row_cols") or []
+#     metadata_list = entry.get("metadata") or []
+#     labels_arr = entry.get("labels")
+#     lookup: Dict[Tuple[int, int], int] = {}
+#     coords: List[Tuple[int, int]] = []
+#     kept_indices: List[int] = []
+#     kept_labels: List[int] = []
+#     kept_metadata: List[Dict[str, object]] = []
+#     for idx, rowcol in enumerate(row_cols):
+#         if rowcol is None:
+#             continue
+#         try:
+#             r, c = int(rowcol[0]), int(rowcol[1])
+#         except Exception:
+#             continue
+#         lookup[(r, c)] = len(kept_indices)
+#         coords.append((r, c))
+#         kept_indices.append(idx)
+#         if labels_arr is not None and idx < len(labels_arr):
+#             kept_labels.append(int(labels_arr[idx]))
+#         else:
+#             kept_labels.append(0)
+#         if idx < len(metadata_list) and isinstance(metadata_list[idx], dict):
+#             kept_metadata.append(metadata_list[idx])
+#         else:
+#             kept_metadata.append({})
+#     if not kept_indices:
+#         return None
+
+#     index_tensor = torch.tensor(kept_indices, dtype=torch.long, device=padded.device)
+#     embedding_tensor = padded.index_select(0, index_tensor).contiguous().detach()
+#     labels_np = np.asarray(kept_labels, dtype=np.int16)
+#     return {
+#         "tuple": (embedding_tensor, lookup, coords),
+#         "metadata": kept_metadata,
+#         "labels": labels_np,
+#         "coords": coords,
+#     }
+
+# def _no_fusion_run_inference(
+#     dataset: Dict[str, object],
+#     anchor_overlap: Optional[Dict[str, object]],
+#     target_overlap: Optional[Dict[str, object]],
+#     mlp: nn.Module,
+#     overlap_mask: Optional[Dict[str, object]],
+#     device: torch.device,
+#     cfg: AlignmentConfig,
+#     run_logger: "_RunLogger",
+# ) -> Dict[str, Dict[str, object]]:
+#     outputs: Dict[str, Dict[str, object]] = {}
+#     if overlap_mask is None:
+#         run_logger.log("[no_fusion] Overlap mask unavailable; skipping inference exports.")
+#         return outputs
+#     default_reference = _make_mask_reference(overlap_mask)
+#     if default_reference is None:
+#         run_logger.log("[no_fusion] Failed to build mask reference; skipping inference exports.")
+#         return outputs
+#     stack = _MaskStack(overlap_mask)
+
+#     def _feature_dim(entry: Optional[Dict[str, object]]) -> Optional[int]:
+#         if not entry:
+#             return None
+#         feats = entry.get("features")
+#         if isinstance(feats, torch.Tensor):
+#             return int(feats.shape[1])
+#         if isinstance(feats, np.ndarray):
+#             return int(feats.shape[1])
+#         return None
+
+#     dim_u = dataset.get("dim_u")
+#     dim_v = dataset.get("dim_v")
+
+#     anchor_dim = _feature_dim(anchor_overlap)
+#     target_dim = _feature_dim(target_overlap)
+#     dataset_features = dataset.get("features")
+#     total_dim = int(dataset_features.shape[1]) if isinstance(dataset_features, np.ndarray) and dataset_features.ndim == 2 else None
+
+#     if dim_u is None:
+#         dim_u = anchor_dim
+#     if dim_v is None:
+#         dim_v = target_dim
+#     if dim_u is None and dim_v is not None and total_dim is not None:
+#         dim_u = max(total_dim - dim_v, 0)
+#     if dim_v is None and dim_u is not None and total_dim is not None:
+#         dim_v = max(total_dim - dim_u, 0)
+
+#     if dim_u is None or dim_v is None:
+#         run_logger.log("[no_fusion] Unable to infer feature dimensions; skipping inference exports.")
+#         return outputs
+
+#     # method_key = str(dataset.get("fusion_method") or "simple").lower()
+#     method_key = str(dataset.get("fusion_method") or "simple").lower()
+#     passes = max(1, int(getattr(cfg.cls_training, "mc_dropout_passes", 30)))
+#     for role_name, entry, role_flag in (
+#         ("anchor", anchor_overlap, "anchor"),
+#         ("target", target_overlap, "target"),
+#     ):
+#         print("[info] Inference for :", role_name)
+#         inference_entry = _prepare_inference_entry(
+#             entry,
+#             dim_u=dim_u,
+#             dim_v=dim_v,
+#             role=role_flag,
+#             method=method_key,
+#         ) if entry is not None else None
+#         if inference_entry is None:
+#             run_logger.log(f"[no_fusion] No inference embeddings available for dataset {role_name}; skipping.")
+#             continue
+#         embedding_array, lookup, coord_list = inference_entry["tuple"]
+#         prediction = mc_predict_map_from_embeddings(
+#             {"GLOBAL": (embedding_array, lookup, coord_list)},
+#             mlp,
+#             stack,
+#             passes=passes,
+#             device=str(device),
+#             show_progress=True,
+#         )
+#         if isinstance(prediction, tuple):
+#             mean_map, std_map = prediction
+#             prediction_payload = {"GLOBAL": {"mean": mean_map, "std": std_map}}
+#         else:
+#             global_payload = prediction.get("GLOBAL") if isinstance(prediction, dict) else {}
+#             mean_map = global_payload.get("mean") if isinstance(global_payload, dict) else None
+#             std_map = global_payload.get("std") if isinstance(global_payload, dict) else None
+#             prediction_payload = prediction
+#         labels_arr = inference_entry["labels"]
+#         coords = inference_entry["coords"]
+#         metadata = inference_entry["metadata"]
+#         pos_coords = [
+#             (meta.get("region") or "GLOBAL", int(coord[0]), int(coord[1]))
+#             for lbl, coord, meta in zip(labels_arr, coord_list, metadata)
+#             if lbl > 0
+#         ]
+#         neg_coords = [
+#             (meta.get("region") or "GLOBAL", int(coord[0]), int(coord[1]))
+#             for lbl, coord, meta in zip(labels_arr, coord_list, metadata)
+#             if lbl <= 0
+#         ]
+#         pos_map = group_coords(pos_coords, stack) if pos_coords else {}
+#         neg_map = group_coords(neg_coords, stack) if neg_coords else {}
+#         mean_values = [float(mean_map[r, c]) if mean_map is not None else float("nan") for r, c in coord_list]
+#         std_values = [float(std_map[r, c]) if std_map is not None else float("nan") for r, c in coord_list]
+#         outputs[role_name] = {
+#             "prediction": prediction_payload,
+#             "default_reference": default_reference,
+#             "pos_map": pos_map,
+#             "neg_map": neg_map,
+#             "counts": {
+#                 "pos": int(sum(len(group) for group in pos_map.values())),
+#                 "neg": int(sum(len(group) for group in neg_map.values())),
+#             },
+#             "row_cols": coord_list,
+#             "coords": coords,
+#             "labels": labels_arr.tolist(),
+#             "metadata": metadata,
+#             "mean_values": mean_values,
+#             "std_values": std_values,
+#         }
+#     return outputs
 
 if __name__ == "__main__":
     main()
