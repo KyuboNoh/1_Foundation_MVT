@@ -19,6 +19,7 @@
     ],
     "step2_data_integration_project": "2_Integrate_MVT_gcs_bcgs_occ"
   },
+  "pairing_mode": "one_to_one",
   "optimization": {
     "step1_DCCA": {
       "batch_size": 256,

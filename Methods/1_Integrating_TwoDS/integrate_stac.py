@@ -680,6 +680,7 @@ def _convert_boundary_to_unified_crs(
     dataset_root: Path,
     role: Optional[str],
     region: Optional[str],
+    integration_root: Path,
     default_resolution: Optional[float] = None,
 ) -> Optional[Dict[str, object]]:
     if shapely_shape is None or Transformer is None or target_crs is None:
@@ -719,7 +720,7 @@ def _convert_boundary_to_unified_crs(
     height = max(1, int(math.ceil(span_y / resolution)))
     transform = Affine(resolution, 0.0, minx, 0.0, -resolution, maxy)
 
-    base_dir = Path("/home/wslqubuntu24/Research/Data/2_Integrate_MVT_gcs_bcgs_occ/data/Boundary_UnifiedCRS")
+    base_dir = integration_root / "data" / "Boundary_UnifiedCRS"
     dataset_dir = base_dir / dataset_root.name
     dataset_dir.mkdir(parents=True, exist_ok=True)
     base_name = src_path.stem + "_UnifiedCRS"
@@ -755,6 +756,8 @@ def _ensure_unified_crs_boundaries(
     summary: DatasetSummary,
     dataset_crs: Optional[CRS],
     target_crs,
+    *,
+    integration_root: Path,
 ) -> None:
     if dataset_crs is None or Transformer is None or shapely_shape is None or target_crs is None:
         return
@@ -780,6 +783,7 @@ def _ensure_unified_crs_boundaries(
             dataset_root=summary.root,
             role=role,
             region=region,
+            integration_root=integration_root,
         )
         if record is not None:
             new_records.append(record)
@@ -1511,10 +1515,11 @@ def _write_overlap_pairs(
     embedding_windows: Optional[Dict[str, List[Dict[str, object]]]] = None,
     embedding_spacing: Optional[Dict[str, Optional[float]]] = None,
     variants: Optional[Sequence[_PairVariantSpec]] = None,
+    dataset_order: Optional[Sequence[str]] = None,
 ) -> Dict[str, Dict[str, str]]:
     if dataset_resolutions is None:
         dataset_resolutions = _compute_dataset_resolutions(tile_geoms)
-    data_dir = target_dir / "data"
+    data_dir = target_dir
     data_dir.mkdir(parents=True, exist_ok=True)
 
     embedding_windows = embedding_windows or {}
@@ -1523,93 +1528,109 @@ def _write_overlap_pairs(
         variants = [_PairVariantSpec(key="default", suffix="", pair_label=None, filter_fn=None)]
     outputs: Dict[str, Dict[str, str]] = {spec.key: {} for spec in variants}
 
-    all_dataset_ids = sorted(set(tile_geoms.keys()) | set(embedding_windows.keys()))
-
-    for ds_a, ds_b in combinations(all_dataset_ids, 2):
-        use_embedding = (
-            ds_a in embedding_windows
-            and ds_b in embedding_windows
-            and NearestNeighbors is not None
-        )
-
-        result: Optional[Tuple[List[Dict[str, object]], Dict[str, object]]]
-        if use_embedding:
-            result = _generate_embedding_overlap_pairs(
-                ds_a,
-                ds_b,
-                embedding_windows,
-                embedding_spacing,
-                dataset_resolutions,
-            )
-        else:
-            result = _generate_raster_overlap_pairs(
-                ds_a,
-                ds_b,
-                tile_geoms,
-                overlap_geom,
-                target_crs,
-                dataset_resolutions,
-            )
-
-        if not result:
-            continue
-
-        records, meta = result
-        if not records:
-            continue
-
-        raw_candidates = int(meta.get("raw_pair_candidates") or len(records))
-        alignment_roles = meta.get("alignment_roles") if isinstance(meta.get("alignment_roles"), dict) else None
-        approx_spacing = meta.get("approx_spacing") if isinstance(meta.get("approx_spacing"), dict) else None
-        search_radius = meta.get("search_radius") if isinstance(meta.get("search_radius"), (int, float)) else None
-        generated_from = meta.get("generated_from") if isinstance(meta.get("generated_from"), str) else None
-
-        for spec in variants:
-            filtered_records = records
-            if spec.filter_fn is not None:
-                filtered_records = [rec for rec in records if spec.filter_fn(rec)]
-            if not filtered_records:
+    all_dataset_ids: List[str] = []
+    if dataset_order:
+        seen = set()
+        for ds_id in dataset_order:
+            if ds_id in seen:
                 continue
-            suffix_token = spec.suffix or ""
-            if suffix_token and not suffix_token.startswith("_"):
-                suffix_token = f"_{suffix_token}"
-            label_suffix = suffix_token
-            pair_name = f"{ds_a}_{ds_b}_overlap_pairs{suffix_token}.json"
-            output_path = data_dir / pair_name
-            try:
-                with output_path.open("w", encoding="utf-8") as fh:
-                    overlap_info = None
-                    if overlap_geom is not None and mapping is not None and not overlap_geom.is_empty:
-                        try:
-                            geom_mapping = mapping(overlap_geom)
-                        except Exception:
-                            geom_mapping = None
-                        overlap_info = {
-                            "crs": target_crs.to_string() if target_crs is not None else None,
-                            "area": float(overlap_geom.area),
-                            "bounds": list(overlap_geom.bounds),
-                            "geometry": geom_mapping,
+            seen.add(ds_id)
+            all_dataset_ids.append(ds_id)
+    remaining = (set(tile_geoms.keys()) | set(embedding_windows.keys())) - set(all_dataset_ids)
+    if remaining:
+        all_dataset_ids.extend(sorted(remaining))
+
+    for idx_a in range(len(all_dataset_ids)):
+        ds_a = all_dataset_ids[idx_a]
+        for idx_b in range(idx_a + 1, len(all_dataset_ids)):
+            ds_b = all_dataset_ids[idx_b]
+            if ds_a == ds_b:
+                continue
+
+            use_embedding = (
+                ds_a in embedding_windows
+                and ds_b in embedding_windows
+                and NearestNeighbors is not None
+            )
+
+            result: Optional[Tuple[List[Dict[str, object]], Dict[str, object]]]
+            if use_embedding:
+                result = _generate_embedding_overlap_pairs(
+                    ds_a,
+                    ds_b,
+                    embedding_windows,
+                    embedding_spacing,
+                    dataset_resolutions,
+                )
+            else:
+                result = _generate_raster_overlap_pairs(
+                    ds_a,
+                    ds_b,
+                    tile_geoms,
+                    overlap_geom,
+                    target_crs,
+                    dataset_resolutions,
+                )
+
+            if not result:
+                continue
+
+            records, meta = result
+            if not records:
+                continue
+
+            raw_candidates = int(meta.get("raw_pair_candidates") or len(records))
+            alignment_roles = meta.get("alignment_roles") if isinstance(meta.get("alignment_roles"), dict) else None
+            approx_spacing = meta.get("approx_spacing") if isinstance(meta.get("approx_spacing"), dict) else None
+            search_radius = meta.get("search_radius") if isinstance(meta.get("search_radius"), (int, float)) else None
+            generated_from = meta.get("generated_from") if isinstance(meta.get("generated_from"), str) else None
+
+            for spec in variants:
+                filtered_records = records
+                if spec.filter_fn is not None:
+                    filtered_records = [rec for rec in records if spec.filter_fn(rec)]
+                if not filtered_records:
+                    continue
+                suffix_token = spec.suffix or ""
+                if suffix_token and not suffix_token.startswith("_"):
+                    suffix_token = f"_{suffix_token}"
+                label_suffix = suffix_token
+                pair_name = f"{ds_a}_{ds_b}_overlap_pairs{suffix_token}.json"
+                output_path = data_dir / pair_name
+                try:
+                    with output_path.open("w", encoding="utf-8") as fh:
+                        overlap_info = None
+                        if overlap_geom is not None and mapping is not None and not overlap_geom.is_empty:
+                            try:
+                                geom_mapping = mapping(overlap_geom)
+                            except Exception:
+                                geom_mapping = None
+                            overlap_info = {
+                                "crs": target_crs.to_string() if target_crs is not None else None,
+                                "area": float(overlap_geom.area),
+                                "bounds": list(overlap_geom.bounds),
+                                "geometry": geom_mapping,
+                            }
+                        doc = {
+                            "dataset_pair": meta.get("dataset_pair", [ds_a, ds_b]),
+                            "alignment_roles": alignment_roles,
+                            "dataset_resolutions": {
+                                ds_a: float(dataset_resolutions.get(ds_a)) if ds_a in dataset_resolutions else None,
+                                ds_b: float(dataset_resolutions.get(ds_b)) if ds_b in dataset_resolutions else None,
+                            },
+                            "approx_spacing": approx_spacing,
+                            "search_radius": search_radius,
+                            "raw_pair_candidates": raw_candidates,
+                            "generated_from": generated_from or ("embedding_windows" if use_embedding else "tile_bounds"),
+                            "overlap": overlap_info,
+                            "pairs": filtered_records,
                         }
-                    doc = {
-                        "dataset_pair": meta.get("dataset_pair", [ds_a, ds_b]),
-                        "alignment_roles": alignment_roles,
-                        "dataset_resolutions": {
-                            ds_a: float(dataset_resolutions.get(ds_a)) if ds_a in dataset_resolutions else None,
-                            ds_b: float(dataset_resolutions.get(ds_b)) if ds_b in dataset_resolutions else None,
-                        },
-                        "approx_spacing": approx_spacing,
-                        "search_radius": search_radius,
-                        "raw_pair_candidates": raw_candidates,
-                        "generated_from": generated_from or ("embedding_windows" if use_embedding else "tile_bounds"),
-                        "overlap": overlap_info,
-                        "pairs": filtered_records,
-                    }
-                    if spec.pair_label is not None:
-                        doc["pair_variant"] = spec.pair_label
-                    json.dump(doc, fh, indent=2)
-                    outputs.setdefault(spec.key, {})[f"{ds_a}-{ds_b}{label_suffix}"] = str(output_path)
-            except Exception as exc:
-                print(f"[warn] Failed to write overlap pairs for {ds_a}-{ds_b} ({spec.key}): {exc}")
+                        if spec.pair_label is not None:
+                            doc["pair_variant"] = spec.pair_label
+                        json.dump(doc, fh, indent=2)
+                        outputs.setdefault(spec.key, {})[f"{ds_a}-{ds_b}{label_suffix}"] = str(output_path)
+                except Exception as exc:
+                    print(f"[warn] Failed to write overlap pairs for {ds_a}-{ds_b} ({spec.key}): {exc}")
 
     return outputs
 
@@ -1777,6 +1798,41 @@ def main() -> None:
     if requested_aug_paths and len(requested_aug_paths) != len(root_paths):
         raise ValueError("--pos-aug-path must align with the number of --collections")
 
+    output_path = args.output
+    project_name = args.projectname
+
+    if project_name and not output_path:
+        raise ValueError("--projectname requires --output to specify the base directory.")
+
+    output_file: Optional[Path] = None
+    visual_base: Optional[Path] = None
+    target_dir: Optional[Path] = None
+
+    if output_path:
+        base_path = Path(output_path).expanduser()
+        if project_name:
+            target_dir = (base_path / project_name).resolve()
+            target_dir.mkdir(parents=True, exist_ok=True)
+            output_file = target_dir / "combined_metadata.json"
+            visual_base = target_dir
+        else:
+            resolved = base_path.resolve()
+            if resolved.suffix:
+                resolved.parent.mkdir(parents=True, exist_ok=True)
+                output_file = resolved
+                visual_base = resolved.parent
+            else:
+                resolved.mkdir(parents=True, exist_ok=True)
+                target_dir = resolved
+                output_file = resolved / "combined_metadata.json"
+                visual_base = resolved
+
+    if output_file is None and args.visualize and visual_base is None:
+        visual_base = Path.cwd() / "integrate_stac_output"
+
+    integration_root = target_dir or visual_base or (Path.cwd() / "integrate_stac_output")
+    integration_root.mkdir(parents=True, exist_ok=True)
+
     datasets: List[DatasetSummary] = []
     dataset_crs_map: Dict[str, Optional[CRS]] = {}
     embedding_windows_map: Dict[str, List[Dict[str, object]]] = {}
@@ -1924,7 +1980,12 @@ def main() -> None:
         for summary in datasets:
             dataset_crs = dataset_crs_map.get(summary.dataset_id)
             if dataset_crs is not None:
-                _ensure_unified_crs_boundaries(summary, dataset_crs, target_crs)
+                _ensure_unified_crs_boundaries(
+                    summary,
+                    dataset_crs,
+                    target_crs,
+                    integration_root=integration_root,
+                )
 
         if len(geom_pairs) >= 2:
             max_area = max(eq_geom.area for _, _, eq_geom in geom_pairs if not eq_geom.is_empty)
@@ -2080,7 +2141,7 @@ def main() -> None:
     if overlap_geom_equal is not None and shapely_shape is not None and mapping is not None and not overlap_geom_equal.is_empty:
         payload["study_area_overlap_detected"] = True
 
-        overlap_dir = Path("/home/wslqubuntu24/Research/Data/2_Integrate_MVT_gcs_bcgs_occ/data/Boundary_UnifiedCRS/Overlap")
+        overlap_dir = integration_root / "data" / "Boundary_UnifiedCRS" / "Overlap"
         overlap_dir.mkdir(parents=True, exist_ok=True)
         overlap_geojson = overlap_dir / "study_area_overlap.geojson"
         overlap_tif = overlap_dir / "study_area_overlap.tif"
@@ -2113,36 +2174,6 @@ def main() -> None:
         payload["study_area_overlap_detected"] = False
         payload["study_area_overlap_boundary"] = None
 
-    output_path = args.output
-    project_name = args.projectname
-
-    if project_name and not output_path:
-        raise ValueError("--projectname requires --output to specify the base directory.")
-
-    output_file: Optional[Path] = None
-    visual_base: Optional[Path] = None
-
-    if output_path:
-        base_path = Path(output_path).expanduser()
-        if project_name:
-            target_dir = (base_path / project_name).resolve()
-            target_dir.mkdir(parents=True, exist_ok=True)
-            output_file = target_dir / "combined_metadata.json"
-            visual_base = target_dir
-        else:
-            resolved = base_path.resolve()
-            if resolved.suffix:
-                resolved.parent.mkdir(parents=True, exist_ok=True)
-                output_file = resolved
-                visual_base = resolved.parent
-            else:
-                resolved.mkdir(parents=True, exist_ok=True)
-                output_file = resolved / "combined_metadata.json"
-                visual_base = resolved
-
-    if output_file is None and args.visualize and visual_base is None:
-        visual_base = Path.cwd() / "integrate_stac_output"
-
     overlap_mask_path: Optional[Path] = None
     if payload.get("study_area_overlap_boundary"):
         overlap_entry = payload["study_area_overlap_boundary"]
@@ -2151,7 +2182,7 @@ def main() -> None:
     else:
         payload["study_area_overlap_mask"] = None
 
-    pairs_dir = Path("/home/wslqubuntu24/Research/Data/2_Integrate_MVT_gcs_bcgs_occ/data/Pairs")
+    pairs_dir = integration_root / "data" / "Pairs"
     pairs_dir.mkdir(parents=True, exist_ok=True)
     pair_output_root = pairs_dir
     overlap_pairs_outputs: Dict[str, str] = {}
@@ -2175,6 +2206,7 @@ def main() -> None:
             embedding_windows_map,
             embedding_spacing_map,
             variants=base_variants,
+            dataset_order=ordered_dataset_ids,
         )
         overlap_pairs_outputs = base_outputs.get("default", {})
         overlap_pairs_positive = base_outputs.get("positive", {})
@@ -2206,6 +2238,7 @@ def main() -> None:
             embedding_windows_with_aug,
             embedding_spacing_with_aug,
             variants=aug_variants,
+            dataset_order=ordered_dataset_ids,
         )
         overlap_pairs_positive_aug = augmented_outputs.get("positive_aug", {})
         if overlap_pairs_positive_aug:

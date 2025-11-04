@@ -1569,8 +1569,8 @@ if __name__ == '__main__':
     # TODO: Make it generalized for future development... How so?
     worker_count = 8
     if getattr(stack, "kind", None) == "raster":
-        # worker_count = 0  # previous behaviour: force single-threaded I/O
-        worker_count = min(8, os.cpu_count() or 8)
+        worker_count = 0  # previous behaviour: force single-threaded I/O
+        # worker_count = min(8, os.cpu_count() or 8)
     train_dl = DataLoader(
         train_ds,
         batch_size=args.batch,

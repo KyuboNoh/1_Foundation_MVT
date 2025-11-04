@@ -17,6 +17,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Callable
 
+from .overlaps import OverlapSet
+
 try:
     import torch
     from torch import nn
@@ -525,10 +527,12 @@ def _prepare_classifier_labels(
 __all__ = [
     "_normalise_cross_matches",
     "_prepare_classifier_labels",
+    "_build_aligned_pairs_OneToOne",
+    "_build_aligned_pairs_SetToSet",
 ]
 
 
-def _build_aligned_pairs(
+def _build_aligned_pairs_core(
     pairs: Sequence[OverlapAlignmentPair],
     *,
     anchor_name: str,
@@ -541,6 +545,8 @@ def _build_aligned_pairs(
     anchor_augment_map: Optional[Dict[str, List[np.ndarray]]] = None,
     target_augment_map: Optional[Dict[str, List[np.ndarray]]] = None,
     pn_label_maps: Optional[Dict[str, Optional[Dict[str, set[Tuple[str, int, int]]]]]] = None,
+    pairing_mode: str,
+    overlap_set: Optional[OverlapSet] = None,
 ) -> Tuple[
     List[torch.Tensor],
     List[torch.Tensor],
@@ -548,6 +554,7 @@ def _build_aligned_pairs(
     Optional[Dict[str, List[Dict[str, object]]]],
     Dict[str, int],
     List[Dict[str, object]],
+    List[torch.Tensor],
     Dict[str, Dict[str, Dict[str, object]]],
 ]:
     anchor_augment_map = anchor_augment_map or {}
@@ -555,6 +562,7 @@ def _build_aligned_pairs(
     pn_index_tracker: Dict[str, Dict[str, Dict[str, set[int]]]] = {}
 
     pn_label_maps = pn_label_maps or {}
+    pairing_mode = (pairing_mode or "one_to_one").lower()
 
     def _register_index(record, dataset_key: str) -> None:
         if not dataset_key:
@@ -617,7 +625,61 @@ def _build_aligned_pairs(
             summary[dataset_name] = region_summary
         return summary
 
+    resolved_pairs = list(pairs)
+
+    def _normalise_key(dataset_name: str, tile_id: Optional[str], row_col: Optional[Tuple[int, int]], coord: Optional[Tuple[float, float]], index: Optional[int] = None) -> Optional[Tuple[str, str]]:
+        if tile_id:
+            return dataset_name, f"tile_{tile_id}"
+        if row_col and all(val is not None for val in row_col):
+            return dataset_name, f"rowcol_{row_col[0]}_{row_col[1]}"
+        if index is not None:
+            return dataset_name, f"idx_{index}"
+        if coord and len(coord) >= 2:
+            key = (int(round(coord[0] * 1000)), int(round(coord[1] * 1000)))
+            return dataset_name, f"coord_{key[0]}_{key[1]}"
+        return None
+
+    if overlap_set is not None:
+        pair_map: Dict[Tuple[str, str], OverlapAlignmentPair] = {}
+        for resolved in resolved_pairs:
+            anchor_key = _normalise_key(
+                resolved.anchor_dataset,
+                getattr(resolved.anchor_record, "tile_id", None),
+                getattr(resolved.anchor_record, "row_col", None),
+                getattr(resolved.anchor_record, "coord", None),
+                getattr(resolved.anchor_record, "index", None),
+            )
+            target_key = _normalise_key(
+                resolved.target_dataset,
+                getattr(resolved.target_record, "tile_id", None),
+                getattr(resolved.target_record, "row_col", None),
+                getattr(resolved.target_record, "coord", None),
+                getattr(resolved.target_record, "index", None),
+            )
+            if anchor_key is None or target_key is None:
+                continue
+            pair_map[(anchor_key, target_key)] = resolved
+
+        ordered: List[OverlapAlignmentPair] = []
+        for raw_pair in overlap_set.pairs:
+            first_tile, second_tile = raw_pair.a, raw_pair.b
+            anchor_tile = first_tile if first_tile.dataset == anchor_name else second_tile if second_tile.dataset == anchor_name else None
+            target_tile = second_tile if first_tile.dataset == anchor_name else first_tile if second_tile.dataset == anchor_name else None
+            if anchor_tile is None or target_tile is None:
+                continue
+            anchor_key = _normalise_key(anchor_name, anchor_tile.tile_id, anchor_tile.row_col, anchor_tile.native_point)
+            target_key = _normalise_key(target_name, target_tile.tile_id, target_tile.row_col, target_tile.native_point)
+            if anchor_key is None or target_key is None:
+                continue
+            resolved = pair_map.get((anchor_key, target_key))
+            if resolved is None:
+                continue
+            ordered.append(resolved)
+        if ordered:
+            resolved_pairs = ordered
+
     grouped: Dict[str, Dict[str, object]] = {}
+    group_entries: List[Dict[str, object]] = []
     anchor_aug_added = 0
     target_aug_added = 0
     label_hist: Counter = Counter()
@@ -631,7 +693,7 @@ def _build_aligned_pairs(
             "target_name": target_name,
         }
 
-    for pair in pairs:
+    for pair in resolved_pairs:
         anchor_record, target_record = pair.anchor_record, pair.target_record
         anchor_ds, target_ds = pair.anchor_dataset, pair.target_dataset
 
@@ -669,7 +731,17 @@ def _build_aligned_pairs(
                 if anchor_sample is not None and target_sample is not None:
                     debug_data["selected_pairs"].append({"anchor": anchor_sample, "target": target_sample})
 
-        tile_id = anchor_record.tile_id
+        if pairing_mode == "one_to_one":
+            entry = {
+                "anchor": anchor_record,
+                "targets": [target_record],
+                "weights": [_pair_weight(anchor_record, target_record, gaussian_sigma)],
+                "label_key": label_key,
+            }
+            group_entries.append(entry)
+            continue
+
+        tile_id = anchor_record.tile_id or f"anchor_{anchor_record.index}"
         grouped.setdefault(tile_id, {
             "anchor": anchor_record,
             "targets": [],
@@ -677,12 +749,17 @@ def _build_aligned_pairs(
         })
         grouped[tile_id]["targets"].append(target_record)
         grouped[tile_id]["weights"].append(_pair_weight(anchor_record, target_record, gaussian_sigma))
+        grouped[tile_id]["label_key"] = label_key
 
     anchor_vecs: List[torch.Tensor] = []
     target_vecs: List[torch.Tensor] = []
+    target_stack_per_anchor: List[torch.Tensor] = []
     pair_metadata: List[Dict[str, object]] = []
 
-    for entry in grouped.values():
+    if pairing_mode == "set_to_set":
+        group_entries = list(grouped.values())
+
+    for entry in group_entries:
         targets: List = entry["targets"]
         if not targets:
             continue
@@ -692,13 +769,19 @@ def _build_aligned_pairs(
         anchor_tensor = torch.from_numpy(entry['anchor'].embedding).float()
         anchor_vecs.append(anchor_tensor)
         target_vecs.append(aggregated.clone())
+        target_stack_per_anchor.append(target_stack.clone())
         meta_entry = _make_pair_meta(
             anchor_record=entry["anchor"],
             targets=targets,
             weights=normalized_weights,
             is_augmented=False,
         )
+        meta_entry["pairing_mode"] = pairing_mode
+        meta_entry["target_set_size"] = len(targets)
+        if pairing_mode == "set_to_set":
+            meta_entry["target_stack_shape"] = list(target_stack.shape)
         pair_metadata.append(meta_entry)
+        entry_label_key = entry.get("label_key", "unlabelled")
         anchor_aug_list = anchor_augment_map.get(entry['anchor'].tile_id, [])
         for aug_emb in anchor_aug_list:
             aug_tensor = torch.from_numpy(np.asarray(aug_emb, dtype=np.float32)).float()
@@ -706,7 +789,8 @@ def _build_aligned_pairs(
                 continue
             anchor_vecs.append(aug_tensor)
             target_vecs.append(aggregated.clone())
-            label_hist[label_key] += 1
+            target_stack_per_anchor.append(target_stack.clone())
+            label_hist[entry_label_key] += 1
             anchor_aug_added += 1
             meta_anchor_aug = _make_pair_meta(
                 anchor_record=entry["anchor"],
@@ -715,6 +799,8 @@ def _build_aligned_pairs(
                 is_augmented=True,
                 augmentation_role="anchor",
             )
+            meta_anchor_aug["pairing_mode"] = pairing_mode
+            meta_anchor_aug["target_set_size"] = len(targets)
             pair_metadata.append(meta_anchor_aug)
 
         for idx_target, target_record in enumerate(targets):
@@ -730,7 +816,8 @@ def _build_aligned_pairs(
                 aggregated_aug = torch.matmul(normalized_weights.unsqueeze(0), modified_stack).squeeze(0)
                 anchor_vecs.append(anchor_tensor.clone())
                 target_vecs.append(aggregated_aug)
-                label_hist[label_key] += 1
+                target_stack_per_anchor.append(modified_stack.clone())
+                label_hist[entry_label_key] += 1
                 target_aug_added += 1
                 meta_target_aug = _make_pair_meta(
                     anchor_record=entry["anchor"],
@@ -739,6 +826,8 @@ def _build_aligned_pairs(
                     is_augmented=True,
                     augmentation_role="target",
                 )
+                meta_target_aug["pairing_mode"] = pairing_mode
+                meta_target_aug["target_set_size"] = len(targets)
                 pair_metadata.append(meta_target_aug)
 
 
@@ -772,7 +861,89 @@ def _build_aligned_pairs(
         debug_payload["pn_index_summary"] = pn_index_summary
         debug_payload = None
 
-    return anchor_vecs, target_vecs, label_hist, debug_payload, aug_stats, pair_metadata, pn_index_summary
+    return anchor_vecs, target_vecs, label_hist, debug_payload, aug_stats, pair_metadata, target_stack_per_anchor, pn_index_summary
+
+
+def _build_aligned_pairs_OneToOne(
+    pairs: Sequence[OverlapAlignmentPair],
+    *,
+    anchor_name: str,
+    target_name: str,
+    use_positive_only: bool,
+    aggregator: str,
+    gaussian_sigma: Optional[float],
+    debug: bool,
+    dataset_meta_map: Dict[str, Dict[str, object]],
+    anchor_augment_map: Optional[Dict[str, List[np.ndarray]]] = None,
+    target_augment_map: Optional[Dict[str, List[np.ndarray]]] = None,
+    pn_label_maps: Optional[Dict[str, Optional[Dict[str, set[Tuple[str, int, int]]]]]] = None,
+    overlap_set: Optional[OverlapSet] = None,
+) -> Tuple[
+    List[torch.Tensor],
+    List[torch.Tensor],
+    Counter,
+    Optional[Dict[str, List[Dict[str, object]]]],
+    Dict[str, int],
+    List[Dict[str, object]],
+    List[torch.Tensor],
+    Dict[str, Dict[str, Dict[str, object]]],
+]:
+    return _build_aligned_pairs_core(
+        pairs,
+        anchor_name=anchor_name,
+        target_name=target_name,
+        use_positive_only=use_positive_only,
+        aggregator=aggregator,
+        gaussian_sigma=gaussian_sigma,
+        debug=debug,
+        dataset_meta_map=dataset_meta_map,
+        anchor_augment_map=anchor_augment_map,
+        target_augment_map=target_augment_map,
+        pn_label_maps=pn_label_maps,
+        pairing_mode="one_to_one",
+        overlap_set=overlap_set,
+    )
+
+
+def _build_aligned_pairs_SetToSet(
+    pairs: Sequence[OverlapAlignmentPair],
+    *,
+    anchor_name: str,
+    target_name: str,
+    use_positive_only: bool,
+    aggregator: str,
+    gaussian_sigma: Optional[float],
+    debug: bool,
+    dataset_meta_map: Dict[str, Dict[str, object]],
+    anchor_augment_map: Optional[Dict[str, List[np.ndarray]]] = None,
+    target_augment_map: Optional[Dict[str, List[np.ndarray]]] = None,
+    pn_label_maps: Optional[Dict[str, Optional[Dict[str, set[Tuple[str, int, int]]]]]] = None,
+    overlap_set: Optional[OverlapSet] = None,
+) -> Tuple[
+    List[torch.Tensor],
+    List[torch.Tensor],
+    Counter,
+    Optional[Dict[str, List[Dict[str, object]]]],
+    Dict[str, int],
+    List[Dict[str, object]],
+    List[torch.Tensor],
+    Dict[str, Dict[str, Dict[str, object]]],
+]:
+    return _build_aligned_pairs_core(
+        pairs,
+        anchor_name=anchor_name,
+        target_name=target_name,
+        use_positive_only=use_positive_only,
+        aggregator=aggregator,
+        gaussian_sigma=gaussian_sigma,
+        debug=debug,
+        dataset_meta_map=dataset_meta_map,
+        anchor_augment_map=anchor_augment_map,
+        target_augment_map=target_augment_map,
+        pn_label_maps=pn_label_maps,
+        pairing_mode="set_to_set",
+        overlap_set=overlap_set,
+    )
 
 def _add_debug_sample(
     store: Dict[str, Dict[str, object]],
@@ -977,4 +1148,3 @@ def _weighted_average_coord(
     if total_weight <= 0:
         return None
     return (accum_x / total_weight, accum_y / total_weight)
-
