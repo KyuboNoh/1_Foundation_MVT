@@ -28,8 +28,8 @@
       "projection_dim": 128,
       "mlp_hidden_dims": [256, 128],
       "validation_fraction": 0.3,
-      "dcca_eps": 1e-1,
-      "singular_value_drop_ratio": 0.1,
+      "dcca_eps": 1e-5,
+      "singular_value_drop_ratio": 0.0,
       "tcc_ratio": 0.0005
     },
     "step2_CLS": {

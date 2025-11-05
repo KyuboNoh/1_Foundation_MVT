@@ -482,7 +482,7 @@ def main() -> None:
                     if fused_targets and len(fused_targets) == len(target_vecs):
                         target_vecs = fused_targets
                         run_logger.log(
-                            f"[agg] Transformer aggregator applied to {len(target_vecs)} pairs (dim={agg_hidden_dim}, layers={agg_num_layers}, heads={agg_num_heads})."
+                            f"[agg] Transformer aggregator applied to {len(target_vecs)} pairs (dim={cfg.projection_dim}, layers={agg_num_layers}, heads={agg_num_heads})."
                         )
                     else:
                         run_logger.log("[agg] Transformer aggregator output size mismatch; skipping fused targets.")
