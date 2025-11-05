@@ -49,14 +49,12 @@ from Common.Unifying.Labels_TwoDatasets.datasets import (
     load_embedding_records,
     summarise_records,
 )
-from Common.overlap_debug_plot import save_overlap_debug_plot
 from Common.metrics_logger import DEFAULT_METRIC_ORDER, log_metrics, normalize_metrics, save_metrics_json
 from Common.Unifying.Labels_TwoDatasets import (
     _normalise_cross_matches,
     _prepare_classifier_labels,
     _build_aligned_pairs_OneToOne,
     _build_aligned_pairs_SetToSet,
-    _serialise_sample,
     _normalise_coord,
     _normalise_row_col,
 )
@@ -77,12 +75,16 @@ from Common.Augmentation import (
     _print_augmentation_usage,
 )
 from Common.Unifying.DCCA import (
-    _canonical_metrics,
+    _format_optional_scalar,
     _load_pretrained_dcca_state,
-    _project_in_batches,
     _projection_head_from_state,
     _resolve_dcca_weights_path,
     _train_DCCA,
+    _prepare_output_dir,
+    _persist_state,
+    _persist_metrics,
+    _maybe_save_debug_figures,
+    _create_debug_alignment_figures,
     reembedding_DCCA,
     dcca_loss,
     ProjectionHead
@@ -151,15 +153,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument( "--use-transformer-aggregator", action=argparse.BooleanOptionalAction, default=True, help="Enable transformer-based aggregation before DCCA (set-to-set pairing only).",)
     parser.add_argument("--agg-trans-num-layers", type=int, default=4, help="Number of cross-attention layers in the aggregator.")
     parser.add_argument("--agg-trans-num-heads", type=int, default=4, help="Number of attention heads in the aggregator.")
-    parser.add_argument("--agg-trans-hidden-dim", type=int, default=512, help="Hidden/output dimension of the aggregator.")
-    parser.add_argument("--agg-trans-steps", type=int, default=100, help="Training steps for the transformer aggregator.")
     parser.add_argument("--agg-trans-dropout", type=float, default=0.1, help="Dropout used inside the transformer aggregator.")
-    parser.add_argument(
-        "--agg-trans-pos-enc",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Use positional encoding based on anchor/target coordinate differences.",
-    )
+    parser.add_argument("--agg-trans-pos-enc", action=argparse.BooleanOptionalAction, default=False, help="Use positional encoding based on anchor/target coordinate differences.",)
     # parser.add_argument("--dcca-eps", type=float, default=1e-5, help="Epsilon value for DCCA covariance regularization (default: 1e-5).")
     # parser.add_argument("--singular-value-drop-ratio", type=float, default=0.01, help="Ratio threshold for dropping small singular values in DCCA (default: 0.01).")
     # parser.add_argument("--tcc-ratio", type=float, default=1.0, help="Fraction of canonical correlations to include when computing TCC (0 < ratio <= 1).", )
@@ -217,6 +212,18 @@ def main() -> None:
             raise FileNotFoundError(f"Unable to locate DCCA weights to load (checked {hint}).")
         pretrained_state, pretrained_summary = _load_pretrained_dcca_state(weights_path)
 
+        if weights_path is not None:
+            run_logger.log(f"Reading DCCA weights from {weights_path}")
+            run_logger.log(
+                "Starting stage-1 overlap alignment with initial projection_dim={proj}; "
+                "mlp_layers={layers}, train_dcca={train_flag}, read_dcca={read_flag}".format(
+                    proj=cfg.projection_dim,
+                    layers=mlp_layers,
+                    train_flag=train_dcca,
+                    read_flag=read_dcca,
+                )
+            )
+
     workspace = OverlapAlignmentWorkspace(cfg)
     anchor_name, target_name = _dataset_pair(cfg)
 
@@ -256,25 +263,27 @@ def main() -> None:
                 )
 
     #################################### Preprocess - Alignment two overlapping data - getting embeddings (pairs) and labels for DCCA & cls ####################################
-    # pn_label_maps: Dict[str, Optional[Dict[str, set[Tuple[str, int, int]]]]] = {
-    #     dataset_cfg.name: _load_pn_lookup(dataset_cfg.pn_split_path) for dataset_cfg in cfg.datasets
-    # }
-    # dataset_region_filters: Dict[str, Optional[List[str]]] = {
-    #     dataset_cfg.name: dataset_cfg.region_filter for dataset_cfg in cfg.datasets
-    # }
-    # for dataset_cfg in cfg.datasets:
-    #     lookup = pn_label_maps.get(dataset_cfg.name)
-    #     if not lookup:
-    #         print(f"[info] PN labels unavailable for dataset {dataset_cfg.name}")
-    #         continue
-    #     counts_filtered = _count_pn_lookup(lookup, dataset_cfg.region_filter)
-    #     region_desc = dataset_cfg.region_filter if dataset_cfg.region_filter else ["ALL"]
-    #     print(
-    #         "[info] PN label counts for {name} (regions={regions}): pos={pos}, neg={neg}".format(
-    #             name=dataset_cfg.name, regions=",".join(region_desc),
-    #             pos=counts_filtered["positive"], neg=counts_filtered["negative"],
-    #         )
-    #     )
+    pn_label_maps: Dict[str, Optional[Dict[str, set[Tuple[str, int, int]]]]] = {
+        dataset_cfg.name: _load_pn_lookup(dataset_cfg.pn_split_path) for dataset_cfg in cfg.datasets
+    }
+    dataset_region_filters: Dict[str, Optional[List[str]]] = {
+        dataset_cfg.name: dataset_cfg.region_filter for dataset_cfg in cfg.datasets
+    }
+    for dataset_cfg in cfg.datasets:
+        lookup = pn_label_maps.get(dataset_cfg.name)
+        if not lookup:
+            print(f"[info] PN labels unavailable for dataset {dataset_cfg.name}")
+            continue
+        counts_filtered = _count_pn_lookup(lookup, dataset_cfg.region_filter)
+        region_desc = dataset_cfg.region_filter if dataset_cfg.region_filter else ["ALL"]
+        print(
+            "[info] PN label counts for {name} (regions={regions}): pos={pos}, neg={neg}".format(
+                name=dataset_cfg.name,
+                regions=",".join(region_desc),
+                pos=counts_filtered["positive"],
+                neg=counts_filtered["negative"],
+            )
+        )
 
     pairing_mode = (cfg.pairing_mode or "set_to_set").lower()
     if pairing_mode == "one_to_one":
@@ -302,7 +311,7 @@ def main() -> None:
         dataset_meta_map=dataset_meta_map,
         anchor_augment_map=augmentation_by_dataset.get(anchor_name),
         target_augment_map=augmentation_by_dataset.get(target_name),
-        pn_label_maps=None,
+        pn_label_maps=pn_label_maps,
         overlap_set=workspace.overlap,
     )
 
@@ -326,6 +335,7 @@ def main() -> None:
     #             else:
     #                 counter[int(value)] += 1
     #         return counter
+
     #     dataset1_match_counts = _count_labels(label_cross_matches, "label_in_dataset_1")
     #     dataset2_match_counts = _count_labels(label_cross_matches, "label_in_dataset_2")
     #     print(f"[debug] label matches in {anchor_name} using label in {target_name}: {dict(dataset1_match_counts)}")
@@ -383,8 +393,10 @@ def main() -> None:
     #################################### Training Overlap Alignment (DCCA) ####################################
     if args.train_dcca:
         objective = cfg.alignment_objective.lower()
-        if objective not in {"dcca", "barlow"}:
-            raise ValueError(f"Unsupported alignment objective: {objective}")
+        # if objective not in {"dcca", "barlow"}:
+        #     raise ValueError(f"Unsupported alignment objective: {objective}")
+        if objective != "dcca":
+            raise NotImplementedError("Only DCCA objective supports adaptive projection control.")
 
         drop_ratio_source = getattr(cfg.dcca_training, "singular_value_drop_ratio", None)
         if drop_ratio_source is None:
@@ -433,31 +445,87 @@ def main() -> None:
         except (TypeError, ValueError):
             dcca_eps_value = 1e-5
 
+        total_pairs = len(anchor_vecs)
+        validation_split = cfg.dcca_training.validation_fraction
+        if not math.isfinite(validation_split):
+            validation_split = 0.0
+        validation_split = max(0.0, min(validation_split, 0.9))
+        DCCA_val_count = int(total_pairs * validation_split)
+
+        minimum_train = 2
+        if total_pairs - DCCA_val_count < minimum_train and total_pairs >= minimum_train:
+            DCCA_val_count = max(0, total_pairs - minimum_train)
+        if DCCA_val_count < 2:
+            DCCA_val_count = 0
+
+        generator = torch.Generator()
+        generator.manual_seed(int(cfg.seed))
+        indices = torch.randperm(total_pairs, generator=generator)
+        val_indices = indices[:DCCA_val_count] if DCCA_val_count > 0 else torch.empty(0, dtype=torch.long)
+        train_indices = indices[DCCA_val_count:]
+        if train_indices.numel() < minimum_train and val_indices.numel() > 0:
+            needed = minimum_train - train_indices.numel()
+            recover = val_indices[:needed]
+            train_indices = torch.cat([train_indices, recover]) if train_indices.numel() else recover
+            val_indices = val_indices[needed:]
+        if train_indices.numel() < minimum_train:
+            raise RuntimeError("Unable to allocate at least two samples for DCCA training after validation split.")
+
+        train_indices_list = train_indices.tolist()
+        val_indices_list = val_indices.tolist()
+        for idx in train_indices_list:
+            pair_metadata[idx]["split"] = "train"
+        for idx in val_indices_list:
+            pair_metadata[idx]["split"] = "val"
+
+        anchor_vecs_train = [anchor_vecs[i] for i in train_indices_list]
+        target_stack_train = [target_stack_per_anchor[i] for i in train_indices_list]
+        metadata_train = [pair_metadata[i] for i in train_indices_list]
+
+        anchor_vecs_val = [anchor_vecs[i] for i in val_indices_list] if val_indices_list else []
+        target_stack_val = [target_stack_per_anchor[i] for i in val_indices_list] if val_indices_list else []
+        metadata_val = [pair_metadata[i] for i in val_indices_list] if val_indices_list else []
+
+        actual_validation_fraction = val_indices.numel() / total_pairs if val_indices.numel() else 0.0
 
         if use_transformer_agg and target_stack_per_anchor:
-            # agg_hidden_dim = args.agg_trans_hidden_dim or cfg.projection_dim or target_stack_per_anchor[0].size(1)
             agg_num_layers = int(args.agg_trans_num_layers) if args.agg_trans_num_layers is not None else 4
             agg_num_layers = max(1, agg_num_layers)
             agg_num_heads = int(args.agg_trans_num_heads) if args.agg_trans_num_heads is not None else 4
             agg_num_heads = max(1, agg_num_heads)
-            agg_steps = max(0, int(getattr(args, "agg_trans_steps", 2000)))
+            agg_steps_raw = getattr(args, "agg_trans_steps", None)
+            if agg_steps_raw is None:
+                agg_steps_raw = getattr(cfg.dcca_training, "epochs", 0)
+            try:
+                agg_steps = int(agg_steps_raw)
+            except (TypeError, ValueError):
+                agg_steps = getattr(cfg.dcca_training, "epochs", 0)
+            agg_steps = max(0, agg_steps)
             agg_dropout = max(0.0, float(getattr(args, "agg_trans_dropout", 0.1)))
-            agg_batch_size = min(max(1, cfg.dcca_training.batch_size), len(target_stack_per_anchor))
+            train_batch_size = min(max(1, cfg.dcca_training.batch_size), len(anchor_vecs_train)) if anchor_vecs_train else 1
 
             if cfg.projection_dim % agg_num_heads != 0:
                 cfg.projection_dim = agg_num_heads * max(1, math.ceil(cfg.projection_dim / agg_num_heads))
             try:
-
-
-                print("[dev] agg_num_layers, agg_num_heads, agg_steps, agg_dropout, agg_batch_size, drop_ratio, dcca_eps_value", 
-                      agg_num_layers, agg_num_heads, agg_steps, agg_dropout, agg_batch_size, drop_ratio, dcca_eps_value)
-
-                aggregator_model = _train_transformer_aggregator(
-                    anchor_vecs,
-                    target_stack_per_anchor,
-                    pair_metadata,
+                run_logger.log(
+                    "[agg] Training transformer aggregator (layers={layers}, heads={heads}, steps={steps}, "
+                    "batch_size={batch}, dropout={drop:.3f})".format(
+                        layers=agg_num_layers,
+                        heads=agg_num_heads,
+                        steps=agg_steps,
+                        batch=train_batch_size,
+                        drop=agg_dropout,
+                    )
+                )
+                train_success, projector_a_anchor_identity, projector_b_trans_aggregator, epoch_history, final_proj_dim, failure_reason = _train_transformer_aggregator(
+                    anchor_vecs_train,
+                    target_stack_train,
+                    metadata_train,
+                    validation_anchor_vecs=anchor_vecs_val,
+                    validation_target_stack=target_stack_val,
+                    validation_metadata=metadata_val,
                     device=device,
-                    batch_size=agg_batch_size,
+                    batch_size=train_batch_size,
                     steps=agg_steps,
                     lr=cfg.dcca_training.lr,
                     agg_dim=cfg.projection_dim,
@@ -469,193 +537,108 @@ def main() -> None:
                     use_positional_encoding=bool(getattr(args, "agg_trans_pos_enc", False)),
                     run_logger=run_logger,
                 )
-                if aggregator_model is not None:
+                if not train_success or projector_b_trans_aggregator is None:
+                    run_logger.log(f"[agg] Transformer aggregator training failed: {agg_failure or 'unknown error'}")
+                else:
                     fused_targets = _apply_transformer_aggregator(
-                        aggregator_model,
+                        projector_b_trans_aggregator,
                         anchor_vecs,
                         target_stack_per_anchor,
                         pair_metadata,
-                        batch_size=agg_batch_size,
+                        batch_size=train_batch_size,
                         device=device,
                         use_positional_encoding=bool(getattr(args, "agg_trans_pos_enc", False)),
                     )
                     if fused_targets and len(fused_targets) == len(target_vecs):
-                        target_vecs = fused_targets
-                        run_logger.log(
-                            f"[agg] Transformer aggregator applied to {len(target_vecs)} pairs (dim={cfg.projection_dim}, layers={agg_num_layers}, heads={agg_num_heads})."
-                        )
+                        fused_target_vecs = fused_targets
+                        run_logger.log(f"[agg] Transformer aggregator applied to {len(fused_target_vecs)} pairs (dim={cfg.projection_dim}).")
                     else:
                         run_logger.log("[agg] Transformer aggregator output size mismatch; skipping fused targets.")
-                else:
-                    run_logger.log("[agg] Transformer aggregator skipped due to insufficient data.")
+                if train_success and projector_b_trans_aggregator is not None and epoch_history:
+                    run_logger.log(
+                        "[agg] Completed transformer aggregator training: final_loss={loss}, final_mean_corr={corr}".format(
+                            loss=_format_optional_scalar(epoch_history[-1].get("train_eval_loss")),
+                            corr=_format_optional_scalar(epoch_history[-1].get("train_eval_mean_correlation")),
+                        )
+                    )
             except Exception as exc:
                 run_logger.log(f"[agg] Transformer aggregator failed: {exc}")
 
-        exit()
 
-        
-        # anchor_tensor = torch.stack(anchor_vecs)
-        # target_tensor = torch.stack(target_vecs)
-        # total_pairs = anchor_tensor.size(0)
+        last_history_dcca = epoch_history[-1] if epoch_history else {}
+        trans_agg_dcca_summary = {
+            "objective": objective,
+            "aggregator": cfg.aggregator,
+            "use_positive_only": cfg.use_positive_only,
+            "use_positive_augmentation": cfg.use_positive_augmentation,
+            "projection_dim": final_proj_dim,
+            "projection_layers": mlp_layers,
+            "train_dcca": train_dcca,
+            "read_dcca": read_dcca,
+            "dcca_weights_path": str(weights_path) if weights_path is not None else None,
+            "pretrained_projection_dim": int(pretrained_summary.get("projection_dim"))
+            if isinstance(pretrained_summary, dict) and pretrained_summary.get("projection_dim") is not None
+            else None,
+            "pretrained_projection_layers": int(pretrained_summary.get("projection_layers"))
+            if isinstance(pretrained_summary, dict) and pretrained_summary.get("projection_layers") is not None
+            else None,
+            "label_histogram": dict(label_hist),
+            "num_pairs": len(anchor_vecs),
+            "epochs": cfg.dcca_training.epochs,
+            "batch_size": train_batch_size,
+            "lr": cfg.dcca_training.lr,
+            "max_coord_error": max_coord_error,
+            "final_loss": last_history_dcca.get("train_eval_loss", last_history_dcca.get("loss")),
+            "final_mean_correlation": last_history_dcca.get("train_eval_mean_correlation", last_history_dcca.get("mean_correlation")),
+            "final_train_tcc": last_history_dcca.get("train_eval_tcc"),
+            "final_train_tcc_mean": last_history_dcca.get("train_eval_tcc_mean"),
+            "final_train_tcc_k": int(last_history_dcca["train_eval_k"]) if last_history_dcca.get("train_eval_k") is not None else None,
+            "train_pairs": len(train_indices_list),
+            "validation_pairs": len(val_indices_list) if val_indices_list is not None else 0,
+            "validation_fraction": actual_validation_fraction,
+            "tcc_ratio": tcc_ratio,
+            "dcca_eps": dcca_eps_value,
+            "singular_value_drop_ratio": drop_ratio,
+            "augmentation_stats": augmentation_stats,
+            # "pn_index_summary": pn_index_summary,
+            # "pn_label_counts": {
+            #     "anchor": _count_pn_lookup(pn_label_maps.get(anchor_name), dataset_region_filters.get(anchor_name)),
+            #     "target": _count_pn_lookup(pn_label_maps.get(target_name), dataset_region_filters.get(target_name)),
+            # },
+            # "cross_index_matches": label_cross_matches,
+        }
 
-        # validation_split = cfg.dcca_training.validation_fraction
-        # if not math.isfinite(validation_split):
-        #     validation_split = 0.0
-        # validation_split = max(0.0, min(validation_split, 0.9))
-        # DCCA_val_count = int(total_pairs * validation_split)
-
-        # minimum_train = 2
-        # if total_pairs - DCCA_val_count < minimum_train and total_pairs >= minimum_train:
-        #     DCCA_val_count = max(0, total_pairs - minimum_train)
-        # if DCCA_val_count < 2:
-        #     DCCA_val_count = 0
-
-        # generator = torch.Generator()
-        # generator.manual_seed(int(cfg.seed))
-        # indices = torch.randperm(total_pairs, generator=generator)
-        # val_indices = indices[:DCCA_val_count] if DCCA_val_count > 0 else torch.empty(0, dtype=torch.long)
-        # train_indices = indices[DCCA_val_count:]
-        # if train_indices.numel() < minimum_train and val_indices.numel() > 0:
-        #     needed = minimum_train - train_indices.numel()
-        #     recover = val_indices[:needed]
-        #     train_indices = torch.cat([train_indices, recover]) if train_indices.numel() else recover
-        #     val_indices = val_indices[needed:]
-        # if train_indices.numel() < minimum_train:
-        #     raise RuntimeError("Unable to allocate at least two samples for DCCA training after validation split.")
-
-        # train_anchor = anchor_tensor[train_indices]
-        # train_target = target_tensor[train_indices]
-        # train_dataset = TensorDataset(train_anchor, train_target)
-
-        # train_indices_list = train_indices.tolist()
-        # val_indices_list = val_indices.tolist()
-        # for idx in train_indices_list:
-        #     pair_metadata[idx]["split"] = "train"
-        # for idx in val_indices_list:
-        #     pair_metadata[idx]["split"] = "val"
-
-        # validation_dataset: Optional[TensorDataset]
-        # if val_indices.numel() >= 2:
-        #     val_anchor = anchor_tensor[val_indices]
-        #     val_target = target_tensor[val_indices]
-        #     validation_dataset = TensorDataset(val_anchor, val_target)
-        #     actual_validation_fraction = val_indices.numel() / total_pairs
-        # else:
-        #     validation_dataset = None
-        #     actual_validation_fraction = 0.0
-
-        # train_batch_size = min(cfg.dcca_training.batch_size, len(train_dataset))
-
-        # if read_dcca and weights_path is not None:
-        #     run_logger.log(f"Reading DCCA weights from {weights_path}")
-        #     run_logger.log(
-        #         "Starting stage-1 overlap alignment with initial projection_dim={proj}; "
-        #         "train_pairs={train}, val_pairs={val}, validation_fraction={vf:.3f}, "
-        #         "drop_ratio={drop:.4f}, tcc_ratio={tcc:.4f}, mlp_layers={layers}, "
-        #         "train_dcca={train_flag}, read_dcca={read_flag}".format(
-        #             proj=cfg.projection_dim,
-        #             train=len(train_dataset),
-        #             val=len(validation_dataset) if validation_dataset is not None else 0,
-        #             vf=actual_validation_fraction,
-        #             drop=drop_ratio,
-        #             tcc=tcc_ratio,
-        #             layers=mlp_layers,
-        #             train_flag=train_dcca,
-        #             read_flag=read_dcca,
-        #         )
-        #     )
-
-
-
-
-        # if objective != "dcca":
-        #     raise NotImplementedError("Only DCCA objective supports adaptive projection control.")
-
-        # train_success, projector_a, projector_b, epoch_history, final_proj_dim, failure_reason = _train_DCCA(
-        #     cfg=cfg,
-        #     train_dataset=train_dataset,
-        #     validation_dataset=validation_dataset,
-        #     batch_size=train_batch_size,
-        #     device=device,
-        #     anchor_dim=train_anchor.size(1),
-        #     target_dim=train_target.size(1),
-        #     dcca_eps=dcca_eps_value,            
-        #     run_logger=run_logger,
-        #     drop_ratio=drop_ratio,
-        #     tcc_ratio=tcc_ratio,
-        #     mlp_layers=mlp_layers,
-        #     train_dcca=train_dcca,
-        #     pretrained_state=pretrained_state,
-        #     pretrained_summary=pretrained_summary,
-        #     pretrained_path=weights_path,
-        # )
-
-        # last_history_dcca = epoch_history[-1] if epoch_history else {}
-        # dcca_summary = {
-        #     "objective": objective,
-        #     "aggregator": cfg.aggregator,
-        #     "use_positive_only": cfg.use_positive_only,
-        #     "use_positive_augmentation": cfg.use_positive_augmentation,
-        #     "projection_dim": final_proj_dim,
-        #     "projection_layers": mlp_layers,
-        #     "train_dcca": train_dcca,
-        #     "read_dcca": read_dcca,
-        #     "dcca_weights_path": str(weights_path) if weights_path is not None else None,
-        #     "pretrained_projection_dim": int(pretrained_summary.get("projection_dim")) if isinstance(pretrained_summary, dict) and pretrained_summary.get("projection_dim") is not None else None,
-        #     "pretrained_projection_layers": int(pretrained_summary.get("projection_layers")) if isinstance(pretrained_summary, dict) and pretrained_summary.get("projection_layers") is not None else None,
-        #     "label_histogram": dict(label_hist),
-        #     "num_pairs": len(anchor_vecs),
-        #     "epochs": cfg.dcca_training.epochs,
-        #     "batch_size": train_batch_size,
-        #     "lr": cfg.dcca_training.lr,
-        #     "max_coord_error": max_coord_error,
-        #     "final_loss": last_history_dcca.get("train_eval_loss", last_history_dcca.get("loss")),
-        #     "final_mean_correlation": last_history_dcca.get("train_eval_mean_correlation", last_history_dcca.get("mean_correlation")),
-        #     "final_train_tcc": last_history_dcca.get("train_eval_tcc"),
-        #     "final_train_tcc_mean": last_history_dcca.get("train_eval_tcc_mean"),
-        #     "final_train_tcc_k": int(last_history_dcca["train_eval_k"]) if last_history_dcca.get("train_eval_k") is not None else None,
-        #     "train_pairs": len(train_dataset),
-        #     "validation_pairs": len(validation_dataset) if validation_dataset is not None else 0,
-        #     "validation_fraction": actual_validation_fraction,
-        #     "tcc_ratio": tcc_ratio,
-        #     "dcca_eps": dcca_eps_value,
-        #     "singular_value_drop_ratio": drop_ratio,
-        #     "augmentation_stats": augmentation_stats,
-        #     "pn_index_summary": pn_index_summary,
-        #     "pn_label_counts": {
-        #         "anchor": _count_pn_lookup(pn_label_maps.get(anchor_name), dataset_region_filters.get(anchor_name)),
-        #         "target": _count_pn_lookup(pn_label_maps.get(target_name), dataset_region_filters.get(target_name)),
-        #     },
-        #     "cross_index_matches": label_cross_matches,
-        # }
-
-        if not train_success or projector_a is None or projector_b is None:
+        if not train_success or projector_a_anchor_identity is None or projector_b_trans_aggregator is None:
             raise RuntimeError(f"DCCA training failed: {failure_reason or 'unknown error'}")    
 
-        _persist_state(cfg, projector_a, projector_b, filename="overlap_alignment_stage1_dcca.pt")
+        _persist_state(cfg, projector_a_anchor_identity, projector_b_trans_aggregator, filename="overlap_alignment_stage1_dcca.pt")
         _persist_metrics(
             cfg,
-            dcca_summary,
+            trans_agg_dcca_summary,
             epoch_history,
             filename="overlap_alignment_stage1_dcca_metrics.json",
         )
 
         if debug_mode:
             _maybe_save_debug_figures(cfg, debug_data)
+
+            # Identity projectors for anchor (no change) and target (aggregated) and anchor and fused target vectors are feed on purpose (workaround to reuse _create_debug_alignment_figures). K.N. Nov 5th, 2025
             _create_debug_alignment_figures(
                 cfg=cfg,
-                projector_a=projector_a,
-                projector_b=projector_b,
-                anchor_tensor=anchor_tensor,
-                target_tensor=target_tensor,
+                projector_a=nn.Identity(),
+                projector_b=nn.Identity(),
+                anchor_tensor=torch.stack(anchor_vecs),
+                target_tensor=torch.stack(fused_target_vecs),
                 pair_metadata=pair_metadata,
                 run_logger=run_logger,
                 drop_ratio=drop_ratio,
                 tcc_ratio=tcc_ratio,
                 dcca_eps=dcca_eps_value,
-                device=device,
+                device=device, 
                 sample_seed=int(cfg.seed),
             )
+        print("debugging done")
+        exit()
     #################################### Training Overlap Alignment (DCCA) END ####################################
 
     #################################### Temporal Debugging Module ####################################
@@ -785,10 +768,13 @@ def main() -> None:
         return {"train": train_coords, "val": val_coords}
     #################################### Temporal Debugging Module ####################################
 
+
+    exit("debugging done")
     #################################### Training Classifier after Overlap Alignment ####################################
     if args.train_cls:
         
         if not train_dcca:
+            # TODO: projector_a_anchor_identity, projector_b_trans_aggregator
             projector_missing = ('projector_a' not in locals() or projector_a is None or
                                  'projector_b' not in locals() or projector_b is None)
             weights_candidate = _resolve_dcca_weights_path(cfg, args.dcca_weights_path)
@@ -880,7 +866,8 @@ def main() -> None:
             meta_target_all=DCCAEmbedding_target_all,
             meta_target_overlap=DCCAEmbedding_target_overlap,
             overlapregion_label=cfg.cls_training.overlapregion_label,
-            label_cross_matches=label_cross_matches,
+            # label_cross_matches=label_cross_matches,
+            label_cross_matches=None,
             sample_sets=sample_sets,
             pn_label_maps=pn_label_maps,
             anchor_name=anchor_name,
@@ -1272,6 +1259,9 @@ def _train_transformer_aggregator(
     target_stack_per_anchor: Sequence[torch.Tensor],
     pair_metadata: Sequence[Dict[str, object]],
     *,
+    validation_anchor_vecs: Optional[Sequence[torch.Tensor]] = None,
+    validation_target_stack: Optional[Sequence[torch.Tensor]] = None,
+    validation_metadata: Optional[Sequence[Dict[str, object]]] = None,
     device: torch.device,
     batch_size: int,
     steps: int,
@@ -1284,17 +1274,48 @@ def _train_transformer_aggregator(
     drop_ratio: float,
     use_positional_encoding: bool,
     run_logger: "_RunLogger",
-) -> Optional[CrossAttentionAggregator]:
+) -> Tuple[bool, Optional[CrossAttentionAggregator], Optional[nn.Module], List[Dict[str, object]], int, Optional[str]]:
     if not anchor_vecs or not target_stack_per_anchor:
         return None
-    dataset = TargetSetDataset(anchor_vecs, target_stack_per_anchor, pair_metadata)
-    if len(dataset) == 0:
+
+    train_dataset = TargetSetDataset(anchor_vecs, target_stack_per_anchor, pair_metadata)
+    if len(train_dataset) == 0:
         return None
+
     collate_fn = lambda batch: _collate_target_sets(batch, use_positional_encoding)
-    loader = DataLoader(dataset, batch_size=max(1, batch_size), shuffle=True, drop_last=False, collate_fn=collate_fn)
-    progress_bar = None
-    if tqdm is not None and steps > 0:
-        progress_bar = tqdm(total=steps, desc="agg-train", leave=False)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=max(1, batch_size),
+        shuffle=True,
+        drop_last=False,
+        collate_fn=collate_fn,
+    )
+    train_eval_loader = DataLoader(
+        train_dataset,
+        batch_size=max(1, batch_size),
+        shuffle=False,
+        drop_last=False,
+        collate_fn=collate_fn,
+    )
+
+    has_validation = (
+        validation_anchor_vecs is not None
+        and validation_target_stack is not None
+        and validation_metadata is not None
+        and len(validation_anchor_vecs) > 0
+    )
+    if has_validation:
+        val_dataset = TargetSetDataset(validation_anchor_vecs, validation_target_stack, validation_metadata)
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=max(1, batch_size),
+            shuffle=False,
+            drop_last=False,
+            collate_fn=collate_fn,
+        )
+    else:
+        val_loader = None
+
     anchor_dim = anchor_vecs[0].numel()
     target_dim = target_stack_per_anchor[0].size(1)
     aggregator = CrossAttentionAggregator(
@@ -1314,44 +1335,148 @@ def _train_transformer_aggregator(
     )
     if steps <= 0:
         aggregator.eval()
-        return aggregator
-    data_iter = iter(loader)
-    for step_idx in range(steps):
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(loader)
-            batch = next(data_iter)
-        anchor_batch, target_batch, mask_batch, pos_batch = batch
-        anchor_batch = anchor_batch.to(device)
-        target_batch = target_batch.to(device)
-        mask_batch = mask_batch.to(device)
-        if pos_batch is not None:
-            pos_batch = pos_batch.to(device)
+        run_logger.log("[agg] No training steps requested; returning aggregator in eval mode.")
+        return True, aggregator, None, [], agg_dim, None
+
+    def _evaluate(loader: Optional[DataLoader]) -> Optional[Dict[str, object]]:
+        if loader is None:
+            return None
+        aggregator.eval()
+        proj_anchor.eval()
+        proj_target.eval()
+        losses: List[float] = []
+        batches = 0
+        singular_store: List[torch.Tensor] = []
+        with torch.no_grad():
+            for anchor_batch, target_batch, mask_batch, pos_batch in loader:
+                anchor_batch = anchor_batch.to(device)
+                target_batch = target_batch.to(device)
+                mask_batch = mask_batch.to(device)
+                if pos_batch is not None:
+                    pos_batch = pos_batch.to(device)
+                fused = aggregator(anchor_batch, target_batch, key_padding_mask=mask_batch, pos_encoding=pos_batch)
+                u = proj_anchor(anchor_batch)
+                v = proj_target(fused)
+                loss, singulars, _ = dcca_loss(u, v, eps=dcca_eps, drop_ratio=drop_ratio)
+                losses.append(loss.item())
+                batches += 1
+                if singulars.numel() > 0:
+                    singular_store.append(singulars.detach().cpu())
+        if batches == 0:
+            return None
+        mean_loss = float(sum(losses) / batches)
+        if singular_store:
+            compiled = torch.cat(singular_store)
+            mean_corr = float(compiled.mean().item())
+            tcc_sum = float(compiled.sum().item())
+            tcc_mean = float(compiled.mean().item())
+            k_val = int(compiled.numel())
+        else:
+            mean_corr = None
+            tcc_sum = None
+            tcc_mean = None
+            k_val = 0
+        aggregator.train()
+        proj_anchor.train()
+        return {
+            "loss": mean_loss,
+            "mean_corr": mean_corr,
+            "tcc_sum": tcc_sum,
+            "tcc_mean": tcc_mean,
+            "k": k_val,
+            "batches": batches,
+        }
+
+    def _format(value: Optional[float]) -> str:
+        if value is None or not math.isfinite(value):
+            return "None"
+        return f"{value:.6f}"
+
+    epoch_history: List[Dict[str, object]] = []
+    failure_reason: Optional[str] = None
+
+    for epoch_idx in range(steps):
         aggregator.train()
         proj_anchor.train()
         proj_target.train()
-        fused = aggregator(anchor_batch, target_batch, key_padding_mask=mask_batch, pos_encoding=pos_batch)
-        u = proj_anchor(anchor_batch)
-        v = proj_target(fused)
-        # TODO: Check why loss is zero.
-        loss, _, _ = dcca_loss(u, v, eps=dcca_eps, drop_ratio=drop_ratio)
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            list(aggregator.parameters()) + list(proj_anchor.parameters()) + list(proj_target.parameters()),
-            max_norm=5.0,
+        epoch_loss = 0.0
+        epoch_batches = 0
+        for anchor_batch, target_batch, mask_batch, pos_batch in train_loader:
+            anchor_batch = anchor_batch.to(device)
+            target_batch = target_batch.to(device)
+            mask_batch = mask_batch.to(device)
+            if pos_batch is not None:
+                pos_batch = pos_batch.to(device)
+            fused = aggregator(anchor_batch, target_batch, key_padding_mask=mask_batch, pos_encoding=pos_batch)
+            u = proj_anchor(anchor_batch)
+            v = proj_target(fused)
+            loss, _, _ = dcca_loss(u, v, eps=dcca_eps, drop_ratio=drop_ratio)
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(aggregator.parameters()) + list(proj_anchor.parameters()) + list(proj_target.parameters()),
+                max_norm=5.0,
+            )
+            optimizer.step()
+            epoch_loss += loss.item()
+            epoch_batches += 1
+
+        train_metrics = _evaluate(train_eval_loader)
+        val_metrics = _evaluate(val_loader) if has_validation else None
+
+        train_loss_log = train_metrics.get("loss") if train_metrics else epoch_loss / max(1, epoch_batches)
+        train_corr_log = train_metrics.get("mean_corr") if train_metrics else None
+        train_tcc_log = train_metrics.get("tcc_sum") if train_metrics else None
+        train_tcc_mean_log = train_metrics.get("tcc_mean") if train_metrics else None
+        train_k_log = train_metrics.get("k") if train_metrics else None
+        val_loss_log = val_metrics.get("loss") if val_metrics else None
+        val_corr_log = val_metrics.get("mean_corr") if val_metrics else None
+        val_tcc_log = val_metrics.get("tcc_sum") if val_metrics else None
+        val_tcc_mean_log = val_metrics.get("tcc_mean") if val_metrics else None
+        val_k_log = val_metrics.get("k") if val_metrics else None
+        train_batches_count = train_metrics.get("batches") if train_metrics else epoch_batches
+        val_batches_count = val_metrics.get("batches") if val_metrics else None
+        run_logger.log(
+            "[agg] epoch {epoch}: train_loss={train_loss}, train_mean_corr={train_corr}, "
+            "train_TCC = {train_tcc}, val_loss={val_loss}, val_mean_corr={val_corr}, "
+            "val_TCC = {val_tcc}, batches={batches}".format(
+                epoch=epoch_idx + 1,
+                train_loss=_format(train_loss_log),
+                train_corr=_format(train_corr_log),
+                train_tcc=_format(train_tcc_log),
+                val_loss=_format(val_loss_log),
+                val_corr=_format(val_corr_log),
+                val_tcc=_format(val_tcc_log),
+                batches=train_batches_count,
+            )
         )
-        optimizer.step()
-        if progress_bar is not None:
-            progress_bar.update(1)
-            progress_bar.set_postfix({"loss": f"{loss.item():.6f}"})
-        elif (step_idx + 1) % 100 == 0:
-            run_logger.log(f"[agg] step {step_idx + 1}/{steps} loss={loss.item():.6f}")
-    if progress_bar is not None:
-        progress_bar.close()
+
+        epoch_history.append(
+            {
+                "epoch": epoch_idx + 1,
+                "loss": float(train_loss_log) if train_loss_log is not None else None,
+                "mean_correlation": float(train_corr_log) if train_corr_log is not None else None,
+                "train_eval_loss": float(train_loss_log) if train_loss_log is not None else None,
+                "train_eval_mean_correlation": float(train_corr_log) if train_corr_log is not None else None,
+                "train_eval_tcc": float(train_tcc_log) if train_tcc_log is not None else None,
+                "train_eval_tcc_mean": float(train_tcc_mean_log) if train_tcc_mean_log is not None else None,
+                "train_eval_k": float(train_k_log) if train_k_log is not None else None,
+                "val_eval_loss": float(val_loss_log) if val_loss_log is not None else None,
+                "val_eval_mean_correlation": float(val_corr_log) if val_corr_log is not None else None,
+                "val_eval_tcc": float(val_tcc_log) if val_tcc_log is not None else None,
+                "val_eval_tcc_mean": float(val_tcc_mean_log) if val_tcc_mean_log is not None else None,
+                "val_eval_k": float(val_k_log) if val_k_log is not None else None,
+                "batches": int(train_batches_count),
+                "val_batches": int(val_batches_count) if val_batches_count is not None else None,
+                "projection_dim": int(agg_dim),
+            }
+        )
+    
+    anchor_identity = nn.Identity()
     aggregator.eval()
-    return aggregator
+    proj_anchor.eval()
+    proj_target.eval()
+    return True, anchor_identity, aggregator, epoch_history, agg_dim, failure_reason
 
 
 def _apply_transformer_aggregator(
@@ -1391,319 +1516,41 @@ def _apply_transformer_aggregator(
 
 
 
-def _select_subset_indices(total: int, max_points: int, seed: int) -> torch.Tensor:
-    if total <= 0:
-        return torch.empty(0, dtype=torch.long)
-    if total <= max_points:
-        return torch.arange(total, dtype=torch.long)
-    generator = torch.Generator()
-    generator.manual_seed(int(seed))
-    perm = torch.randperm(total, generator=generator)
-    return perm[:max_points]
-
-
-def _reduce_dimensionality(features: np.ndarray, random_state: int = 42) -> np.ndarray:
-    if features.shape[0] < 2:
-        return np.zeros((features.shape[0], 2), dtype=np.float32)
-    features = np.asarray(features, dtype=np.float32)
+def _load_pn_lookup(path: Optional[Path]) -> Optional[Dict[str, set[Tuple[str, int, int]]]]:
+    if path is None:
+        return None
     try:
-        import umap  # type: ignore
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError:
+        return None
+    pos_entries = payload.get("pos") or []
+    neg_entries = payload.get("neg") or []
 
-        reducer = umap.UMAP(n_components=2, random_state=random_state)
-        embedding = reducer.fit_transform(features)
-        if embedding.shape[1] == 2:
-            return embedding
-    except Exception:
-        pass
-    try:
-        from sklearn.manifold import TSNE  # type: ignore
+    def _to_key(entry: Dict[str, object]) -> Optional[Tuple[str, int, int]]:
+        region = entry.get("region")
+        row = entry.get("row")
+        col = entry.get("col")
+        if region is None or row is None or col is None:
+            return None
+        try:
+            return (str(region).upper(), int(row), int(col))
+        except Exception:
+            return None
 
-        perplexity = max(5, min(30, features.shape[0] // 3))
-        reducer = TSNE(n_components=2, random_state=random_state, perplexity=perplexity, init="pca")
-        embedding = reducer.fit_transform(features)
-        if embedding.shape[1] == 2:
-            return embedding
-    except Exception:
-        pass
-    try:
-        from sklearn.decomposition import PCA  # type: ignore
-
-        reducer = PCA(n_components=2, random_state=random_state)
-        embedding = reducer.fit_transform(features)
-        if embedding.shape[1] == 2:
-            return embedding
-    except Exception:
-        pass
-    if features.shape[1] >= 2:
-        return features[:, :2]
-    pad = np.zeros((features.shape[0], 2), dtype=np.float32)
-    pad[:, 0] = features[:, 0]
-    return pad
-
-
-def _create_debug_alignment_figures(
-    *,
-    cfg: AlignmentConfig,
-    projector_a: nn.Module,
-    projector_b: nn.Module,
-    anchor_tensor: torch.Tensor,
-    target_tensor: torch.Tensor,
-    pair_metadata: Sequence[Dict[str, object]],
-    run_logger: "_RunLogger",
-    drop_ratio: float,
-    tcc_ratio: float,
-    dcca_eps: float,
-    device: torch.device,
-    sample_seed: int,
-) -> None:
-    if plt is None:
-        run_logger.log("matplotlib is unavailable; skipping advanced debug figures.")
-        return
-
-    analysis_primary = None
-    if cfg.output_dir is not None:
-        analysis_primary = cfg.output_dir / "overlap_visualizations" / "alignment_analysis"
-    elif cfg.log_dir is not None:
-        analysis_primary = cfg.log_dir / "overlap_visualizations" / "alignment_analysis"
-    analysis_dir = _prepare_output_dir(analysis_primary, "overlap_alignment_outputs/alignment_analysis")
-    if analysis_dir is None:
-        run_logger.log("Unable to prepare alignment analysis directory; skipping figures.")
-        return
-
-    try:
-        analysis_dir.mkdir(parents=True, exist_ok=True)
-    except Exception as exc:
-        run_logger.log(f"Failed to create alignment analysis directory {analysis_dir}: {exc}")
-        return
-
-    if anchor_tensor.size(0) == 0 or target_tensor.size(0) == 0:
-        run_logger.log("No samples available for debug plotting.")
-        return
-
-    analysis_batch = max(32, min(2048, anchor_tensor.size(0)))
-    projected_anchor = _project_in_batches(anchor_tensor, projector_a, device, analysis_batch)
-    projected_target = _project_in_batches(target_tensor, projector_b, device, analysis_batch)
-
-    # t-SNE / UMAP figure
-    try:
-        subset_indices = _select_subset_indices(anchor_tensor.size(0), max_points=1000, seed=sample_seed)
-        subset_list = subset_indices.tolist()
-        if subset_indices.numel() >= 2:
-            anchor_raw = anchor_tensor.detach().cpu()
-            target_raw = target_tensor.detach().cpu()
-            proj_anchor_raw = projected_anchor.detach().cpu()
-            proj_target_raw = projected_target.detach().cpu()
-
-            before_features = torch.cat(
-                [anchor_raw[subset_indices], target_raw[subset_indices]], dim=0
-            ).numpy()
-            after_features = torch.cat(
-                [proj_anchor_raw[subset_indices], proj_target_raw[subset_indices]], dim=0
-            ).numpy()
-
-            embedding_before = _reduce_dimensionality(before_features, random_state=sample_seed)
-            embedding_after = _reduce_dimensionality(after_features, random_state=sample_seed + 1)
-
-            num_subset = subset_indices.numel()
-            coords_before_anchor = embedding_before[:num_subset]
-            coords_before_target = embedding_before[num_subset:]
-            coords_after_anchor = embedding_after[:num_subset]
-            coords_after_target = embedding_after[num_subset:]
-
-            fig, axes = plt.subplots(1, 2, figsize=(13, 6), constrained_layout=True)
-            colors = {"anchor": "#1f77b4", "target": "#ff7f0e"}
-            for ax, coords_anchor, coords_target, title in (
-                (axes[0], coords_before_anchor, coords_before_target, "Embeddings (pre-DCCA)"),
-                (axes[1], coords_after_anchor, coords_after_target, "Embeddings (post-DCCA)"),
-            ):
-                ax.scatter(
-                    coords_anchor[:, 0],
-                    coords_anchor[:, 1],
-                    c=colors["anchor"],
-                    label="Anchor",
-                    alpha=0.6,
-                    s=20,
-                )
-                ax.scatter(
-                    coords_target[:, 0],
-                    coords_target[:, 1],
-                    c=colors["target"],
-                    label="Target",
-                    alpha=0.6,
-                    s=20,
-                    marker="s",
-                )
-                val_anchor_x = []
-                val_anchor_y = []
-                val_target_x = []
-                val_target_y = []
-                for i, idx in enumerate(subset_list):
-                    if i >= coords_anchor.shape[0]:
-                        break
-                    split = pair_metadata[idx].get("split") if idx < len(pair_metadata) else None
-                    if split == "val":
-                        val_anchor_x.append(coords_anchor[i, 0])
-                        val_anchor_y.append(coords_anchor[i, 1])
-                        val_target_x.append(coords_target[i, 0])
-                        val_target_y.append(coords_target[i, 1])
-                    ax.plot(
-                        [coords_anchor[i, 0], coords_target[i, 0]],
-                        [coords_anchor[i, 1], coords_target[i, 1]],
-                        color="gray",
-                        alpha=0.2,
-                        linewidth=0.5,
-                    )
-                if val_anchor_x:
-                    ax.scatter(
-                        val_anchor_x,
-                        val_anchor_y,
-                        facecolors="none",
-                        edgecolors="black",
-                        linewidths=0.7,
-                        s=40,
-                        label="Anchor (val)" if ax is axes[0] else None,
-                    )
-                if val_target_x:
-                    ax.scatter(
-                        val_target_x,
-                        val_target_y,
-                        facecolors="none",
-                        edgecolors="black",
-                        linewidths=0.7,
-                        s=40,
-                        marker="s",
-                        label="Target (val)" if ax is axes[0] else None,
-                    )
-                ax.set_title(title)
-                ax.set_xlabel("Component 1")
-                ax.set_ylabel("Component 2")
-            axes[1].legend(loc="upper right")
-            tsne_path = analysis_dir / "alignment_tsne_umap.png"
-            fig.suptitle("Paired Embeddings Before vs After DCCA")
-            fig.savefig(tsne_path, dpi=200, bbox_inches="tight")
-            plt.close(fig)
-            run_logger.log(f"Saved t-SNE/UMAP alignment figure to {tsne_path}")
-    except Exception as exc:
-        run_logger.log(f"Failed to create t-SNE/UMAP debug figure: {exc}")
-
-    # Canonical correlation spectrum
-    try:
-        metrics_before = _canonical_metrics(
-            anchor_tensor.detach().to(projected_anchor.dtype),
-            target_tensor.detach().to(projected_target.dtype),
-            eps=dcca_eps,
-            drop_ratio=drop_ratio,
-            tcc_ratio=tcc_ratio,
-        )
-        metrics_after = _canonical_metrics(
-            projected_anchor,
-            projected_target,
-            eps=dcca_eps,
-            drop_ratio=drop_ratio,
-            tcc_ratio=tcc_ratio,
-        )
-        if metrics_before and metrics_after:
-            vals_before = metrics_before.get("canonical_correlations_sorted") or []
-            vals_after = metrics_after.get("canonical_correlations_sorted") or []
-            if vals_before and vals_after:
-                vals_before = np.asarray(vals_before, dtype=float)
-                vals_after = np.asarray(vals_after, dtype=float)
-                k_plot = int(min(len(vals_before), len(vals_after), 128))
-                if k_plot > 0:
-                    idx = np.arange(1, k_plot + 1)
-                    fig, axes = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
-                    for ax, values, title in (
-                        (axes[0], vals_before[:k_plot], "Pre-DCCA"),
-                        (axes[1], vals_after[:k_plot], "Post-DCCA"),
-                    ):
-                        ax.bar(idx, values, color="#4c72b0", alpha=0.7)
-                        cumulative = np.cumsum(values)
-                        ax.plot(idx, cumulative, color="#dd8452", linewidth=1.5, label="Cumulative sum")
-                        ax.set_title(f"{title} Canonical Spectrum (Top {k_plot})")
-                        ax.set_xlabel("Canonical component")
-                        ax.set_ylabel("Correlation")
-                        ax.set_ylim(0, 1.05)
-                        ax.legend(loc="upper right")
-                    spectrum_path = analysis_dir / "canonical_correlation_spectrum.png"
-                    fig.savefig(spectrum_path, dpi=200, bbox_inches="tight")
-                    plt.close(fig)
-                    run_logger.log(f"Saved canonical correlation spectrum to {spectrum_path}")
-    except Exception as exc:
-        run_logger.log(f"Failed to generate canonical correlation spectrum: {exc}")
-
-    # Geospatial distance heatmap
-    try:
-        geo_indices: List[int] = []
-        geo_coords: List[Tuple[float, float]] = []
-        geo_splits: List[str] = []
-        for idx, meta in enumerate(pair_metadata):
-            coord = meta.get("anchor_coord")
-            if coord is None:
-                coord = meta.get("target_weighted_coord")
-            if coord is None:
-                continue
-            try:
-                x, y = float(coord[0]), float(coord[1])
-            except Exception:
-                continue
-            if not (math.isfinite(x) and math.isfinite(y)):
-                continue
-            geo_indices.append(idx)
-            geo_coords.append((x, y))
-            geo_splits.append(str(meta.get("split") or "train"))
-        if geo_indices:
-            pre_dist = torch.linalg.norm(anchor_tensor - target_tensor, dim=1).detach().cpu().numpy()
-            post_dist = torch.linalg.norm(projected_anchor - projected_target, dim=1).detach().cpu().numpy()
-            pre_geo = pre_dist[geo_indices]
-            post_geo = post_dist[geo_indices]
-            geo_x = np.asarray([coord[0] for coord in geo_coords], dtype=float)
-            geo_y = np.asarray([coord[1] for coord in geo_coords], dtype=float)
-            vmin = float(min(pre_geo.min(), post_geo.min()))
-            vmax = float(max(pre_geo.max(), post_geo.max()))
-            if vmax - vmin < 1e-6:
-                vmax = vmin + 1e-6
-
-            fig, axes = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True, sharex=True, sharey=True)
-            for ax, values, title in (
-                (axes[0], pre_geo, "Pre-DCCA"),
-                (axes[1], post_geo, "Post-DCCA"),
-            ):
-                val_mask = np.array([split == "val" for split in geo_splits], dtype=bool)
-                sc = ax.scatter(
-                    geo_x,
-                    geo_y,
-                    c=values,
-                    cmap="viridis",
-                    vmin=vmin,
-                    vmax=vmax,
-                    s=40,
-                    alpha=0.9,
-                )
-                if val_mask.any():
-                    ax.scatter(
-                        geo_x[val_mask],
-                        geo_y[val_mask],
-                        facecolors="none",
-                        edgecolors="black",
-                        linewidths=0.8,
-                        s=60,
-                        label="Validation",
-                    )
-                    ax.legend(loc="upper right")
-                ax.set_title(f"{title} Pairwise Distance")
-                ax.set_xlabel("Longitude")
-                ax.set_ylabel("Latitude")
-                color_label = (
-                    "||Latent_base(A) - Latent_base(B)||" if title == "Pre-DCCA" else "||Latent_DCCA(A) - Latent_DCCA(B)||"
-                )
-                fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04, label=color_label)
-            geo_path = analysis_dir / "geospatial_distance_map.png"
-            fig.suptitle("Pairwise Distance Heatmap (Anchor vs Target)")
-            fig.savefig(geo_path, dpi=200, bbox_inches="tight")
-            plt.close(fig)
-            run_logger.log(f"Saved geospatial distance heatmap to {geo_path}")
-    except Exception as exc:
-        run_logger.log(f"Failed to create geospatial distance map: {exc}")
+    pos_set: set[Tuple[str, int, int]] = set()
+    neg_set: set[Tuple[str, int, int]] = set()
+    for collection, target in ((pos_entries, pos_set), (neg_entries, neg_set)):
+        if not isinstance(collection, list):
+            continue
+        for entry in collection:
+            if isinstance(entry, dict):
+                key = _to_key(entry)
+                if key is not None:
+                    target.add(key)
+    return {"pos": pos_set, "neg": neg_set}
 
 
 def _lookup_pn_label(region: Optional[str], row_col: Optional[Tuple[int, int]], lookup: Optional[Dict[str, set[Tuple[str, int, int]]]]) -> Optional[int]:
@@ -2374,22 +2221,6 @@ def _compute_overlap_debug(
         "positive_pairs": overlapping_positive_pairs,
     }
 
-def _prepare_output_dir(primary: Optional[Path], fallback_relative: str) -> Optional[Path]:
-    if primary is not None:
-        try:
-            primary.mkdir(parents=True, exist_ok=True)
-            return primary
-        except Exception as exc:
-            print(f"[warn] Unable to create directory {primary}: {exc}. Falling back to local path.")
-    fallback = Path.cwd() / fallback_relative
-    try:
-        fallback.mkdir(parents=True, exist_ok=True)
-        return fallback
-    except Exception as exc:
-        print(f"[warn] Unable to create fallback directory {fallback}: {exc}")
-        return None
-
-
 class _RunLogger:
     def __init__(self, cfg: AlignmentConfig):
         base = cfg.output_dir if cfg.output_dir is not None else cfg.log_dir
@@ -2408,151 +2239,6 @@ class _RunLogger:
             except Exception as exc:
                 print(f"[warn] Unable to append to run log {self.path}: {exc}")
         print(f"[run-log] {message}")
-
-
-def _persist_state(
-    cfg: AlignmentConfig,
-    proj_a: nn.Module,
-    proj_b: nn.Module,
-    #summary: Dict[str, object],
-    *,
-    filename: str = "overlap_alignment_stage1.pt",
-) -> None:
-    primary = None
-    if cfg.output_dir is not None:
-        primary = cfg.output_dir
-    elif cfg.log_dir is not None:
-        primary = cfg.log_dir
-    target_dir = _prepare_output_dir(primary, "overlap_alignment_outputs")
-    if target_dir is None:
-        return
-
-    state_path = target_dir / filename
-    payload = {
-        "projection_head_a": proj_a.state_dict(),
-        "projection_head_b": proj_b.state_dict(),
-    #    "summary": summary,
-    }
-    try:
-        torch.save(payload, state_path)
-        print(f"[info] saved stage-1 weights to {state_path}")
-    except Exception as exc:
-        print(f"[warn] Unable to persist training state: {exc}")
-        fallback_dir = _prepare_output_dir(None, "overlap_alignment_outputs")
-        if fallback_dir is not None:
-            alt_path = fallback_dir / state_path.name
-            try:
-                torch.save(payload, alt_path)
-                print(f"[info] saved stage-1 weights to fallback location {alt_path}")
-            except Exception as exc_fallback:
-                print(f"[warn] Unable to persist training state to fallback location: {exc_fallback}")
-
-
-def _persist_metrics(
-    cfg: AlignmentConfig,
-    summary: Dict[str, object],
-    epoch_history: Sequence[Dict[str, float]],
-    *,
-    filename: str = "overlap_alignment_stage1_metrics.json",
-) -> None:
-    primary = None
-    if cfg.output_dir is not None:
-        primary = cfg.output_dir
-    elif cfg.log_dir is not None:
-        primary = cfg.log_dir
-    target_dir = _prepare_output_dir(primary, "overlap_alignment_outputs")
-    if target_dir is None:
-        return
-    metrics_path = target_dir / filename
-    payload = {
-        "summary": summary,
-        "epoch_history": list(epoch_history),
-    }
-
-    try:
-        with metrics_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
-        print(f"[info] saved metrics to {metrics_path}")
-    except Exception as exc:
-        print(f"[warn] Unable to persist metrics: {exc}")
-        fallback_dir = _prepare_output_dir(None, "overlap_alignment_outputs")
-        if fallback_dir is not None:
-            fallback_path = fallback_dir / metrics_path.name
-            try:
-                with fallback_path.open("w", encoding="utf-8") as handle:
-                    json.dump(payload, handle, indent=2)
-                print(f"[info] saved metrics to fallback location {fallback_path}")
-            except Exception as exc_fallback:
-                print(f"[warn] Unable to persist metrics to fallback location: {exc_fallback}")
-
-
-def _maybe_save_debug_figures(cfg: AlignmentConfig, debug_data: Optional[Dict[str, List[Dict[str, object]]]]) -> None:
-    if debug_data is None:
-        print("[warn] Debug data unavailable; skipping figure generation.")
-        return
-    viz_primary = None
-    if cfg.output_dir is not None:
-        viz_primary = cfg.output_dir / "overlap_visualizations" / "overlap"
-    elif cfg.log_dir is not None:
-        viz_primary = cfg.log_dir / "overlap_visualizations" / "overlap"
-    viz_dir = _prepare_output_dir(viz_primary, "overlap_alignment_debug/overlap_visualizations/overlap")
-    if viz_dir is None:
-        return
-
-    geometry = None
-    overlap_json = cfg.overlap_pairs_path or cfg.overlap_pairs_augmented_path
-    if overlap_json is not None:
-        try:
-            with Path(overlap_json).open("r", encoding="utf-8") as handle:
-                doc = json.load(handle)
-            geometry = doc.get("overlap", {}).get("geometry")
-        except Exception:
-            geometry = None
-
-    anchor_samples = debug_data.get("anchor_positive", []) or []
-    target_samples = debug_data.get("target_positive", []) or []
-    anchor_label = (
-        anchor_samples[0].get("dataset")
-        if anchor_samples and anchor_samples[0].get("dataset")
-        else debug_data.get("anchor_name", "anchor")
-    )
-    target_label = (
-        target_samples[0].get("dataset")
-        if target_samples and target_samples[0].get("dataset")
-        else debug_data.get("target_name", "target")
-    )
-
-    anchor_serialised = [_serialise_sample(sample) for sample in anchor_samples]
-    target_serialised = [_serialise_sample(sample) for sample in target_samples]
-    plot_path = viz_dir / "debug_positive_overlap.png"
-    save_overlap_debug_plot(
-        plot_path,
-        geometry,
-        anchor_serialised,
-        target_serialised,
-        title="Positive overlap",
-        anchor_label=str(anchor_label),
-        target_label=str(target_label),
-        centroid_points=None,
-    )
-    print(f"[info] saved debug figure to {plot_path}")
-
-    if cfg.use_positive_augmentation:
-        aug_anchor = [sample for sample in anchor_serialised if sample.get("is_augmented")]
-        aug_target = [sample for sample in target_serialised if sample.get("is_augmented")]
-        if aug_anchor or aug_target:
-            aug_path = viz_dir / "debug_positive_aug_overlap.png"
-            save_overlap_debug_plot(
-                aug_path,
-                geometry,
-                aug_anchor or anchor_serialised,
-                aug_target or target_serialised,
-                title="Positive overlap (augmented)",
-                anchor_label=str(anchor_label),
-                target_label=str(target_label),
-                centroid_points=None,
-            )
-            print(f"[info] saved debug figure to {aug_path}")
 
 if __name__ == "__main__":
     main()

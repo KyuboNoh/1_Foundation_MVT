@@ -2,12 +2,9 @@
 
 ## Layout
 
-- `overlap_alignment/train.py` — DCCA and CLS training.
-- `overlap_alignment/cli.py` — quick diagnostics over the loaded workspace.
-- `overlap_alignment/config.py` — JSON schema loader (updated format from `v0`).
-- `overlap_alignment/datasets.py` — embedding loader exposing region / window / resolution metadata.
-- `overlap_alignment/overlaps.py` — parser for `*_overlap_pairs.json` with robust handling of schema variants.
-- `overlap_alignment/workspace.py` — workspace that pairs embeddings for co-located tiles.
+- `scripts/train.py` — DCCA and CLS training.
+- `scripts/cli.py` — quick diagnostics over the loaded workspace.
+- `scripts/config.py` — JSON schema loader (updated format from `v0`).
 
 ## Stage-1 Overlap Alignment Training 
 
@@ -15,7 +12,7 @@ The stage-1 trainer freezes encoder features and optimises only the projection
 heads using a positive-only, negative-free alignment loss.
 
 ```bash
-python -m Methods.1_UniversalGFM4MPM_v1.overlap_alignment.train --config ./ufm_v1_config_wsl_debug.json --debug
+python -m Methods.1_UniversalGFM4MPM_v1.scripts.train --config ./ufm_v1_config_wsl_debug.json --debug
 ```
 
 ## Stage-2 Train CLS after Overlap Alignment Training

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import math
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -20,6 +22,11 @@ try:  # optional progress bar
 except ImportError:  # pragma: no cover - optional dependency
     tqdm = None
 
+try:  # optional plotting
+    import matplotlib.pyplot as plt
+except ImportError:  # pragma: no cover - optional dependency
+    plt = None
+
 try:  # optional raster IO
     import rasterio
 except ImportError:  # pragma: no cover - optional dependency
@@ -32,7 +39,9 @@ from Common.Unifying.Labels_TwoDatasets.fusion_utils.workspace import (
 from Common.Unifying.Labels_TwoDatasets import (
     _normalise_coord,
     _normalise_row_col,
+    _serialise_sample,
 )
+from Common.overlap_debug_plot import save_overlap_debug_plot
 
 DEFAULT_INFERENCE_BATCH_SIZE = 2048
 
@@ -380,6 +389,378 @@ def _project_in_batches(
             projected = model(chunk).detach().cpu()
             outputs.append(projected)
     return torch.cat(outputs, dim=0)
+
+
+def _prepare_output_dir(primary: Optional[Path], fallback_relative: str) -> Optional[Path]:
+    if primary is not None:
+        try:
+            primary.mkdir(parents=True, exist_ok=True)
+            return primary
+        except Exception as exc:
+            print(f"[warn] Unable to create directory {primary}: {exc}. Falling back to local path.")
+    fallback = Path.cwd() / fallback_relative
+    try:
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+    except Exception as exc:
+        print(f"[warn] Unable to create fallback directory {fallback}: {exc}")
+        return None
+
+
+def _persist_state(
+    cfg: Any,
+    proj_a: nn.Module,
+    proj_b: nn.Module,
+    *,
+    filename: str = "overlap_alignment_stage1.pt",
+) -> None:
+    primary = None
+    if getattr(cfg, "output_dir", None) is not None:
+        primary = cfg.output_dir
+    elif getattr(cfg, "log_dir", None) is not None:
+        primary = cfg.log_dir
+    target_dir = _prepare_output_dir(primary, "overlap_alignment_outputs")
+    if target_dir is None:
+        return
+
+    state_path = target_dir / filename
+    payload = {
+        "projection_head_a": proj_a.state_dict(),
+        "projection_head_b": proj_b.state_dict(),
+    }
+    try:
+        torch.save(payload, state_path)
+        print(f"[info] saved stage-1 weights to {state_path}")
+    except Exception as exc:
+        print(f"[warn] Unable to persist training state: {exc}")
+        fallback_dir = _prepare_output_dir(None, "overlap_alignment_outputs")
+        if fallback_dir is not None:
+            alt_path = fallback_dir / state_path.name
+            try:
+                torch.save(payload, alt_path)
+                print(f"[info] saved stage-1 weights to fallback location {alt_path}")
+            except Exception as exc_fallback:
+                print(f"[warn] Unable to persist training state to fallback location: {exc_fallback}")
+
+
+def _persist_metrics(
+    cfg: Any,
+    summary: Dict[str, object],
+    epoch_history: Sequence[Dict[str, float]],
+    *,
+    filename: str = "overlap_alignment_stage1_metrics.json",
+) -> None:
+    primary = None
+    if getattr(cfg, "output_dir", None) is not None:
+        primary = cfg.output_dir
+    elif getattr(cfg, "log_dir", None) is not None:
+        primary = cfg.log_dir
+    target_dir = _prepare_output_dir(primary, "overlap_alignment_outputs")
+    if target_dir is None:
+        return
+    metrics_path = target_dir / filename
+    payload = {
+        "summary": summary,
+        "epoch_history": list(epoch_history),
+    }
+
+    try:
+        with metrics_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        print(f"[info] saved metrics to {metrics_path}")
+    except Exception as exc:
+        print(f"[warn] Unable to persist metrics: {exc}")
+        fallback_dir = _prepare_output_dir(None, "overlap_alignment_outputs")
+        if fallback_dir is not None:
+            fallback_path = fallback_dir / metrics_path.name
+            try:
+                with fallback_path.open("w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, indent=2)
+                print(f"[info] saved metrics to fallback location {fallback_path}")
+            except Exception as exc_fallback:
+                print(f"[warn] Unable to persist metrics to fallback location: {exc_fallback}")
+
+
+def _maybe_save_debug_figures(cfg: Any, debug_data: Optional[Dict[str, List[Dict[str, object]]]]) -> None:
+    if debug_data is None:
+        print("[warn] Debug data unavailable; skipping figure generation.")
+        return
+    viz_primary = None
+    if getattr(cfg, "output_dir", None) is not None:
+        viz_primary = cfg.output_dir / "overlap_visualizations" / "overlap"
+    elif getattr(cfg, "log_dir", None) is not None:
+        viz_primary = cfg.log_dir / "overlap_visualizations" / "overlap"
+    viz_dir = _prepare_output_dir(viz_primary, "overlap_alignment_debug/overlap_visualizations/overlap")
+    if viz_dir is None:
+        return
+
+    geometry = None
+    overlap_json = getattr(cfg, "overlap_pairs_path", None) or getattr(cfg, "overlap_pairs_augmented_path", None)
+    if overlap_json is not None:
+        try:
+            with Path(overlap_json).open("r", encoding="utf-8") as handle:
+                doc = json.load(handle)
+            geometry = doc.get("overlap", {}).get("geometry")
+        except Exception:
+            geometry = None
+
+    anchor_samples = debug_data.get("anchor_positive", []) or []
+    target_samples = debug_data.get("target_positive", []) or []
+    anchor_label = (
+        anchor_samples[0].get("dataset")
+        if anchor_samples and anchor_samples[0].get("dataset")
+        else debug_data.get("anchor_name", "anchor")
+    )
+    target_label = (
+        target_samples[0].get("dataset")
+        if target_samples and target_samples[0].get("dataset")
+        else debug_data.get("target_name", "target")
+    )
+
+    anchor_serialised = [_serialise_sample(sample) for sample in anchor_samples]
+    target_serialised = [_serialise_sample(sample) for sample in target_samples]
+    plot_path = viz_dir / "debug_positive_overlap.png"
+    save_overlap_debug_plot(
+        plot_path,
+        geometry,
+        anchor_serialised,
+        target_serialised,
+        title="Positive overlap",
+        anchor_label=str(anchor_label),
+        target_label=str(target_label),
+        centroid_points=None,
+    )
+    print(f"[info] saved debug figure to {plot_path}")
+
+    if getattr(cfg, "use_positive_augmentation", False):
+        aug_anchor = [sample for sample in anchor_serialised if sample.get("is_augmented")]
+        aug_target = [sample for sample in target_serialised if sample.get("is_augmented")]
+        if aug_anchor or aug_target:
+            aug_path = viz_dir / "debug_positive_aug_overlap.png"
+            save_overlap_debug_plot(
+                aug_path,
+                geometry,
+                aug_anchor or anchor_serialised,
+                aug_target or target_serialised,
+                title="Positive overlap (augmented)",
+                anchor_label=str(anchor_label),
+                target_label=str(target_label),
+                centroid_points=None,
+            )
+            print(f"[info] saved debug figure to {aug_path}")
+
+
+def _select_subset_indices(total: int, max_points: int, seed: int) -> torch.Tensor:
+    if total <= 0:
+        return torch.empty(0, dtype=torch.long)
+    if total <= max_points:
+        return torch.arange(total, dtype=torch.long)
+    generator = torch.Generator()
+    generator.manual_seed(int(seed))
+    perm = torch.randperm(total, generator=generator)
+    return perm[:max_points]
+
+
+def _reduce_dimensionality(features: np.ndarray, random_state: int = 42) -> np.ndarray:
+    if features.shape[0] < 2:
+        return np.zeros((features.shape[0], 2), dtype=np.float32)
+    features = np.asarray(features, dtype=np.float32)
+    try:
+        import umap  # type: ignore
+
+        reducer = umap.UMAP(n_components=2, random_state=random_state)
+        embedding = reducer.fit_transform(features)
+        if embedding.shape[1] == 2:
+            return embedding
+    except Exception:
+        pass
+    try:
+        from sklearn.manifold import TSNE  # type: ignore
+
+        perplexity = max(5, min(30, features.shape[0] // 3))
+        reducer = TSNE(n_components=2, random_state=random_state, perplexity=perplexity, init="pca")
+        embedding = reducer.fit_transform(features)
+        if embedding.shape[1] == 2:
+            return embedding
+    except Exception:
+        pass
+    try:
+        from sklearn.decomposition import PCA  # type: ignore
+
+        reducer = PCA(n_components=2, random_state=random_state)
+        embedding = reducer.fit_transform(features)
+        if embedding.shape[1] == 2:
+            return embedding
+    except Exception:
+        pass
+    if features.shape[1] >= 2:
+        return features[:, :2]
+    pad = np.zeros((features.shape[0], 2), dtype=np.float32)
+    pad[:, 0] = features[:, 0]
+    return pad
+
+
+def _create_debug_alignment_figures(
+    *,
+    cfg: Any,
+    projector_a: nn.Module,
+    projector_b: nn.Module,
+    anchor_tensor: torch.Tensor,
+    target_tensor: torch.Tensor,
+    pair_metadata: Sequence[Dict[str, object]],
+    run_logger: Any,
+    drop_ratio: float,
+    tcc_ratio: float,
+    dcca_eps: float,
+    device: torch.device,
+    sample_seed: int,
+) -> None:
+    if plt is None:
+        run_logger.log("matplotlib is unavailable; skipping advanced debug figures.")
+        return
+
+    analysis_primary = None
+    if getattr(cfg, "output_dir", None) is not None:
+        analysis_primary = cfg.output_dir / "overlap_visualizations" / "alignment_analysis"
+    elif getattr(cfg, "log_dir", None) is not None:
+        analysis_primary = cfg.log_dir / "overlap_visualizations" / "alignment_analysis"
+    analysis_dir = _prepare_output_dir(analysis_primary, "overlap_alignment_outputs/alignment_analysis")
+    if analysis_dir is None:
+        run_logger.log("Unable to prepare alignment analysis directory; skipping figures.")
+        return
+
+    try:
+        analysis_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        run_logger.log(f"Failed to create alignment analysis directory {analysis_dir}: {exc}")
+        return
+
+    if anchor_tensor.size(0) == 0 or target_tensor.size(0) == 0:
+        run_logger.log("No samples available for debug plotting.")
+        return
+
+    analysis_batch = max(32, min(2048, anchor_tensor.size(0)))
+    projected_anchor = _project_in_batches(anchor_tensor, projector_a, device, analysis_batch)
+    projected_target = _project_in_batches(target_tensor, projector_b, device, analysis_batch)
+
+    try:
+        subset_indices = _select_subset_indices(anchor_tensor.size(0), max_points=1000, seed=sample_seed)
+        subset_list = subset_indices.tolist()
+        if subset_indices.numel() >= 2:
+            anchor_raw = anchor_tensor.detach().cpu()
+            target_raw = target_tensor.detach().cpu()
+            proj_anchor_raw = projected_anchor.detach().cpu()
+            proj_target_raw = projected_target.detach().cpu()
+
+            before_features = torch.cat(
+                [anchor_raw[subset_indices], target_raw[subset_indices]], dim=0
+            ).numpy()
+            after_features = torch.cat(
+                [proj_anchor_raw[subset_indices], proj_target_raw[subset_indices]], dim=0
+            ).numpy()
+
+            embedding_before = _reduce_dimensionality(before_features, random_state=sample_seed)
+            embedding_after = _reduce_dimensionality(after_features, random_state=sample_seed + 1)
+
+            num_subset = subset_indices.numel()
+            coords_before_anchor = embedding_before[:num_subset]
+            coords_before_target = embedding_before[num_subset:]
+            coords_after_anchor = embedding_after[:num_subset]
+            coords_after_target = embedding_after[num_subset:]
+
+            fig, axes = plt.subplots(1, 2, figsize=(13, 6), constrained_layout=True)
+            colors = {"anchor": "#1f77b4", "target": "#ff7f0e"}
+            for ax, coords_anchor, coords_target, title in (
+                (axes[0], coords_before_anchor, coords_before_target, "Embeddings (pre-DCCA)"),
+                (axes[1], coords_after_anchor, coords_after_target, "Embeddings (post-DCCA)"),
+            ):
+                ax.scatter(
+                    coords_anchor[:, 0],
+                    coords_anchor[:, 1],
+                    c=colors["anchor"],
+                    label="Anchor",
+                    alpha=0.6,
+                    s=20,
+                )
+                ax.scatter(
+                    coords_target[:, 0],
+                    coords_target[:, 1],
+                    c=colors["target"],
+                    label="Target",
+                    alpha=0.6,
+                    s=20,
+                    marker="s",
+                )
+                val_anchor_x = []
+                val_anchor_y = []
+                val_target_x = []
+                val_target_y = []
+                for i, idx in enumerate(subset_list):
+                    if i >= coords_anchor.shape[0]:
+                        break
+                    split = pair_metadata[idx].get("split") if idx < len(pair_metadata) else None
+                    if split == "val":
+                        val_anchor_x.append(coords_anchor[i, 0])
+                        val_anchor_y.append(coords_anchor[i, 1])
+                        val_target_x.append(coords_target[i, 0])
+                        val_target_y.append(coords_target[i, 1])
+                    ax.plot(
+                        [coords_anchor[i, 0], coords_target[i, 0]],
+                        [coords_anchor[i, 1], coords_target[i, 1]],
+                        color="gray",
+                        alpha=0.2,
+                        linewidth=0.5,
+                    )
+                if val_anchor_x:
+                    ax.scatter(
+                        val_anchor_x,
+                        val_anchor_y,
+                        facecolors="none",
+                        edgecolors="black",
+                        linewidths=0.7,
+                        s=40,
+                        label="Anchor (val)" if ax is axes[0] else None,
+                    )
+                if val_target_x:
+                    ax.scatter(
+                        val_target_x,
+                        val_target_y,
+                        facecolors="none",
+                        edgecolors="black",
+                        linewidths=0.7,
+                        s=40,
+                        marker="s",
+                        label="Target (val)" if ax is axes[0] else None,
+                    )
+                ax.set_title(title)
+                ax.set_xlabel("Component 1")
+                ax.set_ylabel("Component 2")
+            axes[1].legend(loc="upper right")
+            tsne_path = analysis_dir / "alignment_tsne_umap.png"
+            fig.savefig(tsne_path, dpi=200)
+            plt.close(fig)
+            run_logger.log(f"Saved t-SNE/UMAP alignment figure to {tsne_path}")
+    except Exception as exc:
+        run_logger.log(f"Failed to create t-SNE/UMAP figure: {exc}")
+
+    try:
+        latent_metrics = _canonical_metrics(
+            projector_a=projector_a,
+            projector_b=projector_b,
+            anchor_tensor=anchor_tensor,
+            target_tensor=target_tensor,
+            device=device,
+            drop_ratio=drop_ratio,
+            tcc_ratio=tcc_ratio,
+            dcca_eps=dcca_eps,
+            batch_size=analysis_batch,
+        )
+        metrics_path = analysis_dir / "alignment_metrics.json"
+        with metrics_path.open("w", encoding="utf-8") as handle:
+            json.dump(latent_metrics, handle, indent=2)
+        run_logger.log(f"Saved alignment metrics to {metrics_path}")
+    except Exception as exc:
+        run_logger.log(f"Failed to compute alignment metrics: {exc}")
 
 def _get_bundle_embeddings(bundle: DatasetBundle) -> torch.Tensor:
     if bundle.embeddings is not None and bundle.embeddings.numel() > 0:
@@ -932,6 +1313,13 @@ __all__ = [
     "_has_nonfinite_gradients",
     "_canonical_metrics",
     "_project_in_batches",
+    "_prepare_output_dir",
+    "_persist_state",
+    "_persist_metrics",
+    "_maybe_save_debug_figures",
+    "_select_subset_indices",
+    "_reduce_dimensionality",
+    "_create_debug_alignment_figures",
     "_get_bundle_embeddings",
     "_collect_full_dataset_projection",
     "_evaluate_dcca",
