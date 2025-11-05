@@ -745,15 +745,11 @@ def _create_debug_alignment_figures(
 
     try:
         latent_metrics = _canonical_metrics(
-            projector_a=projector_a,
-            projector_b=projector_b,
-            anchor_tensor=anchor_tensor,
-            target_tensor=target_tensor,
-            device=device,
+            anchor_tensor.detach().to(projected_anchor.dtype),
+            target_tensor.detach().to(projected_target.dtype),
+            eps=dcca_eps,
             drop_ratio=drop_ratio,
             tcc_ratio=tcc_ratio,
-            dcca_eps=dcca_eps,
-            batch_size=analysis_batch,
         )
         metrics_path = analysis_dir / "alignment_metrics.json"
         with metrics_path.open("w", encoding="utf-8") as handle:

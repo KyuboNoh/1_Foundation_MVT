@@ -23,7 +23,7 @@
   "optimization": {
     "step1_DCCA": {
       "batch_size": 256,
-      "epochs": 60,
+      "epochs": 2,
       "lr": 0.0005,
       "projection_dim": 128,
       "mlp_hidden_dims": [256, 128],

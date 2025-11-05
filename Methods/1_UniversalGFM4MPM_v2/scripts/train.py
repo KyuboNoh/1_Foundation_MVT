@@ -76,6 +76,7 @@ from Common.Augmentation import (
 )
 from Common.Unifying.DCCA import (
     _format_optional_scalar,
+    _project_in_batches,
     _load_pretrained_dcca_state,
     _projection_head_from_state,
     _resolve_dcca_weights_path,
@@ -488,6 +489,14 @@ def main() -> None:
 
         actual_validation_fraction = val_indices.numel() / total_pairs if val_indices.numel() else 0.0
 
+        fused_target_vecs: List[torch.Tensor] = list(target_vecs)
+        agg_epoch_history: List[Dict[str, object]] = []
+        agg_proj_dim = cfg.projection_dim or (target_vecs[0].numel() if target_vecs else 0)
+        agg_failure_reason: Optional[str] = None
+        projector_a_head: Optional[nn.Module] = nn.Identity()
+        target_head: Optional[nn.Module] = nn.Identity()
+        agg_success = True
+
         if use_transformer_agg and target_stack_per_anchor:
             agg_num_layers = int(args.agg_trans_num_layers) if args.agg_trans_num_layers is not None else 4
             agg_num_layers = max(1, agg_num_layers)
@@ -507,6 +516,12 @@ def main() -> None:
             if cfg.projection_dim % agg_num_heads != 0:
                 cfg.projection_dim = agg_num_heads * max(1, math.ceil(cfg.projection_dim / agg_num_heads))
             try:
+                agg_success = False
+                projector_a_head = None
+                target_head = None
+                agg_epoch_history = []
+                fused_target_vecs = []
+                agg_proj_dim = cfg.projection_dim
                 run_logger.log(
                     "[agg] Training transformer aggregator (layers={layers}, heads={heads}, steps={steps}, "
                     "batch_size={batch}, dropout={drop:.3f})".format(
@@ -517,7 +532,7 @@ def main() -> None:
                         drop=agg_dropout,
                     )
                 )
-                train_success, projector_a_anchor_identity, projector_b_trans_aggregator, epoch_history, final_proj_dim, failure_reason = _train_transformer_aggregator(
+                agg_success, projector_a_head, target_head, agg_epoch_history, agg_proj_dim, agg_failure_reason = _train_transformer_aggregator(
                     anchor_vecs_train,
                     target_stack_train,
                     metadata_train,
@@ -537,41 +552,42 @@ def main() -> None:
                     use_positional_encoding=bool(getattr(args, "agg_trans_pos_enc", False)),
                     run_logger=run_logger,
                 )
-                if not train_success or projector_b_trans_aggregator is None:
-                    run_logger.log(f"[agg] Transformer aggregator training failed: {agg_failure or 'unknown error'}")
+                fused_target_vecs: List[torch.Tensor] = []
+                if not agg_success or projector_a_head is None or target_head is None:
+                    run_logger.log(f"[agg] Transformer aggregator training failed: {agg_failure_reason or 'unknown error'}")
                 else:
-                    fused_targets = _apply_transformer_aggregator(
-                        projector_b_trans_aggregator,
+                    agg_success = True
+                    fused_target_vecs = _apply_transformer_target_head(
+                        target_head,
                         anchor_vecs,
                         target_stack_per_anchor,
                         pair_metadata,
                         batch_size=train_batch_size,
                         device=device,
-                        use_positional_encoding=bool(getattr(args, "agg_trans_pos_enc", False)),
                     )
-                    if fused_targets and len(fused_targets) == len(target_vecs):
-                        fused_target_vecs = fused_targets
-                        run_logger.log(f"[agg] Transformer aggregator applied to {len(fused_target_vecs)} pairs (dim={cfg.projection_dim}).")
+                    if fused_target_vecs and len(fused_target_vecs) == len(target_vecs):
+                        target_vecs = fused_target_vecs
+                        run_logger.log(f"[agg] Transformer aggregator applied to {len(target_vecs)} pairs (dim={cfg.projection_dim}).")
                     else:
                         run_logger.log("[agg] Transformer aggregator output size mismatch; skipping fused targets.")
-                if train_success and projector_b_trans_aggregator is not None and epoch_history:
+                if agg_success and target_head is not None and agg_epoch_history:
                     run_logger.log(
                         "[agg] Completed transformer aggregator training: final_loss={loss}, final_mean_corr={corr}".format(
-                            loss=_format_optional_scalar(epoch_history[-1].get("train_eval_loss")),
-                            corr=_format_optional_scalar(epoch_history[-1].get("train_eval_mean_correlation")),
+                            loss=_format_optional_scalar(agg_epoch_history[-1].get("train_eval_loss")),
+                            corr=_format_optional_scalar(agg_epoch_history[-1].get("train_eval_mean_correlation")),
                         )
                     )
             except Exception as exc:
                 run_logger.log(f"[agg] Transformer aggregator failed: {exc}")
 
 
-        last_history_dcca = epoch_history[-1] if epoch_history else {}
+        last_history_agg = agg_epoch_history[-1] if agg_epoch_history else {}
         trans_agg_dcca_summary = {
             "objective": objective,
             "aggregator": cfg.aggregator,
             "use_positive_only": cfg.use_positive_only,
             "use_positive_augmentation": cfg.use_positive_augmentation,
-            "projection_dim": final_proj_dim,
+            "projection_dim": agg_proj_dim,
             "projection_layers": mlp_layers,
             "train_dcca": train_dcca,
             "read_dcca": read_dcca,
@@ -588,11 +604,11 @@ def main() -> None:
             "batch_size": train_batch_size,
             "lr": cfg.dcca_training.lr,
             "max_coord_error": max_coord_error,
-            "final_loss": last_history_dcca.get("train_eval_loss", last_history_dcca.get("loss")),
-            "final_mean_correlation": last_history_dcca.get("train_eval_mean_correlation", last_history_dcca.get("mean_correlation")),
-            "final_train_tcc": last_history_dcca.get("train_eval_tcc"),
-            "final_train_tcc_mean": last_history_dcca.get("train_eval_tcc_mean"),
-            "final_train_tcc_k": int(last_history_dcca["train_eval_k"]) if last_history_dcca.get("train_eval_k") is not None else None,
+            "final_loss": last_history_agg.get("train_eval_loss", last_history_agg.get("loss")),
+            "final_mean_correlation": last_history_agg.get("train_eval_mean_correlation", last_history_agg.get("mean_correlation")),
+            "final_train_tcc": last_history_agg.get("train_eval_tcc"),
+            "final_train_tcc_mean": last_history_agg.get("train_eval_tcc_mean"),
+            "final_train_tcc_k": int(last_history_agg["train_eval_k"]) if last_history_agg.get("train_eval_k") is not None else None,
             "train_pairs": len(train_indices_list),
             "validation_pairs": len(val_indices_list) if val_indices_list is not None else 0,
             "validation_fraction": actual_validation_fraction,
@@ -608,37 +624,46 @@ def main() -> None:
             # "cross_index_matches": label_cross_matches,
         }
 
-        if not train_success or projector_a_anchor_identity is None or projector_b_trans_aggregator is None:
-            raise RuntimeError(f"DCCA training failed: {failure_reason or 'unknown error'}")    
+        if not agg_success or projector_a_head is None or target_head is None:
+            raise RuntimeError(f"Transformer aggregator training failed: {agg_failure_reason or 'unknown error'}")
 
-        _persist_state(cfg, projector_a_anchor_identity, projector_b_trans_aggregator, filename="overlap_alignment_stage1_dcca.pt")
+        _persist_state(cfg, projector_a_head, target_head, filename="overlap_alignment_stage1_dcca.pt")
         _persist_metrics(
             cfg,
             trans_agg_dcca_summary,
-            epoch_history,
+            agg_epoch_history,
             filename="overlap_alignment_stage1_dcca_metrics.json",
         )
+
+        projector_a = projector_a_head
+        projector_b = target_head
 
         if debug_mode:
             _maybe_save_debug_figures(cfg, debug_data)
 
-            # Identity projectors for anchor (no change) and target (aggregated) and anchor and fused target vectors are feed on purpose (workaround to reuse _create_debug_alignment_figures). K.N. Nov 5th, 2025
+            # Precompute latent features so we can reuse the shared debug helper with identity heads. K.N. Nov 5th, 2025
+            anchor_latent_tensor = _project_in_batches(
+                torch.stack(anchor_vecs),
+                projector_a_head,
+                device,
+                max(32, cfg.dcca_training.batch_size),
+            )
+            target_latent_tensor = torch.stack(fused_target_vecs) if fused_target_vecs else torch.stack(target_vecs)
+
             _create_debug_alignment_figures(
                 cfg=cfg,
                 projector_a=nn.Identity(),
                 projector_b=nn.Identity(),
-                anchor_tensor=torch.stack(anchor_vecs),
-                target_tensor=torch.stack(fused_target_vecs),
+                anchor_tensor=anchor_latent_tensor,
+                target_tensor=target_latent_tensor,
                 pair_metadata=pair_metadata,
                 run_logger=run_logger,
                 drop_ratio=drop_ratio,
                 tcc_ratio=tcc_ratio,
                 dcca_eps=dcca_eps_value,
-                device=device, 
+                device=device,
                 sample_seed=int(cfg.seed),
             )
-        print("debugging done")
-        exit()
     #################################### Training Overlap Alignment (DCCA) END ####################################
 
     #################################### Temporal Debugging Module ####################################
@@ -769,12 +794,11 @@ def main() -> None:
     #################################### Temporal Debugging Module ####################################
 
 
-    exit("debugging done")
     #################################### Training Classifier after Overlap Alignment ####################################
     if args.train_cls:
         
         if not train_dcca:
-            # TODO: projector_a_anchor_identity, projector_b_trans_aggregator
+            # Ensure projection heads are available when skipping fresh training.
             projector_missing = ('projector_a' not in locals() or projector_a is None or
                                  'projector_b' not in locals() or projector_b is None)
             weights_candidate = _resolve_dcca_weights_path(cfg, args.dcca_weights_path)
@@ -1254,6 +1278,30 @@ class CrossAttentionAggregator(nn.Module):
         return fused
 
 
+class AggregatorTargetHead(nn.Module):
+    def __init__(self, aggregator: CrossAttentionAggregator, proj_target: nn.Module, *, use_positional_encoding: bool) -> None:
+        super().__init__()
+        self.aggregator = aggregator
+        self.proj_target = proj_target
+        self.use_positional_encoding = bool(use_positional_encoding)
+
+    def forward(
+        self,
+        anchor_batch: torch.Tensor,
+        target_batch: torch.Tensor,
+        *,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        pos_encoding: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        fused = self.aggregator(
+            anchor_batch,
+            target_batch,
+            key_padding_mask=key_padding_mask,
+            pos_encoding=pos_encoding if self.aggregator.use_positional_encoding else None,
+        )
+        return self.proj_target(fused)
+
+
 def _train_transformer_aggregator(
     anchor_vecs: Sequence[torch.Tensor],
     target_stack_per_anchor: Sequence[torch.Tensor],
@@ -1274,13 +1322,17 @@ def _train_transformer_aggregator(
     drop_ratio: float,
     use_positional_encoding: bool,
     run_logger: "_RunLogger",
-) -> Tuple[bool, Optional[CrossAttentionAggregator], Optional[nn.Module], List[Dict[str, object]], int, Optional[str]]:
+) -> Tuple[bool, Optional[nn.Module], Optional[AggregatorTargetHead], List[Dict[str, object]], int, Optional[str]]:
     if not anchor_vecs or not target_stack_per_anchor:
-        return None
+        failure = "Transformer aggregator requires non-empty anchor/target stacks."
+        run_logger.log(f"[agg] {failure}")
+        return False, None, None, [], agg_dim, failure
 
     train_dataset = TargetSetDataset(anchor_vecs, target_stack_per_anchor, pair_metadata)
     if len(train_dataset) == 0:
-        return None
+        failure = "Transformer aggregator received empty training dataset."
+        run_logger.log(f"[agg] {failure}")
+        return False, None, None, [], agg_dim, failure
 
     collate_fn = lambda batch: _collate_target_sets(batch, use_positional_encoding)
     train_loader = DataLoader(
@@ -1335,8 +1387,12 @@ def _train_transformer_aggregator(
     )
     if steps <= 0:
         aggregator.eval()
+        proj_anchor.eval()
+        proj_target.eval()
+        target_head = AggregatorTargetHead(aggregator, proj_target, use_positional_encoding=use_positional_encoding)
+        target_head.eval()
         run_logger.log("[agg] No training steps requested; returning aggregator in eval mode.")
-        return True, aggregator, None, [], agg_dim, None
+        return True, proj_anchor, target_head, [], agg_dim, None
 
     def _evaluate(loader: Optional[DataLoader]) -> Optional[Dict[str, object]]:
         if loader is None:
@@ -1471,29 +1527,28 @@ def _train_transformer_aggregator(
                 "projection_dim": int(agg_dim),
             }
         )
-    
-    anchor_identity = nn.Identity()
     aggregator.eval()
     proj_anchor.eval()
     proj_target.eval()
-    return True, anchor_identity, aggregator, epoch_history, agg_dim, failure_reason
+    target_head = AggregatorTargetHead(aggregator, proj_target, use_positional_encoding=use_positional_encoding)
+    target_head.eval()
+    return True, proj_anchor, target_head, epoch_history, agg_dim, failure_reason
 
 
-def _apply_transformer_aggregator(
-    aggregator: CrossAttentionAggregator,
+def _apply_transformer_target_head(
+    target_head: AggregatorTargetHead,
     anchor_vecs: Sequence[torch.Tensor],
     target_stack_per_anchor: Sequence[torch.Tensor],
     pair_metadata: Sequence[Dict[str, object]],
     *,
     batch_size: int,
     device: torch.device,
-    use_positional_encoding: bool,
 ) -> List[torch.Tensor]:
     dataset = TargetSetDataset(anchor_vecs, target_stack_per_anchor, pair_metadata)
-    collate_fn = lambda batch: _collate_target_sets(batch, use_positional_encoding)
+    collate_fn = lambda batch: _collate_target_sets(batch, target_head.aggregator.use_positional_encoding)
     loader = DataLoader(dataset, batch_size=max(1, batch_size), shuffle=False, drop_last=False, collate_fn=collate_fn)
     fused_outputs: List[torch.Tensor] = []
-    aggregator.eval()
+    target_head.eval()
     with torch.no_grad():
         for anchor_batch, target_batch, mask_batch, pos_batch in loader:
             anchor_batch = anchor_batch.to(device)
@@ -1501,8 +1556,8 @@ def _apply_transformer_aggregator(
             mask_batch = mask_batch.to(device)
             if pos_batch is not None:
                 pos_batch = pos_batch.to(device)
-            fused = aggregator(anchor_batch, target_batch, key_padding_mask=mask_batch, pos_encoding=pos_batch)
-            fused_outputs.extend(fused.detach().cpu())
+            output = target_head(anchor_batch, target_batch, key_padding_mask=mask_batch, pos_encoding=pos_batch)
+            fused_outputs.extend(output.detach().cpu())
     return fused_outputs
 
 
