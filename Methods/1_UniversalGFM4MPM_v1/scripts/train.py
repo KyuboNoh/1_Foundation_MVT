@@ -35,11 +35,6 @@ try:  # optional plotting for debug mode
 except ImportError:  # pragma: no cover - optional dependency
     plt = None
 
-try:  # optional raster IO
-    import rasterio
-except ImportError:  # pragma: no cover - optional dependency
-    rasterio = None  # type: ignore[assignment]
-
 try:
     from pyproj import CRS, Transformer
 except Exception:  # pragma: no cover - optional dependency
@@ -56,13 +51,23 @@ from Common.Unifying.Labels_TwoDatasets.datasets import (
     auto_coord_error,
     load_embedding_records,
     summarise_records,
+    _make_mask_reference,
+    _MaskStack,
+    _load_pn_lookup,
+    _count_pn_lookup, 
+    _build_dataloaders,
 )
-from Common.Unifying.Labels_TwoDatasets.overlaps import load_overlap_pairs
+from Common.Unifying.Labels_TwoDatasets.overlaps import (
+    load_overlap_pairs,
+    _extract_reembedding_overlap,
+    _load_overlap_mask_data,
+)
 from sklearn.model_selection import train_test_split
 
 from Common.cls.infer.infer_maps import (group_coords, mc_predict_map_from_embeddings, write_prediction_outputs,)
 from Common.cls.models.mlp_dropout import MLPDropout
 from Common.cls.training.train_cls import (dataloader_metric_inputORembedding, eval_classifier, train_classifier,)
+from Common.cls.miscellaneous import _prepare_classifier_dir
 from Common.metrics_logger import DEFAULT_METRIC_ORDER, log_metrics, normalize_metrics, save_metrics_json
 from Common.Unifying.Labels_TwoDatasets import (
     _normalise_cross_matches,
@@ -71,11 +76,13 @@ from Common.Unifying.Labels_TwoDatasets import (
     _build_aligned_pairs_SetToSet,
     _normalise_coord,
     _normalise_row_col,
+    _collect_classifier_samples,
 )
 from Common.Unifying.Labels_TwoDatasets.fusion_utils import (
     align_overlap_embeddings_for_pn_one_to_one as _align_overlap_embeddings_for_pn_OneToOne,
     prepare_fusion_overlap_dataset_one_to_one as _prepare_fusion_overlap_dataset_OneToOne,
     prepare_fusion_overlap_dataset_for_inference as _prepare_fusion_overlap_dataset_for_inference,
+    fusion_export_results as _fusion_export_results,
 )
 from Common.Augmentation import (
     _load_augmented_embeddings,
@@ -475,6 +482,7 @@ def main() -> None:
 
         if read_dcca and weights_path is not None:
             run_logger.log(f"Reading DCCA weights from {weights_path}")
+        else:
             run_logger.log(
                 "Starting stage-1 overlap alignment with initial projection_dim={proj}; "
                 "train_pairs={train}, val_pairs={val}, validation_fraction={vf:.3f}, "
@@ -1106,249 +1114,20 @@ def main() -> None:
 
 
 
-def _load_pn_lookup(path: Optional[Path]) -> Optional[Dict[str, set[Tuple[str, int, int]]]]:
-    if path is None:
-        return None
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except FileNotFoundError:
-        return None
-    except json.JSONDecodeError:
-        return None
-    pos_entries = payload.get("pos") or []
-    neg_entries = payload.get("neg") or []
-    def _to_key(entry: Dict[str, object]) -> Optional[Tuple[str, int, int]]:
-        region = entry.get("region")
-        row = entry.get("row")
-        col = entry.get("col")
-        if region is None or row is None or col is None:
-            return None
-        try:
-            return (str(region).upper(), int(row), int(col))
-        except Exception:
-            return None
-    pos_set: set[Tuple[str, int, int]] = set()
-    neg_set: set[Tuple[str, int, int]] = set()
-    for collection, target in ((pos_entries, pos_set), (neg_entries, neg_set)):
-        if not isinstance(collection, list):
-            continue
-        for entry in collection:
-            if isinstance(entry, dict):
-                key = _to_key(entry)
-                if key is not None:
-                    target.add(key)
-    return {"pos": pos_set, "neg": neg_set}
+# class ClassifierHead(nn.Module):
+#     def __init__(self, in_dim: int, hidden_mult: float = 2.0):
+#         super().__init__()
+#         hidden = max(32, int(in_dim * hidden_mult))
+#         self.net = nn.Sequential(
+#             nn.Linear(in_dim, hidden),
+#             nn.ReLU(inplace=True),
+#             nn.Linear(hidden, 1),
+#         )
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         return self.net(x)
 
 
-def _lookup_pn_label(region: Optional[str], row_col: Optional[Tuple[int, int]], lookup: Optional[Dict[str, set[Tuple[str, int, int]]]]) -> Optional[int]:
-    if lookup is None or region is None or row_col is None:
-        return None
-    region_key = str(region).upper()
-    row, col = row_col
-    key = (region_key, int(row), int(col))
-    if key in lookup["pos"]:
-        return 1
-    if key in lookup["neg"]:
-        return 0
-    return None
-
-
-class ClassifierHead(nn.Module):
-    def __init__(self, in_dim: int, hidden_mult: float = 2.0):
-        super().__init__()
-        hidden = max(32, int(in_dim * hidden_mult))
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, 1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-def _prepare_classifier_dir(
-    cfg: AlignmentConfig,
-    method_id: int,
-    *name_tokens: str,
-) -> Optional[Path]:
-    
-    primary = cfg.output_dir if cfg.output_dir is not None else cfg.log_dir
-    suffix = f"CLS_Method_{method_id}"
-    sanitized: List[str] = []
-    for token in name_tokens:
-        text = str(token).strip()
-        if not text:
-            continue
-        text = text.replace("\\", "_").replace("/", "_").replace(" ", "_")
-        sanitized.append(text)
-    if sanitized:
-        suffix += "_Data_" + "_".join(sanitized)
-    return _prepare_output_dir(primary, suffix)
-
-
-
-def _compute_boundary_mask(mask: np.ndarray) -> np.ndarray:
-    boundary = mask.copy()
-    interior = mask.copy()
-    interior[:-1, :] &= mask[1:, :]
-    interior[1:, :] &= mask[:-1, :]
-    interior[:, :-1] &= mask[:, 1:]
-    interior[:, 1:] &= mask[:, :-1]
-    boundary &= ~interior
-    return boundary
-
-
-def _load_overlap_mask_data(mask_path: Optional[Path]) -> Optional[Dict[str, object]]:
-    if mask_path is None:
-        return None
-    if rasterio is None:
-        print(f"[warn] rasterio unavailable; cannot apply overlap mask filtering ({mask_path}).")
-        return None
-    try:
-        with rasterio.open(mask_path) as src:
-            mask_array = src.read(1)
-            return {
-                "array": np.asarray(mask_array),
-                "transform": src.transform,
-                "shape": mask_array.shape,
-                "nodata": src.nodata,
-            }
-    except Exception as exc:
-        print(f"[warn] Unable to load overlap mask {mask_path}: {exc}")
-        return None
-
-def _mask_contains_coord(coord: Optional[Tuple[float, float]], mask_info: Optional[Dict[str, object]]) -> bool:
-    if mask_info is None:
-        return True
-    if coord is None or rasterio is None:
-        return False
-    transform = mask_info.get("transform")
-    array = mask_info.get("array")
-    shape = mask_info.get("shape")
-    if transform is None or array is None or shape is None:
-        return True
-    try:
-        row, col = rasterio.transform.rowcol(transform, coord[0], coord[1])
-    except Exception:
-        return False
-    height, width = shape
-    if not (0 <= row < height and 0 <= col < width):
-        return False
-    value = array[row, col]
-    nodata = mask_info.get("nodata")
-    try:
-        if nodata is not None and np.isfinite(nodata):
-            if np.isfinite(value) and np.isclose(value, nodata):
-                return False
-            if not np.isfinite(value):
-                return False
-    except Exception:
-        pass
-    return bool(value)
-
-
-
-
-
-
-def _extract_reembedding_overlap(
-    entry: Optional[Dict[str, object]],
-    overlap_mask: Optional[Dict[str, object]],
-) -> Optional[Dict[str, object]]:
-    if entry is None:
-        return None
-    mask_flags = entry.get("mask_flags")
-    if overlap_mask is None:
-        return entry
-    if mask_flags is None:
-        return entry
-    keep_idx = [i for i, flag in enumerate(mask_flags) if flag]
-    if not keep_idx:
-        return None
-    index_tensor = torch.as_tensor(keep_idx, dtype=torch.long)
-    if isinstance(entry["features"], torch.Tensor):
-        features = entry["features"].index_select(0, index_tensor)
-    else:
-        features = entry["features"][keep_idx]
-    labels = entry.get("labels")
-    def _slice_list(values):
-        if values is None:
-            return None
-        return [values[i] for i in keep_idx]
-    indices_slice = _slice_list(entry.get("indices")) or []
-    coords_slice = _slice_list(entry.get("coords")) or []
-    metadata_slice = _slice_list(entry.get("metadata")) or []
-    row_cols_mask_slice = _slice_list(entry.get("row_cols_mask")) or []
-    if isinstance(labels, np.ndarray):
-        labels_slice = labels[keep_idx]
-    else:
-        label_list = _slice_list(labels) or []
-        labels_slice = np.asarray(label_list, dtype=np.int16)
-    filtered = {
-        "dataset": entry.get("dataset"),
-        "features": features,
-        "indices": list(indices_slice),
-        "coords": list(coords_slice),
-        "metadata": list(metadata_slice),
-        "labels": labels_slice,
-        "row_cols": list(row_cols_mask_slice),
-        "mask_flags": [True] * len(keep_idx),
-        "row_cols_mask": list(row_cols_mask_slice),
-    }
-    return filtered
-
-
-class _MaskStack:
-    def __init__(self, mask_info: Dict[str, object]):
-        shape = mask_info.get("shape")
-        self.height = int(shape[0]) if shape is not None else 0
-        self.width = int(shape[1]) if shape is not None else 0
-        self.transform = mask_info.get("transform")
-        self.crs = None
-
-    def grid_centers(self, stride: int) -> List[Tuple[int, int]]:
-        centers: List[Tuple[int, int]] = []
-        for r in range(0, self.height, stride):
-            for c in range(0, self.width, stride):
-                centers.append((r, c))
-        return centers
-
-
-def _make_mask_reference(mask_info: Optional[Dict[str, object]]) -> Optional[Dict[str, object]]:
-    if mask_info is None:
-        return None
-    mask_array = mask_info.get("array")
-    mask_transform = mask_info.get("transform")
-    mask_shape = mask_info.get("shape")
-    mask_nodata = mask_info.get("nodata")
-    if mask_array is None or mask_transform is None or mask_shape is None:
-        return None
-    mask_arr = np.asarray(mask_array)
-    valid_mask = np.isfinite(mask_arr)
-    if mask_nodata is not None and np.isfinite(mask_nodata):
-        valid_mask &= ~np.isclose(mask_arr, mask_nodata)
-    valid_mask &= mask_arr != 0
-    height = int(mask_shape[0])
-    width = int(mask_shape[1])
-    if valid_mask.shape != (height, width):
-        valid_mask = valid_mask.reshape((height, width))
-    boundary_mask = _compute_boundary_mask(valid_mask) if valid_mask.any() else None
-    profile = {
-        "driver": "GTiff",
-        "width": width,
-        "height": height,
-        "count": 1,
-        "dtype": "float32",
-        "transform": mask_transform,
-    }
-    return {
-        "profile": profile,
-        "transform": mask_transform,
-        "crs": None,
-        "valid_mask": valid_mask if valid_mask.any() else None,
-        "boundary_mask": boundary_mask,
-    }
 
 
 def _fusion_run_inference(
@@ -1494,30 +1273,6 @@ def _fusion_run_inference(
     }
     return outputs
 
-
-def _build_dataloaders(
-    dataset: Dict[str, object],
-    train_idx: np.ndarray,
-    val_idx: np.ndarray,
-    cfg: AlignmentConfig,
-) -> Tuple[DataLoader, DataLoader, Dict[str, object]]:
-    features = dataset["features"]
-    labels = dataset["labels"]
-    ytr = labels[train_idx]
-    yval = labels[val_idx] if val_idx.size else np.empty(0, dtype=int)
-    dl_tr, dl_val, metrics_summary = dataloader_metric_inputORembedding(
-        train_idx,
-        val_idx,
-        ytr,
-        yval,
-        cfg.cls_training.batch_size,
-        positive_augmentation=False,
-        embedding=features,
-        epochs=cfg.cls_training.epochs,
-    )
-    return dl_tr, dl_val, metrics_summary
-
-
 def _fusion_train_model(
     dataset: Dict[str, object],
     dl_tr: DataLoader,
@@ -1569,211 +1324,6 @@ def _fusion_train_model(
         "val": normalize_metrics(val_eval),
     }
     return mlp, history_payload, evaluation_summary
-
-
-def _fusion_export_results(
-    fusion_dir: Path,
-    mlp: nn.Module,
-    history_payload: List[Dict[str, object]],
-    evaluation_summary: Dict[str, Dict[str, float]],
-    metrics_summary: Dict[str, object],
-    inference_outputs: Dict[str, Dict[str, object]],
-) -> Dict[str, object]:
-    fusion_dir.mkdir(parents=True, exist_ok=True)
-    metrics_payload = dict(metrics_summary)
-    metrics_payload["evaluation"] = evaluation_summary
-    metrics_payload["history"] = history_payload
-    metrics_path = fusion_dir / "metrics.json"
-    try:
-        save_metrics_json(metrics_payload, metrics_path)
-    except Exception as exc:
-        raise RuntimeError(f"Failed to save fusion metrics: {exc}")
-    state_path = fusion_dir / "classifier.pt"
-    torch.save({"state_dict": mlp.state_dict()}, state_path)
-    inference_summary: Dict[str, object] = {}
-    for dataset_name, payload in inference_outputs.items():
-        out_dir = fusion_dir / dataset_name
-        write_prediction_outputs(
-            payload["prediction"],
-            payload["default_reference"],
-            out_dir,
-            pos_coords_by_region=payload["pos_map"],
-            neg_coords_by_region=payload["neg_map"],
-        )
-        # predictions_path = out_dir / "predictions.npy"
-        predictions_path = out_dir / "predictions.npz"
-        try:
-            prediction_payload = payload.get("prediction")
-            if isinstance(prediction_payload, dict):
-                global_payload = prediction_payload.get("GLOBAL") or {}
-                mean_map = global_payload.get("mean")
-                std_map = global_payload.get("std")
-            else:
-                mean_map = prediction_payload
-                std_map = None
-            pos_map = payload.get("pos_map") or {}
-            neg_map = payload.get("neg_map") or {}
-            pos_coords = [
-                (region, int(r), int(c))
-                for region, coords in pos_map.items()
-                for r, c in coords
-            ]
-            neg_coords = [
-                (region, int(r), int(c))
-                for region, coords in neg_map.items()
-                for r, c in coords
-            ]
-            row_cols = [tuple(rc) if isinstance(rc, (list, tuple)) else rc for rc in (payload.get("row_cols") or [])]
-            coords_list = payload.get("coords") or [None] * len(row_cols)
-            labels = payload.get("labels") or [0] * len(row_cols)
-            metadata = payload.get("metadata") or [None] * len(row_cols)
-            mean_values = payload.get("mean_values")
-            std_values = payload.get("std_values")
-            if mean_values is None and mean_map is not None and row_cols:
-                mean_values = [float(mean_map[r, c]) for r, c in row_cols]
-            if std_values is None and std_map is not None and row_cols:
-                std_values = [float(std_map[r, c]) for r, c in row_cols]
-            data_payload = {
-                "mean": np.asarray(mean_map, dtype=np.float32) if mean_map is not None else None,
-                "std": np.asarray(std_map, dtype=np.float32) if std_map is not None else None,
-                "row_cols": row_cols,
-                "coords": coords_list,
-                "labels": labels,
-                "metadata": metadata,
-                "mean_values": np.asarray(mean_values, dtype=np.float32) if mean_values is not None else None,
-                "std_values": np.asarray(std_values, dtype=np.float32) if std_values is not None else None,
-                "pos_coords": pos_coords,
-                "neg_coords": neg_coords,
-            }
-            # np.save(predictions_path, data_payload, allow_pickle=True)
-            np.savez_compressed(predictions_path, predictions=data_payload)
-
-        except Exception as exc:
-            print(f"[warn] Failed to save prediction array for {dataset_name}: {exc}")
-        inference_summary[dataset_name] = {
-            "output_dir": str(out_dir),
-            "npy_path": str(predictions_path),
-            "positive_count": payload["counts"]["pos"],
-            "negative_count": payload["counts"]["neg"],
-        }
-    return {
-        "metrics_path": str(metrics_path),
-        "state_dict_path": str(state_path),
-        "evaluation": evaluation_summary,
-        "history": history_payload,
-        "outputs": inference_summary,
-    }
-
-def _collect_classifier_samples(
-    workspace: OverlapAlignmentWorkspace,
-    dataset_name: str,
-    pn_lookup: Optional[Dict[str, set[Tuple[str, int, int]]]],
-    projector: nn.Module,
-    device: torch.device,
-    run_logger: "_RunLogger",
-    *,
-    overlap_mask: Optional[Dict[str, object]] = None,
-    apply_overlap_filter: bool = False,
-) -> Optional[Dict[str, object]]:
-    bundle = workspace.datasets.get(dataset_name)
-    if bundle is None:
-        run_logger.log(f"[cls] dataset {dataset_name} not found in workspace; skipping classifier samples.")
-        return None
-    if pn_lookup is None or (not pn_lookup.get("pos") and not pn_lookup.get("neg")):
-        run_logger.log(f"[cls] PN lookup unavailable for dataset {dataset_name}; skipping classifier samples.")
-        return None
-    if apply_overlap_filter and overlap_mask is None:
-        run_logger.log(f"[cls] overlap mask unavailable; cannot filter samples for dataset {dataset_name}.")
-        apply_overlap_filter = False
-    matched_records: List[EmbeddingRecord] = []
-    labels: List[int] = []
-    coords: List[Optional[Tuple[float, float]]] = []
-    regions: List[Optional[str]] = []
-    row_cols: List[Optional[Tuple[int, int]]] = []
-    indices: List[int] = []
-    metadata: List[Dict[str, object]] = []
-    for record in bundle.records:
-        label = _lookup_pn_label(record.region, record.row_col, pn_lookup)
-        if label is None:
-            continue
-        label_int = 1 if int(label) > 0 else 0
-        coord_norm = _normalise_coord(record.coord)
-        if apply_overlap_filter and not _mask_contains_coord(coord_norm, overlap_mask):
-            continue
-        matched_records.append(record)
-        labels.append(label_int)
-        coords.append(coord_norm)
-        regions.append(getattr(record, "region", None))
-        row_cols.append(getattr(record, "row_col", None))
-        indices.append(int(getattr(record, "index", len(indices))))
-        metadata.append(
-            {
-                "dataset": dataset_name,
-                "label": label_int,
-                "coord": coord_norm,
-                "region": getattr(record, "region", None),
-                "row_col": getattr(record, "row_col", None),
-                "embedding_index": int(getattr(record, "index", len(indices))),
-                "tile_id": getattr(record, "tile_id", None),
-                "overlap_filtered": bool(apply_overlap_filter),
-            }
-        )
-    if not matched_records:
-        run_logger.log(f"[cls] No PN-labelled samples found for dataset {dataset_name}; skipping classifier samples.")
-        return None
-    embeddings = np.stack([np.asarray(rec.embedding, dtype=np.float32) for rec in matched_records])
-    projector = projector.to(device)
-    projector.eval()
-    with torch.no_grad():
-        embed_tensor = torch.from_numpy(embeddings).to(device)
-        projected = projector(embed_tensor).detach().cpu()
-    label_tensor = torch.tensor(labels, dtype=torch.float32)
-    return {
-        "dataset": dataset_name,
-        "features": projected,
-        "labels": label_tensor,
-        "metadata": metadata,
-        "coords": coords,
-        "regions": regions,
-        "row_cols": row_cols,
-        "indices": indices,
-    }
-
-
-def _count_pn_lookup(
-    pn_lookup: Optional[Dict[str, set[Tuple[str, int, int]]]],
-    region_filter: Optional[Sequence[str]] = None,
-) -> Dict[str, int]:
-    if not pn_lookup:
-        return {"positive": 0, "negative": 0}
-
-    def _normalise_region(value: Optional[object]) -> str:
-        if value is None:
-            return "NONE"
-        return str(value).upper()
-
-    allowed_regions: Optional[set[str]] = None
-    if region_filter:
-        allowed_regions = {str(region).upper() for region in region_filter if region is not None}
-
-    def _count(entries: Iterable[Tuple[str, int, int]]) -> int:
-        if entries is None:
-            return 0
-        if not allowed_regions:
-            return sum(1 for _ in entries)
-
-        total = 0
-        for region_value, _, _ in entries:
-            region_key = _normalise_region(region_value)
-            if region_key in allowed_regions:
-                total += 1
-            elif region_key == "NONE" and ("GLOBAL" in allowed_regions or "ALL" in allowed_regions):
-                total += 1
-        return total
-
-    pos = _count(pn_lookup.get("pos", ()))
-    neg = _count(pn_lookup.get("neg", ()))
-    return {"positive": int(pos), "negative": int(neg)}
 
 
 def _dataset_pair(cfg: AlignmentConfig) -> Tuple[str, str]:

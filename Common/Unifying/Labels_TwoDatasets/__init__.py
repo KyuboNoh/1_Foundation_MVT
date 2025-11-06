@@ -3,12 +3,6 @@
 from __future__ import annotations
 
 import copy
-from typing import Dict, List, Optional, Sequence, Tuple
-from collections import Counter, defaultdict
-
-import numpy as np
-
-import copy
 import csv
 import json
 import math
@@ -17,7 +11,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Callable
 
+import numpy as np
+
 from .overlaps import OverlapSet
+from Common.data_utils import EmbeddingRecord
+from .fusion_utils.workspace import OverlapAlignmentWorkspace
 
 try:
     import torch
@@ -27,6 +25,11 @@ except ImportError:  # pragma: no cover - optional dependency
     torch = None  # type: ignore[assignment]
     nn = None  # type: ignore[assignment]
     DataLoader = TensorDataset = None  # type: ignore[assignment]
+
+try:  # optional raster IO
+    import rasterio
+except ImportError:  # pragma: no cover - optional dependency
+    rasterio = None  # type: ignore[assignment]
 
 def _normalise_cross_matches(
     matches: Sequence[Dict[str, object]],
@@ -855,10 +858,11 @@ def _build_aligned_pairs_core(
             "selected_pairs": pair_serialised,
             "anchor_name": anchor_name,
             "target_name": target_name,
-            'anchor_augmented_pairs': int(anchor_aug_added),
-            'target_augmented_pairs': int(target_aug_added),
+            "anchor_augmented_pairs": int(anchor_aug_added),
+            "target_augmented_pairs": int(target_aug_added),
+            "pn_index_summary": pn_index_summary,
         }
-        debug_payload["pn_index_summary"] = pn_index_summary
+    else:
         debug_payload = None
 
     return anchor_vecs, target_vecs, label_hist, debug_payload, aug_stats, pair_metadata, target_stack_per_anchor, pn_index_summary
@@ -1148,3 +1152,195 @@ def _weighted_average_coord(
     if total_weight <= 0:
         return None
     return (accum_x / total_weight, accum_y / total_weight)
+
+
+def _lookup_pn_label(
+    region: Optional[str],
+    row_col: Optional[Tuple[int, int]],
+    lookup: Optional[Dict[str, set[Tuple[str, int, int]]]],
+) -> Optional[int]:
+    if lookup is None or region is None or row_col is None:
+        return None
+    region_key = str(region).upper()
+    row, col = row_col
+    key = (region_key, int(row), int(col))
+    if key in lookup.get("pos", set()):
+        return 1
+    if key in lookup.get("neg", set()):
+        return 0
+    return None
+
+
+def _mask_contains_coord(coord: Optional[Tuple[float, float]], mask_info: Optional[Dict[str, object]]) -> bool:
+    if mask_info is None:
+        return True
+    if coord is None or rasterio is None:
+        return False
+    transform = mask_info.get("transform")
+    array = mask_info.get("array")
+    shape = mask_info.get("shape")
+    if transform is None or array is None or shape is None:
+        return True
+    try:
+        row, col = rasterio.transform.rowcol(transform, coord[0], coord[1])
+    except Exception:
+        return False
+    height, width = shape
+    if not (0 <= row < height and 0 <= col < width):
+        return False
+    value = array[row, col]
+    nodata = mask_info.get("nodata")
+    try:
+        if nodata is not None and np.isfinite(nodata):
+            if np.isfinite(value) and np.isclose(value, nodata):
+                return False
+            if not np.isfinite(value):
+                return False
+    except Exception:
+        pass
+    return bool(value)
+
+
+def _collect_classifier_samples(
+    workspace: OverlapAlignmentWorkspace,
+    dataset_name: str,
+    pn_lookup: Optional[Dict[str, set[Tuple[str, int, int]]]],
+    projector: nn.Module,
+    device: torch.device,
+    run_logger: Any,
+    *,
+    overlap_mask: Optional[Dict[str, object]] = None,
+    apply_overlap_filter: bool = False,
+) -> Optional[Dict[str, object]]:
+    bundle = workspace.datasets.get(dataset_name)
+    if bundle is None:
+        run_logger.log(f"[cls] dataset {dataset_name} not found in workspace; skipping classifier samples.")
+        return None
+    if pn_lookup is None or (not pn_lookup.get("pos") and not pn_lookup.get("neg")):
+        run_logger.log(f"[cls] PN lookup unavailable for dataset {dataset_name}; skipping classifier samples.")
+        return None
+    if apply_overlap_filter and overlap_mask is None:
+        run_logger.log(f"[cls] overlap mask unavailable; cannot filter samples for dataset {dataset_name}.")
+        apply_overlap_filter = False
+    matched_records: List[EmbeddingRecord] = []
+    labels: List[int] = []
+    coords: List[Optional[Tuple[float, float]]] = []
+    regions: List[Optional[str]] = []
+    row_cols: List[Optional[Tuple[int, int]]] = []
+    indices: List[int] = []
+    metadata: List[Dict[str, object]] = []
+    for record in bundle.records:
+        label = _lookup_pn_label(record.region, record.row_col, pn_lookup)
+        if label is None:
+            continue
+        label_int = 1 if int(label) > 0 else 0
+        coord_norm = _normalise_coord(record.coord)
+        if apply_overlap_filter and not _mask_contains_coord(coord_norm, overlap_mask):
+            continue
+        matched_records.append(record)
+        labels.append(label_int)
+        coords.append(coord_norm)
+        regions.append(getattr(record, "region", None))
+        row_cols.append(getattr(record, "row_col", None))
+        indices.append(int(getattr(record, "index", len(indices))))
+        metadata.append(
+            {
+                "dataset": dataset_name,
+                "label": label_int,
+                "coord": coord_norm,
+                "region": getattr(record, "region", None),
+                "row_col": getattr(record, "row_col", None),
+                "embedding_index": int(getattr(record, "index", len(indices))),
+                "tile_id": getattr(record, "tile_id", None),
+                "overlap_filtered": bool(apply_overlap_filter),
+            }
+        )
+    if not matched_records:
+        run_logger.log(f"[cls] No PN-labelled samples found for dataset {dataset_name}; skipping classifier samples.")
+        return None
+    if torch is None:
+        raise RuntimeError("PyTorch is required to collect classifier samples.")
+    embeddings = np.stack([np.asarray(rec.embedding, dtype=np.float32) for rec in matched_records])
+    projector = projector.to(device)
+    projector.eval()
+    with torch.no_grad():
+        embed_tensor = torch.from_numpy(embeddings).to(device)
+        if hasattr(projector, 'aggregator'):
+        # For AggregatorTargetHead, reshape input for aggregation
+            target_tensor = embed_tensor.unsqueeze(1)  # Add sequence length dimension [B, 1, D]
+            projected = projector(embed_tensor, target_tensor).detach().cpu()
+        else:
+            projected = projector(embed_tensor).detach().cpu()
+    label_tensor = torch.tensor(labels, dtype=torch.float32)
+    return {
+        "dataset": dataset_name,
+        "features": projected,
+        "labels": label_tensor,
+        "metadata": metadata,
+        "coords": coords,
+        "regions": regions,
+        "row_cols": row_cols,
+        "indices": indices,
+    }
+
+class AggregatorTargetHead(nn.Module):
+    def __init__(self, aggregator: CrossAttentionAggregator, proj_target: nn.Module, *, use_positional_encoding: bool) -> None:
+        super().__init__()
+        self.aggregator = aggregator
+        self.proj_target = proj_target
+        self.use_positional_encoding = bool(use_positional_encoding)
+
+    def forward(
+        self,
+        anchor_batch: torch.Tensor,
+        target_batch: torch.Tensor,
+        *,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        pos_encoding: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        fused = self.aggregator(
+            anchor_batch,
+            target_batch,
+            key_padding_mask=key_padding_mask,
+            pos_encoding=pos_encoding if self.aggregator.use_positional_encoding else None,
+        )
+        return self.proj_target(fused)
+
+def _subset_classifier_sample(
+    sample: Dict[str, object],
+    keep_mask: Sequence[bool],
+    *,
+    subset_tag: Optional[str] = None,
+) -> Optional[Dict[str, object]]:
+    if torch is None:
+        raise RuntimeError("PyTorch is required to subset classifier samples.")
+    features = sample.get("features")
+    if not isinstance(features, torch.Tensor):
+        raise TypeError("Classifier sample 'features' must be a torch.Tensor.")
+    mask_tensor = torch.as_tensor(keep_mask, dtype=torch.bool, device=features.device)
+    if mask_tensor.numel() != features.size(0):
+        raise ValueError("Subset mask size mismatch for classifier sample.")
+    if not bool(mask_tensor.any()):
+        return None
+    filtered_metadata: List[Dict[str, object]] = []
+    metadata_entries = sample.get("metadata", [])
+    for entry, keep in zip(metadata_entries, keep_mask):
+        if not keep:
+            continue
+        entry_copy = dict(entry)
+        if subset_tag is not None:
+            entry_copy["subset_role"] = subset_tag
+        filtered_metadata.append(entry_copy)
+    filtered_sample: Dict[str, object] = {
+        "dataset": sample.get("dataset"),
+        "features": features[mask_tensor].clone(),
+        "labels": sample["labels"][mask_tensor].clone(),
+        "metadata": filtered_metadata,
+        "coords": [coord for coord, keep in zip(sample.get("coords", []), keep_mask) if keep],
+        "regions": [region for region, keep in zip(sample.get("regions", []), keep_mask) if keep],
+        "row_cols": [row_col for row_col, keep in zip(sample.get("row_cols", []), keep_mask) if keep],
+        "indices": [idx for idx, keep in zip(sample.get("indices", []), keep_mask) if keep],
+    }
+    if subset_tag is not None:
+        filtered_sample["subset"] = subset_tag
+    return filtered_sample

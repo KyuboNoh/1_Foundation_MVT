@@ -2056,6 +2056,8 @@ def main() -> None:
     label_union = sorted({label for ds in datasets for label in ds.label_names})
     region_union = sorted({region for ds in datasets for region in ds.region_keys})
 
+    # TODO: dataset_window_spacing should be updated (now it is recording patch_size not window_size)
+    raise NotImplementedError("dataset_window_spacing should be updated!!!!!!!!!")
     payload = {
         "dataset_count": len(datasets),
         "native_crs": {

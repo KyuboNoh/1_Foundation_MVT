@@ -7,6 +7,16 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
+try:
+    import torch
+except ImportError:  # pragma: no cover - optional dependency
+    torch = None  # type: ignore[assignment]
+
+try:  # optional raster IO
+    import rasterio
+except ImportError:  # pragma: no cover - optional dependency
+    rasterio = None  # type: ignore[assignment]
+
 
 @dataclass(frozen=True)
 class OverlapTile:
@@ -389,3 +399,73 @@ _KNOWN_PAIR_KEYS = {
     "centroid",
 }
 
+
+def _load_overlap_mask_data(mask_path: Optional[Path]) -> Optional[Dict[str, object]]:
+    if mask_path is None:
+        return None
+    if rasterio is None:
+        print(f"[warn] rasterio unavailable; cannot apply overlap mask filtering ({mask_path}).")
+        return None
+    try:
+        with rasterio.open(mask_path) as src:
+            mask_array = src.read(1)
+            return {
+                "array": np.asarray(mask_array),
+                "transform": src.transform,
+                "shape": mask_array.shape,
+                "nodata": src.nodata,
+            }
+    except Exception as exc:
+        print(f"[warn] Unable to load overlap mask {mask_path}: {exc}")
+        return None
+
+
+def _extract_reembedding_overlap(
+    entry: Optional[Dict[str, object]],
+    overlap_mask: Optional[Dict[str, object]],
+) -> Optional[Dict[str, object]]:
+    if entry is None:
+        return None
+    mask_flags = entry.get("mask_flags")
+    if overlap_mask is None or mask_flags is None:
+        return entry
+    keep_idx = [idx for idx, flag in enumerate(mask_flags) if flag]
+    if not keep_idx:
+        return None
+    if torch is None:
+        raise RuntimeError("PyTorch is required to process overlap re-embeddings.")
+    index_tensor = torch.as_tensor(keep_idx, dtype=torch.long)
+    features_field = entry.get("features")
+    if isinstance(features_field, torch.Tensor):
+        features = features_field.index_select(0, index_tensor)
+    else:
+        features = np.asarray(features_field)[keep_idx]
+
+    labels = entry.get("labels")
+
+    def _slice_list(values):
+        if values is None:
+            return None
+        return [values[i] for i in keep_idx]
+
+    indices_slice = _slice_list(entry.get("indices")) or []
+    coords_slice = _slice_list(entry.get("coords")) or []
+    metadata_slice = _slice_list(entry.get("metadata")) or []
+    row_cols_mask_slice = _slice_list(entry.get("row_cols_mask")) or []
+    if isinstance(labels, np.ndarray):
+        labels_slice = labels[keep_idx]
+    else:
+        label_list = _slice_list(labels) or []
+        labels_slice = np.asarray(label_list, dtype=np.int16)
+    filtered = {
+        "dataset": entry.get("dataset"),
+        "features": features,
+        "indices": list(indices_slice),
+        "coords": list(coords_slice),
+        "metadata": list(metadata_slice),
+        "labels": labels_slice,
+        "row_cols": list(row_cols_mask_slice),
+        "mask_flags": [True] * len(keep_idx),
+        "row_cols_mask": list(row_cols_mask_slice),
+    }
+    return filtered

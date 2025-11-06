@@ -46,6 +46,20 @@ from Common.cls.data.stac_table import StacTableStack  # noqa: E402
 
 
 @dataclass
+class EmbeddingRecord:
+    index: int 
+    embedding: np.ndarray
+    label: int
+    tile_id: str
+    coord: Optional[Tuple[float, float]] = None
+    row_col: Optional[Tuple[int, int]] = None
+    region: Optional[str] = None
+    pixel_resolution: Optional[float] = None
+    window_size: Optional[Tuple[int, int]] = None
+    metadata: Optional[Dict] = None
+
+
+@dataclass
 class BoundaryInfo:
     path: Path
     mask: np.ndarray

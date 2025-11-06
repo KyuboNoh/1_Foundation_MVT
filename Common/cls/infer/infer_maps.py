@@ -1,7 +1,7 @@
 # src/gfm4mpm/infer/infer_maps.py
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from collections import defaultdict
 
 import json
@@ -149,9 +149,17 @@ def _mc_predict_single_region(
             module.train()
         elif isinstance(module, nn.modules.batchnorm._BatchNorm):
             module.eval()
-    def _to_tensor(array_like: Any) -> Optional[torch.Tensor]:
+    def _to_tensor(array_like: Any) -> Optional[Union[torch.Tensor, Dict[str, torch.Tensor]]]:
         if array_like is None:
             return None
+        
+        if isinstance(array_like, dict):
+            # Handle dictionary case for unified model (u,v features)
+            return {
+                key: (_to_tensor(val) if val is not None else None)
+                for key, val in array_like.items()
+            }
+        
         if torch_mod.is_tensor(array_like):
             tensor = array_like.detach()
         else:
@@ -190,15 +198,40 @@ def _mc_predict_single_region(
             if embedding_lookup is not None and embedding_tensor is not None:
                 idx = embedding_lookup.get((int(r), int(c)))
                 if idx is not None:
-                    zs = embedding_tensor[idx].unsqueeze(0)
+                    if isinstance(embedding_tensor, dict) and 'u' in embedding_tensor and 'v' in embedding_tensor:
+                        # Handle case for unified model with separate u,v features
+                        zs = {
+                            'u': (embedding_tensor['u'][idx].float() if torch.is_tensor(embedding_tensor['u']) 
+                                 else torch.from_numpy(embedding_tensor['u'][idx])).unsqueeze(0).to(device_obj),
+                            'v': (embedding_tensor['v'][idx].float() if torch.is_tensor(embedding_tensor['v'])
+                                 else torch.from_numpy(embedding_tensor['v'][idx])).unsqueeze(0).to(device_obj)
+                        }
+                    else:
+                        # Regular case for single tensor
+                        zs = embedding_tensor[idx].unsqueeze(0)
             if zs is None:
                 missing_embeddings += 1
                 continue
-            if passes > 1:
-                batch = zs.repeat(passes, 1)
-                preds_tensor = mlp(batch).view(-1)
+            if isinstance(zs, dict) and 'u' in zs and 'v' in zs:
+                # Handle PNHeadUnified case
+                u = zs['u']
+                v = zs['v']
+                if passes > 1:
+                    u_batch = u.repeat(passes, 1)
+                    v_batch = v.repeat(passes, 1)
+                    b_missing = torch.zeros(u_batch.size(0), 1, device=u_batch.device)
+                    preds_tensor = mlp(u_batch, v_batch, b_missing).view(-1)
+                else:
+                    b_missing = torch.zeros(u.size(0), 1, device=u.device)
+                    preds_tensor = mlp(u, v, b_missing).view(-1)
             else:
-                preds_tensor = mlp(zs).view(-1)
+                # Handle regular case (PNHeadAOnly)
+                if passes > 1:
+                    batch = zs.repeat(passes, 1)
+                    preds_tensor = mlp(batch).view(-1)
+                else:
+                    preds_tensor = mlp(zs).view(-1)
+            
             mu = float(preds_tensor.mean().item())
             sig2 = float(preds_tensor.var(unbiased=False).item()) if preds_tensor.numel() > 1 else 0.0
 

@@ -9,29 +9,18 @@ import numpy as np
 
 try:
     import torch
+    from torch.utils.data import DataLoader
 except ImportError:  # pragma: no cover - optional dependency
     torch = None  # type: ignore[assignment]
+    DataLoader = None  # type: ignore[assignment]
+
+from Common.cls.training.train_cls import dataloader_metric_inputORembedding
+from Common.data_utils import EmbeddingRecord
 
 DatasetConfig = Any
 
 if TYPE_CHECKING:
     from Common.Unifying.Labels_TwoDatasets.fusion_utils.workspace import OverlapAlignmentWorkspace
-
-
-@dataclass
-class EmbeddingRecord:
-    """Container for a single embedding vector together with metadata."""
-
-    index: int
-    embedding: np.ndarray
-    label: int
-    tile_id: str
-    coord: Optional[Tuple[float, float]]
-    row_col: Optional[Tuple[int, int]]
-    region: str
-    pixel_resolution: Optional[float]
-    window_size: Optional[Tuple[int, int]]
-    metadata: Optional[Dict]
 
 def auto_coord_error(workspace: "OverlapAlignmentWorkspace", anchor_name: str, target_name: str) -> Optional[float]:
     meta = getattr(workspace, "integration_dataset_meta", {}) or {}
@@ -364,3 +353,160 @@ def summarise_records(records: Sequence[EmbeddingRecord]) -> Dict[str, object]:
         "pixel_resolution": _summary(resolutions),
         "window_size": window_summary,
     }
+
+
+def _load_pn_lookup(path: Optional[Path]) -> Optional[Dict[str, set[Tuple[str, int, int]]]]:
+    if path is None:
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError:
+        return None
+    pos_entries = payload.get("pos") or []
+    neg_entries = payload.get("neg") or []
+
+    def _to_key(entry: Dict[str, object]) -> Optional[Tuple[str, int, int]]:
+        region = entry.get("region")
+        row = entry.get("row")
+        col = entry.get("col")
+        if region is None or row is None or col is None:
+            return None
+        try:
+            return (str(region).upper(), int(row), int(col))
+        except Exception:
+            return None
+
+    pos_set: set[Tuple[str, int, int]] = set()
+    neg_set: set[Tuple[str, int, int]] = set()
+    for collection, target in ((pos_entries, pos_set), (neg_entries, neg_set)):
+        if not isinstance(collection, list):
+            continue
+        for entry in collection:
+            if isinstance(entry, dict):
+                key = _to_key(entry)
+                if key is not None:
+                    target.add(key)
+    return {"pos": pos_set, "neg": neg_set}
+
+def _count_pn_lookup(
+    pn_lookup: Optional[Dict[str, set[Tuple[str, int, int]]]],
+    region_filter: Optional[Sequence[str]] = None,
+) -> Dict[str, int]:
+    if not pn_lookup:
+        return {"positive": 0, "negative": 0}
+
+    def _normalise_region(value: Optional[object]) -> str:
+        if value is None:
+            return "NONE"
+        return str(value).upper()
+
+    allowed_regions: Optional[set[str]] = None
+    if region_filter:
+        allowed_regions = {str(region).upper() for region in region_filter if region is not None}
+
+    def _count(entries: Iterable[Tuple[str, int, int]]) -> int:
+        if entries is None:
+            return 0
+        if not allowed_regions:
+            return sum(1 for _ in entries)
+
+        total = 0
+        for region_value, _, _ in entries:
+            region_key = _normalise_region(region_value)
+            if region_key in allowed_regions:
+                total += 1
+            elif region_key == "NONE" and ("GLOBAL" in allowed_regions or "ALL" in allowed_regions):
+                total += 1
+        return total
+
+    pos = _count(pn_lookup.get("pos", ()))
+    neg = _count(pn_lookup.get("neg", ()))
+    return {"positive": int(pos), "negative": int(neg)}
+
+def _compute_boundary_mask(mask: np.ndarray) -> np.ndarray:
+    boundary = mask.copy()
+    interior = mask.copy()
+    interior[:-1, :] &= mask[1:, :]
+    interior[1:, :] &= mask[:-1, :]
+    interior[:, :-1] &= mask[:, 1:]
+    interior[:, 1:] &= mask[:, :-1]
+    boundary &= ~interior
+    return boundary
+
+
+class _MaskStack:
+    def __init__(self, mask_info: Dict[str, object]):
+        shape = mask_info.get("shape")
+        self.height = int(shape[0]) if shape is not None else 0
+        self.width = int(shape[1]) if shape is not None else 0
+        self.transform = mask_info.get("transform")
+        self.crs = None
+
+    def grid_centers(self, stride: int) -> List[Tuple[int, int]]:
+        centers: List[Tuple[int, int]] = []
+        for r in range(0, self.height, stride):
+            for c in range(0, self.width, stride):
+                centers.append((r, c))
+        return centers
+
+
+def _make_mask_reference(mask_info: Optional[Dict[str, object]]) -> Optional[Dict[str, object]]:
+    if mask_info is None:
+        return None
+    mask_array = mask_info.get("array")
+    mask_transform = mask_info.get("transform")
+    mask_shape = mask_info.get("shape")
+    mask_nodata = mask_info.get("nodata")
+    if mask_array is None or mask_transform is None or mask_shape is None:
+        return None
+    mask_arr = np.asarray(mask_array)
+    valid_mask = np.isfinite(mask_arr)
+    if mask_nodata is not None and np.isfinite(mask_nodata):
+        valid_mask &= ~np.isclose(mask_arr, mask_nodata)
+    valid_mask &= mask_arr != 0
+    height = int(mask_shape[0])
+    width = int(mask_shape[1])
+    if valid_mask.shape != (height, width):
+        valid_mask = valid_mask.reshape((height, width))
+    boundary_mask = _compute_boundary_mask(valid_mask) if valid_mask.any() else None
+    profile = {
+        "driver": "GTiff",
+        "width": width,
+        "height": height,
+        "count": 1,
+        "dtype": "float32",
+        "transform": mask_transform,
+    }
+    return {
+        "profile": profile,
+        "transform": mask_transform,
+        "crs": None,
+        "valid_mask": valid_mask if valid_mask.any() else None,
+        "boundary_mask": boundary_mask,
+    }
+
+
+def _build_dataloaders(
+    dataset: Dict[str, object],
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    cfg: Any,
+) -> Tuple[Any, Any, Dict[str, object]]:
+    features = dataset["features"]
+    labels = dataset["labels"]
+    ytr = labels[train_idx]
+    yval = labels[val_idx] if val_idx.size else np.empty(0, dtype=int)
+    dl_tr, dl_val, metrics_summary = dataloader_metric_inputORembedding(
+        train_idx,
+        val_idx,
+        ytr,
+        yval,
+        cfg.cls_training.batch_size,
+        positive_augmentation=False,
+        embedding=features,
+        epochs=cfg.cls_training.epochs,
+    )
+    return dl_tr, dl_val, metrics_summary

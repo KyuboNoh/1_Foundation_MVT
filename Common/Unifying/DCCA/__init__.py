@@ -277,6 +277,18 @@ def _load_pretrained_dcca_state(path: Path) -> Tuple[Tuple[Dict[str, "torch.Tens
 def _projection_head_from_state(state_dict: Dict[str, "torch.Tensor"]) -> "nn.Module":
     if torch is None or nn is None:
         raise RuntimeError("Restoring DCCA projection heads requires PyTorch. Install torch before calling this function.")
+    # Support loading either a ProjectionHead state_dict (keys like "net.0.weight")
+    # or a wrapped AggregatorTargetHead state_dict where the projection is saved
+    # under the prefix "proj_target." (e.g. "proj_target.net.0.weight").
+    # If the latter, extract the proj_target sub-dictionary and continue.
+    if any(key.startswith("proj_target.") for key in state_dict.keys()):
+        sub: Dict[str, "torch.Tensor"] = {}
+        for k, v in state_dict.items():
+            if k.startswith("proj_target."):
+                sub[k[len("proj_target.") :]] = v
+        # replace local reference with the extracted projection state
+        state_dict = sub
+
     weight_keys = [key for key in state_dict.keys() if key.endswith(".weight")]
     if not weight_keys:
         raise ValueError("DCCA state dict does not contain linear layer weights.")
@@ -607,6 +619,8 @@ def _create_debug_alignment_figures(
     projector_b: nn.Module,
     anchor_tensor: torch.Tensor,
     target_tensor: torch.Tensor,
+    anchor_tensor_post: Optional[torch.Tensor] = None,
+    target_tensor_post: Optional[torch.Tensor] = None,
     pair_metadata: Sequence[Dict[str, object]],
     run_logger: Any,
     drop_ratio: float,
@@ -640,8 +654,15 @@ def _create_debug_alignment_figures(
         return
 
     analysis_batch = max(32, min(2048, anchor_tensor.size(0)))
-    projected_anchor = _project_in_batches(anchor_tensor, projector_a, device, analysis_batch)
-    projected_target = _project_in_batches(target_tensor, projector_b, device, analysis_batch)
+    if anchor_tensor_post is not None:
+        projected_anchor = anchor_tensor_post.detach().cpu()
+    else:
+        projected_anchor = _project_in_batches(anchor_tensor, projector_a, device, analysis_batch)
+
+    if target_tensor_post is not None:
+        projected_target = target_tensor_post.detach().cpu()
+    else:
+        projected_target = _project_in_batches(target_tensor, projector_b, device, analysis_batch)
 
     try:
         subset_indices = _select_subset_indices(anchor_tensor.size(0), max_points=1000, seed=sample_seed)
@@ -649,8 +670,8 @@ def _create_debug_alignment_figures(
         if subset_indices.numel() >= 2:
             anchor_raw = anchor_tensor.detach().cpu()
             target_raw = target_tensor.detach().cpu()
-            proj_anchor_raw = projected_anchor.detach().cpu()
-            proj_target_raw = projected_target.detach().cpu()
+            proj_anchor_raw = projected_anchor
+            proj_target_raw = projected_target
 
             before_features = torch.cat(
                 [anchor_raw[subset_indices], target_raw[subset_indices]], dim=0
@@ -757,6 +778,125 @@ def _create_debug_alignment_figures(
         run_logger.log(f"Saved alignment metrics to {metrics_path}")
     except Exception as exc:
         run_logger.log(f"Failed to compute alignment metrics: {exc}")
+
+    # Canonical correlation spectrum (updated to work with existing tensors). K.N. Nov 2025
+    try:
+        metrics_before = _canonical_metrics(
+            anchor_tensor.detach().to(projected_anchor.dtype),
+            target_tensor.detach().to(projected_target.dtype),
+            eps=dcca_eps,
+            drop_ratio=drop_ratio,
+            tcc_ratio=tcc_ratio,
+        )
+        metrics_after = _canonical_metrics(
+            projected_anchor,
+            projected_target,
+            eps=dcca_eps,
+            drop_ratio=drop_ratio,
+            tcc_ratio=tcc_ratio,
+        )
+        if metrics_before and metrics_after:
+            vals_before = metrics_before.get("canonical_correlations_sorted") or []
+            vals_after = metrics_after.get("canonical_correlations_sorted") or []
+            if vals_before and vals_after:
+                vals_before = np.asarray(vals_before, dtype=float)
+                vals_after = np.asarray(vals_after, dtype=float)
+                k_plot = int(min(len(vals_before), len(vals_after), 128))
+                if k_plot > 0:
+                    idx = np.arange(1, k_plot + 1)
+                    fig, axes = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
+                    for ax, values, title in (
+                        (axes[0], vals_before[:k_plot], "Pre-Aggregation"),
+                        (axes[1], vals_after[:k_plot], "Post-Aggregation"),
+                    ):
+                        ax.bar(idx, values, color="#4c72b0", alpha=0.7)
+                        cumulative = np.cumsum(values)
+                        ax.plot(idx, cumulative, color="#dd8452", linewidth=1.5, label="Cumulative sum")
+                        ax.set_title(f"{title} Canonical Spectrum (Top {k_plot})")
+                        ax.set_xlabel("Canonical component")
+                        ax.set_ylabel("Correlation")
+                        ax.set_ylim(0, 1.05)
+                        ax.legend(loc="upper right")
+                    spectrum_path = analysis_dir / "canonical_correlation_spectrum.png"
+                    fig.savefig(spectrum_path, dpi=200, bbox_inches="tight")
+                    plt.close(fig)
+                    run_logger.log(f"Saved canonical correlation spectrum to {spectrum_path}")
+    except Exception as exc:
+        run_logger.log(f"Failed to generate canonical correlation spectrum: {exc}")
+
+    # Geospatial distance heatmap (adapted to aggregated embeddings). K.N. Nov 2025
+    try:
+        geo_indices: List[int] = []
+        geo_coords: List[Tuple[float, float]] = []
+        geo_splits: List[str] = []
+        for idx, meta in enumerate(pair_metadata):
+            coord = meta.get("anchor_coord")
+            if coord is None:
+                coord = meta.get("target_weighted_coord")
+            if coord is None:
+                continue
+            try:
+                x, y = float(coord[0]), float(coord[1])
+            except Exception:
+                continue
+            if not (math.isfinite(x) and math.isfinite(y)):
+                continue
+            geo_indices.append(idx)
+            geo_coords.append((x, y))
+            geo_splits.append(str(meta.get("split") or "train"))
+        if geo_indices:
+            pre_dist = torch.linalg.norm(anchor_tensor - target_tensor, dim=1).detach().cpu().numpy()
+            post_dist = torch.linalg.norm(projected_anchor - projected_target, dim=1).detach().cpu().numpy()
+            pre_geo = pre_dist[geo_indices]
+            post_geo = post_dist[geo_indices]
+            geo_x = np.asarray([coord[0] for coord in geo_coords], dtype=float)
+            geo_y = np.asarray([coord[1] for coord in geo_coords], dtype=float)
+            vmin = float(min(pre_geo.min(), post_geo.min()))
+            vmax = float(max(pre_geo.max(), post_geo.max()))
+            if vmax - vmin < 1e-6:
+                vmax = vmin + 1e-6
+
+            fig, axes = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True, sharex=True, sharey=True)
+            for ax, values, title in (
+                (axes[0], pre_geo, "Pre-Aggregation"),
+                (axes[1], post_geo, "Post-Aggregation"),
+            ):
+                val_mask = np.array([split == "val" for split in geo_splits], dtype=bool)
+                sc = ax.scatter(
+                    geo_x,
+                    geo_y,
+                    c=values,
+                    cmap="viridis",
+                    vmin=vmin,
+                    vmax=vmax,
+                    s=40,
+                    alpha=0.9,
+                )
+                # if val_mask.any():
+                #     ax.scatter(
+                #         geo_x[val_mask],
+                #         geo_y[val_mask],
+                #         facecolors="none",
+                #         edgecolors="black",
+                #         linewidths=0.8,
+                #         s=60,
+                #         label="Validation",
+                #     )
+                #     ax.legend(loc="upper right")
+                ax.set_title(f"{title} Pairwise Distance")
+                ax.set_xlabel("Longitude")
+                ax.set_ylabel("Latitude")
+                color_label = (
+                    "||Latent_base(A) - Latent_base(B)||" if title == "Pre-Aggregation" else "||Latent_fused(A) - Latent_fused(B)||"
+                )
+                fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04, label=color_label)
+            geo_path = analysis_dir / "geospatial_distance_map.png"
+            fig.suptitle("Pairwise Distance Heatmap (Anchor vs Target)")
+            fig.savefig(geo_path, dpi=200, bbox_inches="tight")
+            plt.close(fig)
+            run_logger.log(f"Saved geospatial distance heatmap to {geo_path}")
+    except Exception as exc:
+        run_logger.log(f"Failed to create geospatial distance map: {exc}")
 
 def _get_bundle_embeddings(bundle: DatasetBundle) -> torch.Tensor:
     if bundle.embeddings is not None and bundle.embeddings.numel() > 0:

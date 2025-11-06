@@ -13,8 +13,104 @@ except Exception:  # pragma: no cover
     torch = None  # type: ignore[assignment]
     Tensor = None  # type: ignore[assignment]
 
+from Common.metrics_logger import save_metrics_json
+from Common.cls.infer.infer_maps import (write_prediction_outputs,)
+
+
 Coord = Tuple[int, int]
 
+def fusion_export_results(
+    fusion_dir: Path,
+    mlp: nn.Module,
+    history_payload: List[Dict[str, object]],
+    evaluation_summary: Dict[str, Dict[str, float]],
+    metrics_summary: Dict[str, object],
+    inference_outputs: Dict[str, Dict[str, object]],
+) -> Dict[str, object]:
+    fusion_dir.mkdir(parents=True, exist_ok=True)
+    metrics_payload = dict(metrics_summary)
+    metrics_payload["evaluation"] = evaluation_summary
+    metrics_payload["history"] = history_payload
+    metrics_path = fusion_dir / "metrics.json"
+    try:
+        save_metrics_json(metrics_payload, metrics_path)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to save fusion metrics: {exc}")
+    state_path = fusion_dir / "classifier.pt"
+    torch.save({"state_dict": mlp.state_dict()}, state_path)
+    inference_summary: Dict[str, object] = {}
+    for dataset_name, payload in inference_outputs.items():
+        out_dir = fusion_dir / dataset_name
+        write_prediction_outputs(
+            payload["prediction"],
+            payload["default_reference"],
+            out_dir,
+            pos_coords_by_region=payload["pos_map"],
+            neg_coords_by_region=payload["neg_map"],
+        )
+        # predictions_path = out_dir / "predictions.npy"
+        predictions_path = out_dir / "predictions.npz"
+        try:
+            prediction_payload = payload.get("prediction")
+            if isinstance(prediction_payload, dict):
+                global_payload = prediction_payload.get("GLOBAL") or {}
+                mean_map = global_payload.get("mean")
+                std_map = global_payload.get("std")
+            else:
+                mean_map = prediction_payload
+                std_map = None
+            pos_map = payload.get("pos_map") or {}
+            neg_map = payload.get("neg_map") or {}
+            pos_coords = [
+                (region, int(r), int(c))
+                for region, coords in pos_map.items()
+                for r, c in coords
+            ]
+            neg_coords = [
+                (region, int(r), int(c))
+                for region, coords in neg_map.items()
+                for r, c in coords
+            ]
+            row_cols = [tuple(rc) if isinstance(rc, (list, tuple)) else rc for rc in (payload.get("row_cols") or [])]
+            coords_list = payload.get("coords") or [None] * len(row_cols)
+            labels = payload.get("labels") or [0] * len(row_cols)
+            metadata = payload.get("metadata") or [None] * len(row_cols)
+            mean_values = payload.get("mean_values")
+            std_values = payload.get("std_values")
+            if mean_values is None and mean_map is not None and row_cols:
+                mean_values = [float(mean_map[r, c]) for r, c in row_cols]
+            if std_values is None and std_map is not None and row_cols:
+                std_values = [float(std_map[r, c]) for r, c in row_cols]
+            data_payload = {
+                "mean": np.asarray(mean_map, dtype=np.float32) if mean_map is not None else None,
+                "std": np.asarray(std_map, dtype=np.float32) if std_map is not None else None,
+                "row_cols": row_cols,
+                "coords": coords_list,
+                "labels": labels,
+                "metadata": metadata,
+                "mean_values": np.asarray(mean_values, dtype=np.float32) if mean_values is not None else None,
+                "std_values": np.asarray(std_values, dtype=np.float32) if std_values is not None else None,
+                "pos_coords": pos_coords,
+                "neg_coords": neg_coords,
+            }
+            # np.save(predictions_path, data_payload, allow_pickle=True)
+            np.savez_compressed(predictions_path, predictions=data_payload)
+
+        except Exception as exc:
+            print(f"[warn] Failed to save prediction array for {dataset_name}: {exc}")
+        inference_summary[dataset_name] = {
+            "output_dir": str(out_dir),
+            "npy_path": str(predictions_path),
+            "positive_count": payload["counts"]["pos"],
+            "negative_count": payload["counts"]["neg"],
+        }
+    return {
+        "metrics_path": str(metrics_path),
+        "state_dict_path": str(state_path),
+        "evaluation": evaluation_summary,
+        "history": history_payload,
+        "outputs": inference_summary,
+    }
 
 def _ensure_numpy_features(value: object) -> np.ndarray:
     if torch is not None and isinstance(value, Tensor):

@@ -8,15 +8,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-
-
-@dataclass
-class EmbeddingRecord:
-    embedding: np.ndarray
-    label: int
-    tile_id: str
-    coord: Optional[Tuple[float, float]] = None
-    metadata: Optional[Dict] = None
+from Common.data_utils import EmbeddingRecord
 
 
 class EmbeddingDataset(Dataset):

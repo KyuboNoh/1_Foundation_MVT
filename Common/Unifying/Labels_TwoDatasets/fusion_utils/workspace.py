@@ -18,9 +18,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 else:  # pragma: no cover - avoid optional torch dependency at runtime
     Tensor = None  # type: ignore[assignment]
 
-from ..datasets import DatasetConfig, EmbeddingRecord, load_embedding_records, summarise_records
+from ..datasets import DatasetConfig, load_embedding_records, summarise_records
 from ..overlaps import OverlapPair, OverlapSet, OverlapTile, load_overlap_pairs
-
+from Common.data_utils import EmbeddingRecord
 AlignmentConfig = Any
 
 
