@@ -1,6 +1,6 @@
-# Note: For training cls, pn_index_summary is critical to track positive/negative sample counts. by K.N. 30Oct2025
 # Note: The terminology of "anchor" and "target" datasets is used throughout this module to refer to the two datasets. 
 #       (Dataset 1 is the anchor and 2 is the target. No semantic meaning beyond that.) by K.N. 30Oct2025
+#       [CRITICAL] Currently, the code assumes that target dataset falls within the anchor dataset spatially for cls-2 training. by K.N. 30Oct2025
 
 from __future__ import annotations
 
@@ -13,11 +13,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Callable
 
 import numpy as np
+import random
 from affine import Affine
 try:
     import torch
     from torch import nn
-    from torch.utils.data import DataLoader, TensorDataset, Dataset
+    from torch.utils.data import DataLoader, TensorDataset, Dataset, Sampler
 except ImportError:  # pragma: no cover - optional dependency
     torch = None  # type: ignore[assignment]
     nn = None  # type: ignore[assignment]
@@ -55,7 +56,8 @@ from Common.Unifying.Labels_TwoDatasets import (
     _build_aligned_pairs_SetToSet,
     _normalise_coord,
     _normalise_row_col,
-    _collect_classifier_samples,
+    _apply_projector_based_PNlabels,
+    _apply_projector_based_PUNlabels,
     _subset_classifier_sample,
 )
 
@@ -130,19 +132,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--read-dcca",  action=argparse.BooleanOptionalAction, default=False,help="Load existing DCCA projection head weights before training (default: false).",)
     parser.add_argument("--dcca-weights-path", type=str, default=None, help="Optional path to a saved DCCA checkpoint used when --read-dcca is enabled.",)
 
-    parser.add_argument(
-        "--train-cls",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Train the PN classifier after DCCA training (default: false).",
-    )
-    parser.add_argument(
-        "--train-cls-method",
-        type=int,
-        choices=[1, 2],
-        default=1,
-        help="PN classifier training method to use (1 [Overlap region; Use labels from chosen 'overlapregion_label' in config] or 2 [No label in overlapping region]; default: 1).",
-    )
+    parser.add_argument("--train-cls-1", action=argparse.BooleanOptionalAction, default=False, help="Train the PN classifier for Non-Overlapping part.",)
+    parser.add_argument("--train-cls-2", action=argparse.BooleanOptionalAction, default=False, help="Train the PN classifier for Overlapping part.",)
     parser.add_argument(
         "--mlp-hidden-dims",
         type=int,
@@ -260,7 +251,8 @@ def main() -> None:
         raise RuntimeError("No overlap pairs were resolved; cannot start training.")
 
     gA = None
-    gAB = None  #TODO: Temp
+    gAB = None  #Temp
+    inference_results = {}
     #################################### Preprocess - Augmenting positive labels ####################################
     augmentation_by_dataset: Dict[str, Dict[str, List[np.ndarray]]] = {}
     augmentation_loaded_counts: Dict[str, int] = {}
@@ -334,48 +326,11 @@ def main() -> None:
         overlap_set=workspace.overlap,
     )
 
-    # label_matcher = OverlapAlignmentLabels(workspace, pn_label_maps)
-    # label_cross_matches = label_matcher.build_label_matches(
-    #     pairs=pairs,
-    #     max_coord_error=max_coord_error,
-    # )
-    # label_cross_matches = _normalise_cross_matches(label_cross_matches, anchor_name, target_name)
-
-    # if debug_mode:
-    #     def _count_labels(entries: List[Dict[str, object]], field: str) -> Counter:
-    #         counter: Counter = Counter()
-    #         for entry in entries:
-    #             value = entry.get(field)
-    #             if value is None:
-    #                 continue
-    #             if isinstance(value, (list, tuple)):
-    #                 for item in value:
-    #                     counter[int(item)] += 1
-    #             else:
-    #                 counter[int(value)] += 1
-    #         return counter
-
-    #     dataset1_match_counts = _count_labels(label_cross_matches, "label_in_dataset_1")
-    #     dataset2_match_counts = _count_labels(label_cross_matches, "label_in_dataset_2")
-    #     print(f"[debug] label matches in {anchor_name} using label in {target_name}: {dict(dataset1_match_counts)}")
-    #     print(f"[debug] label matches in {target_name} using label in {target_name}: {dict(dataset2_match_counts)}")
-
     pairs_by_region = defaultdict(lambda: Counter())
     for meta in pair_metadata:
         anchor_region = meta.get("anchor_region", "UNKNOWN")
         for label in meta["target_labels"]:
             pairs_by_region[anchor_region][label] += 1
-
-    # pn_index_sets: Dict[str, Dict[str, set[int]]] = {}
-    # for dataset, regions in pn_index_summary.items():
-    #     pos_union: set[int] = set()
-    #     neg_union: set[int] = set()
-    #     for region, payload in regions.items():
-    #         pos_indices = [int(idx) for idx in payload.get("pos_original_indices", [])]
-    #         neg_indices = [int(idx) for idx in payload.get("neg_original_indices", [])]
-    #         pos_union.update(pos_indices)
-    #         neg_union.update(neg_indices)
-    #     pn_index_sets[dataset] = {"pos": pos_union, "neg": neg_union}
 
     if not anchor_vecs:
         print("[warn] No qualifying overlap groups were found for training.")
@@ -499,6 +454,7 @@ def main() -> None:
 
         anchor_vecs_train = [anchor_vecs[i] for i in train_indices_list]
         target_stack_train = [target_stack_per_anchor[i] for i in train_indices_list]
+
         metadata_train = [pair_metadata[i] for i in train_indices_list]
 
         anchor_vecs_val = [anchor_vecs[i] for i in val_indices_list] if val_indices_list else []
@@ -696,7 +652,7 @@ def main() -> None:
     #################################### Training Overlap Alignment (Transformer-based Aggregation DCCA) END ####################################
 
     #################################### Training Classifier after Overlap Alignment ####################################
-    if args.train_cls:
+    if args.train_cls_1 or args.train_cls_2:
         
         #################################### Training Cls - 0) GET Training data ready (START) ####################################
         if not train_dcca:
@@ -764,36 +720,27 @@ def main() -> None:
                     projector_b = target_head.to(device)
                 else:
                     projector_b = _projection_head_from_state(state_b_dict).to(device)
-
-
             else:
                 projector_a = projector_a.to(device)
                 projector_b = projector_b.to(device)
 
         projector_a.eval()
         projector_b.eval()
-        methods_to_run = sorted({int(args.train_cls_method)})
-        if debug_mode:
-            methods_to_run = [1, 2]
         projector_map = {anchor_name: projector_a, target_name: projector_b,}
 
         overlap_mask_info = _load_overlap_mask_data(cfg.overlap_mask_path)
         if overlap_mask_info is None:
-            run_logger.log("[inference] No overlap mask available; using default reference")
-            # Create a default reference grid based on matched coordinates
-            min_x = min(c[0] for c in matched_coords if c)
-            max_x = max(c[0] for c in matched_coords if c)
-            min_y = min(c[1] for c in matched_coords if c)
-            max_y = max(c[1] for c in matched_coords if c)
-            
-            overlap_mask_info = {
-                'transform': from_origin(min_x, max_y, (max_x-min_x)/100, (max_y-min_y)/100),
-                'height': 100,
-                'width': 100,
-                'mask': np.ones((100, 100), dtype=bool)
-            }
-
+            run_logger.log("[inference] No overlap mask available")
+            raise RuntimeError("Overlap mask is required for classifier training but none was provided.")
         stack = _MaskStack(overlap_mask_info)
+
+
+        sample_sets: Dict[str, Dict[str, object]] = {}
+        label_summary_meta: Dict[str, List[str]] = {}
+        anchor_overlap_samples: Optional[Dict[str, object]] = None
+        anchor_non_overlap_samples: Optional[Dict[str, object]] = None
+        target_overlap_samples: Optional[Dict[str, object]] = None
+        target_non_overlap_samples: Optional[Dict[str, object]] = None
 
         def _summarise_sample_labels(sample_entry: Optional[Dict[str, object]]) -> List[str]:
             if not sample_entry:
@@ -813,19 +760,13 @@ def main() -> None:
                     summary.append("unknown")
             return summary
 
-        sample_sets: Dict[str, Dict[str, object]] = {}
-        label_summary_meta: Dict[str, List[str]] = {}
-        anchor_overlap_samples: Optional[Dict[str, object]] = None
-        anchor_non_overlap_samples: Optional[Dict[str, object]] = None
-
-
         # Get all the data ready
         for dataset_name, projector in projector_map.items():
             if projector is None:
                 run_logger.log(f"[cls] projector unavailable for dataset {dataset_name}; skipping.")
                 continue
 
-            sample_set = _collect_classifier_samples(
+            sample_set = _apply_projector_based_PUNlabels(
                 workspace=workspace,
                 dataset_name=dataset_name,
                 pn_lookup=pn_label_maps.get(dataset_name),
@@ -840,115 +781,93 @@ def main() -> None:
                 sample_sets[dataset_name] = sample_set
                 label_summary_meta[dataset_name] = _summarise_sample_labels(sample_set)
 
-            # Get overlap-region anchor, target (global, overlap) data ready
-            overlap_indices = set(anchor_overlap_samples.get("indices", [])) if anchor_overlap_samples else set()
-                
-            if overlap_indices:
-                keep_mask = [idx not in overlap_indices for idx in sample_set.get("indices", [])]
-                anchor_non_overlap_samples = _subset_classifier_sample(sample_set, keep_mask, subset_tag="non_overlap")
-
-
-            
+            # Get overlap-region anchor, anchor (global, overlap) data ready
             if dataset_name == anchor_name and sample_set:
-                anchor_overlap_samples = _collect_classifier_samples(
-                    workspace=workspace,
-                    dataset_name=dataset_name,
-                    pn_lookup=pn_label_maps.get(dataset_name),
-                    projector=projector,
-                    device=device,
-                    run_logger=run_logger,
-                    overlap_mask=overlap_mask_info,
-                    apply_overlap_filter=True,
+                anchor_overlap_samples = _apply_projector_based_PUNlabels(
+                    workspace=workspace, dataset_name=dataset_name, pn_lookup=pn_label_maps.get(dataset_name),
+                    projector=projector, device=device, run_logger=run_logger,
+                    overlap_mask=overlap_mask_info, apply_overlap_filter=True,
                 )
                 overlap_indices = set(anchor_overlap_samples.get("indices", [])) if anchor_overlap_samples else set()
-                
                 if overlap_indices:
                     keep_mask = [idx not in overlap_indices for idx in sample_set.get("indices", [])]
                     anchor_non_overlap_samples = _subset_classifier_sample(sample_set, keep_mask, subset_tag="non_overlap")
-                    overlap_count = int(anchor_overlap_samples["labels"].numel())
-                    run_logger.log(f"[cls] Identified {overlap_count} anchor samples 'inside' overlap region for nnPU training.")
-                else:
-                    anchor_non_overlap_samples = sample_set
 
-                # Get NON overlap-region anchor (global) data ready
-                if anchor_non_overlap_samples:
-                    non_overlap_count = int(anchor_non_overlap_samples["labels"].numel())
-                    run_logger.log(f"[cls] Identified {non_overlap_count} anchor samples 'outside' overlap region for nnPU training.")
+                # print("anchor_all", int(sample_set["labels"].numel()))
+                # print("anchor_overlap", int(anchor_overlap_samples["labels"].numel()))
+                # print("anchor_non_overlap", int(anchor_non_overlap_samples["labels"].numel()))
 
-                    anchor_non_overlap_tensor: Optional[torch.Tensor] = None
-                    anchor_non_overlap_labels: Optional[torch.Tensor] = None
-                    anchor_non_overlap_metadata: Optional[List[Dict[str, object]]] = None
-                    anchor_non_overlap_coords: Optional[List[Optional[Tuple[float, float]]]] = None
-
-                    bundle = workspace.datasets.get(anchor_name) if hasattr(workspace, "datasets") else None
-                    projected_subset: Optional[torch.Tensor] = None
-                    if bundle is not None:
-                        candidate_vectors: List[np.ndarray] = []
-                        for idx in anchor_non_overlap_samples.get("indices", []):
-                            try:
-                                record = bundle.records[int(idx)]
-                            except (TypeError, ValueError, IndexError, AttributeError):
-                                record = None
-                            if record is None or getattr(record, "embedding", None) is None:
-                                continue
-                            candidate_vectors.append(np.asarray(record.embedding, dtype=np.float32))
-                        if candidate_vectors:
-                            stacked = np.stack(candidate_vectors, axis=0)
-                            with torch.no_grad():
-                                projected_subset = projector_a(torch.from_numpy(stacked).to(device)).detach().cpu()
-                        # Ensure projected_subset aligns with the PN-labelled samples we intend to use.
-                        # candidate_vectors may be shorter than the original sample list if some records
-                        # are missing embeddings; in that case, fall back to the features already
-                        # computed and stored in anchor_non_overlap_samples to preserve alignment.
-                        if projected_subset is None:
-                            projected_subset = anchor_non_overlap_samples["features"].clone()
-                        else:
-                            try:
-                                labels_count = int(anchor_non_overlap_samples["labels"].numel())
-                                if projected_subset.size(0) != labels_count:
-                                    run_logger.log(
-                                        f"[cls] Projected subset size ({projected_subset.size(0)}) does not match label count ({labels_count}); using stored features instead."
-                                    )
-                                    projected_subset = anchor_non_overlap_samples["features"].clone()
-                            except Exception:
-                                # If anything goes wrong checking sizes, revert to stored features.
-                                projected_subset = anchor_non_overlap_samples["features"].clone()
-                    anchor_non_overlap_tensor = projected_subset
-                    anchor_non_overlap_labels = anchor_non_overlap_samples["labels"].clone()
-                    anchor_non_overlap_metadata = list(anchor_non_overlap_samples.get("metadata", []))
-                    anchor_non_overlap_coords = list(anchor_non_overlap_samples.get("coords", []))
-                    positives = int((anchor_non_overlap_labels > 0).sum().item())
-                    unlabelled = int((anchor_non_overlap_labels == 0).sum().item())
-                    total_non_overlap = int(anchor_non_overlap_labels.numel())
-                    run_logger.log(
-                        "[cls] Anchor non-overlap embeddings prepared: total={total}, positives={pos}, unlabelled={unk}".format(
-                            total=total_non_overlap, pos=positives, unk=unlabelled,
-                        )
-                    )
-
+            # Get overlap-region anchor, target (global, overlap) data ready
             if dataset_name == target_name and sample_set:
-                target_overlap_samples = _collect_classifier_samples(
-                    workspace=workspace,
-                    dataset_name=dataset_name,
-                    pn_lookup=pn_label_maps.get(dataset_name),
-                    projector=projector,
-                    device=device,
-                    run_logger=run_logger,
-                    overlap_mask=overlap_mask_info,
-                    apply_overlap_filter=True,
+                run_logger.log( "[DEVVVVV] ")
+                run_logger.log(f"[DEVVVVV] The code currently assumes that the target dataset falls within the overlap region entirely.")   # YOU NEED THROUGH UPDATES FOR OVERLAP_MASK UPDATE IN integrate_stac.py
+                run_logger.log( "[DEVVVVV] ")
+                target_overlap_samples = _apply_projector_based_PUNlabels(
+                    workspace=workspace, dataset_name=dataset_name, pn_lookup=pn_label_maps.get(dataset_name),
+                    projector=projector, device=device, run_logger=run_logger,
+                    overlap_mask=None, apply_overlap_filter=False,
                 )
-
         #################################### Training Cls - 0) GET Training data ready (END) ####################################
 
-        
-
-        
+    if args.train_cls_1:        
         #################################### Training Cls - 1) GLOBAL\OVERLAP using GLOBAL data (START) ####################################
         # Stat training of nnPU from (Global\Overlap) Anchor (Global) data
-        if anchor_non_overlap_tensor is None or anchor_non_overlap_labels is None:
+        if anchor_non_overlap_samples is None or anchor_non_overlap_samples is None:
             raise RuntimeError("Anchor non-overlap samples unavailable for classifier training; aborting.")
-        uA = anchor_non_overlap_tensor.float()      # projected features (u)
-        yA_pu = torch.where(anchor_non_overlap_labels > 0, 1, -1).long()
+        uA = anchor_non_overlap_samples["features"].float()                                 # DDCA-projected features (u)
+        yA_pu = torch.where(anchor_non_overlap_samples["labels"] >= 0.9, 1, -1).long()      # nnPU labels (+1/-1) from PN labels
+
+
+        if debug_mode:
+            # After line 881 in train.py
+            temp_crd = anchor_non_overlap_samples.get("coords")  # Get coordinates
+            temp_labels = anchor_non_overlap_samples["labels"]
+            yA_pu = torch.where(temp_labels >= 0.9, 1, -1).long()
+
+            # Create scatter plot of coordinates colored by labels
+            if plt is not None and temp_crd is not None:
+                fig, ax = plt.subplots(figsize=(10, 8))
+                
+                # Separate positive and negative samples
+                pos_mask = (yA_pu == 1).cpu().numpy()
+                neg_mask = (yA_pu == -1).cpu().numpy()
+                
+                # Extract coordinates
+                coords_array = np.array(temp_crd)
+                
+                # Plot negative samples (unlabeled)
+                if neg_mask.any():
+                    ax.scatter(coords_array[neg_mask, 0], coords_array[neg_mask, 1], 
+                            c='blue', s=5, alpha=0.5, label=f'Unlabeled (n={neg_mask.sum()})', 
+                            marker='H')
+                
+                # Plot positive samples
+                if pos_mask.any():
+                    ax.scatter(coords_array[pos_mask, 0], coords_array[pos_mask, 1], 
+                            c='red', s=5, alpha=0.7, label=f'Positive (n={pos_mask.sum()})', 
+                            marker='H')
+                
+                ax.set_xlabel('X Coordinate')
+                ax.set_ylabel('Y Coordinate')
+                ax.set_title(f'Anchor Non-Overlap Samples Distribution\n'
+                            f'Total: {len(yA_pu)}, Positive: {pos_mask.sum()}, Unlabeled: {neg_mask.sum()}')
+                ax.legend(loc='best')
+                ax.grid(True, alpha=0.3)
+                ax.set_aspect('equal', adjustable='datalim')
+                
+                # Save plot
+                debug_plot_path = Path(cfg.output_dir) / "debug_cls1_anchor_non_overlap_distribution.png"
+                debug_plot_path.parent.mkdir(parents=True, exist_ok=True)
+                fig.savefig(debug_plot_path, dpi=150, bbox_inches='tight')
+                plt.close(fig)
+                
+                run_logger.log(f"[cls-1] Saved anchor non-overlap distribution plot to {debug_plot_path}")
+                
+                # Print statistics
+                run_logger.log(f"[cls-1] Anchor non-overlap samples: total={len(yA_pu)}, "
+                            f"positive={pos_mask.sum()}, unlabeled={neg_mask.sum()}, "
+                            f"positive_ratio={pos_mask.sum()/len(yA_pu):.4f}")
+        
         # Sanity-check shapes before creating DataLoader to avoid silent StopIteration later.
         try:
             n_u = int(uA.size(0))
@@ -1002,53 +921,95 @@ def main() -> None:
         uA_val = uA[val_idx_list].contiguous() if val_idx_list else uA.new_empty((0, uA.size(1)))
         yA_pu_val = yA_pu[val_idx_list].contiguous() if val_idx_list else yA_pu.new_empty((0,))
 
-        train_loader = DataLoader(TensorDataset(uA_train, yA_pu_train), batch_size=cfg.cls_training.batch_size, shuffle=True)
-        val_loader = DataLoader(TensorDataset(uA_val, yA_pu_val), batch_size=cfg.cls_training.batch_size, shuffle=False)
+        train_ds = TensorDataset(uA_train, yA_pu_train)
+        val_ds   = TensorDataset(uA_val,   yA_pu_val)
 
-        # Positive prior (quick estimate; replace with TIcE/AlphaMax for further development)
-        pi_p = float((yA_pu == 1).sum().item()) / max(1, yA_pu.numel())
-        pi_p = float(min(max(pi_p, 1e-3), 0.999))  # clamp for stability
+        # --- indices for P and U ---
+        pos_idx = (yA_pu_train == 1).nonzero(as_tuple=True)[0].tolist()
+        unl_idx = (yA_pu_train != 1).nonzero(as_tuple=True)[0].tolist()
+        if len(pos_idx) == 0:
+            raise RuntimeError("No positives in training set; cannot construct PU batches.")
+
+        B = int(getattr(cfg.cls_training, "batch_size", 512))
+        # choose at least 1 positive per batch; you can tune this:
+        # k_pos = min(max(1, int(max(1, math.ceil(0.05 * B)))) , len(pos_idx))  # e.g., 5% of batch or at least 1
+        k_pos = min(int(max(1, math.ceil(0.05 * B))) , len(pos_idx))  # e.g., 5% of batch or at least 1
+
+        k_unl = B - k_pos
+        sampler = PUBatchSampler(pos_idx, unl_idx, k_pos=k_pos, k_unl=k_unl, seed=cfg.seed)
+
+        # IMPORTANT: when using batch_sampler, do not pass batch_size/shuffle
+        train_loader = DataLoader(train_ds, batch_sampler=sampler, num_workers=0)
+        val_loader   = DataLoader(val_ds, batch_size=B, shuffle=False, num_workers=0)
+
+        # --- global prior (use your dataset-wide estimate; don't recompute per batch) ---
+        pi_p = float((yA_pu == 1).sum().item()) / max(1, int(yA_pu.numel()))
+        pi_p = float(min(max(pi_p, 1e-4), 0.2))  # clamp only to keep numerics sane
 
         encA = nn.Identity(); pA = nn.Identity()    # we are already in u-space
         gA = train_nnpu_a_only(encA, pA, train_loader, val_loader, pi_p, lr=cfg.dcca_training.lr, epochs=cfg.cls_training.epochs, device=device,)
+        
+        # After training gA inference
+        uA_overlap = anchor_overlap_samples["features"].float()
+        inference_results["gA_Overlap"] = run_inference_gA_only(
+            uA=uA_overlap, 
+            samples=anchor_overlap_samples,
+            gA=gA,
+            device=device,
+            cfg=cfg,
+            output_dir=Path(cfg.output_dir) / "cls_1_inference_results" / "Overlap",
+            run_logger=run_logger,
+            passes=cfg.cls_training.mc_dropout_passes
+        )
+
+        inference_results["gA_Non_Overlap"] = run_inference_gA_only(
+            uA=uA, 
+            samples=anchor_non_overlap_samples,
+            gA=gA,
+            device=device,
+            cfg=cfg,
+            output_dir=Path(cfg.output_dir) / "cls_1_inference_results" / "Non_Overlap",
+            run_logger=run_logger,
+            passes=cfg.cls_training.mc_dropout_passes
+        )
         #################################### Training Cls - 1) GLOBAL\OVERLAP using GLOBAL data (END) ####################################
 
-        # After training gA (around line 1037)
-        if gA is not None:
-            # Get input dimension from the first layer of gA's network
-            d = gA.net[0].in_features  # Get dimension from first linear layer            
+    # After training gA (around line 1037)
+    if gA is not None:
+        # Get input dimension from the first layer of gA's network
+        d = gA.net[0].in_features  # Get dimension from first linear layer            
 
-            # Save A-only PN head
-            gA_state = {
-                'state_dict': gA.state_dict(),
-                'input_shape': d,  # feature dimension
-                'architecture': 'PNHeadAOnly'
-            }
-            save_path = Path(cfg.output_dir) / "pn_head_A_only.pt"
-            torch.save(gA_state, save_path)
-            run_logger.log(f"[cls] Saved A-only PN head (input dim={d}) to {save_path}")        
+        # Save A-only PN head
+        gA_state = {
+            'state_dict': gA.state_dict(),
+            'input_shape': d,  # feature dimension
+            'architecture': 'PNHeadAOnly'
+        }
+        save_path = Path(cfg.output_dir) / "cls_1_nonoverlap.pt"
+        torch.save(gA_state, save_path)
+        run_logger.log(f"[cls] Saved A-only PN head (input dim={d}) to {save_path}")        
 
-        # After gA training and before gAB training 
-        if gA is None:
-            # Try to load saved A-only PN head
-            gA_path = Path(cfg.output_dir) / "pn_head_A_only.pt"
-            if gA_path.exists():
-                try:
-                    gA_state = torch.load(gA_path)
-                    d = gA_state['input_shape']
-                    gA = PNHeadAOnly(d=d).to(device)
-                    gA.load_state_dict(gA_state['state_dict'])
-                    gA.eval()
-                    run_logger.log(f"[cls] Loaded A-only PN head (input dim={d}) from {gA_path}")
-                except Exception as e:
-                    run_logger.log(f"[cls] Failed to load A-only PN head from {gA_path}: {str(e)}")
-                    raise RuntimeError("Could not train or load A-only PN head required for unified training")
-            else:
-                raise RuntimeError("A-only PN head not found and training failed; cannot proceed with unified training")
+    # After gA training and before gAB training 
+    if gA is None:
+        # Try to load saved A-only PN head
+        gA_path = Path(cfg.output_dir) / "cls_1_nonoverlap.pt"
+        if gA_path.exists():
+            try:
+                gA_state = torch.load(gA_path)
+                d = gA_state['input_shape']
+                gA = PNHeadAOnly(d=d).to(device)
+                gA.load_state_dict(gA_state['state_dict'])
+                gA.eval()
+                run_logger.log(f"[cls] Loaded A-only PN head (input dim={d}) from {gA_path}")
+            except Exception as e:
+                run_logger.log(f"[cls] Failed to load A-only PN head from {gA_path}: {str(e)}")
+                raise RuntimeError("Could not train or load A-only PN head required for unified training")
+        else:
+            raise RuntimeError("A-only PN head not found and training failed; cannot proceed with unified training")
 
         #################################### Training Cls - 2) GLOBAL\OVERLAP using GLOBAL data (START) ####################################
         # ---------- simple dataset for precomputed u/v ----------
-        class UVDataset(Dataset):
+    class UVDataset(Dataset):
             """
             u: [N, d] (required)
             v: [N, d] (optional; if None, uses zeros like u)
@@ -1071,7 +1032,7 @@ def main() -> None:
             def __len__(self): return self.u.size(0)
             def __getitem__(self, i): return self.u[i], self.v[i], self.b_missing[i]
 
-        def build_b_to_a_mapping(target_coords: List[Tuple[float, float]], 
+    def build_b_to_a_mapping(target_coords: List[Tuple[float, float]], 
                                 anchor_coords: List[Tuple[float, float]], 
                                 max_coord_error: float) -> torch.Tensor:
             """
@@ -1104,13 +1065,18 @@ def main() -> None:
                 
                 # Find closest anchor within threshold
                 valid_matches = distances <= max_coord_error
+                # if np.any(valid_matches):
+                #     closest_a_idx = np.argmin(distances)
+                #     b_to_a[b_idx] = closest_a_idx
+
                 if np.any(valid_matches):
-                    closest_a_idx = np.argmin(distances)
+                    vv = np.flatnonzero(valid_matches)
+                    closest_a_idx = vv[np.argmin(distances[vv])]
                     b_to_a[b_idx] = closest_a_idx
-                    
+
             return b_to_a
 
-        def expand_pairs(u_bc, v_raw, b_to_a):
+    def expand_pairs(u_bc, v_raw, b_to_a):
             """
             Return expanded (u_exp, v_exp, b_missing_exp) where each B row becomes one training pair.
             Unmatched A rows can be added with v=0 and b_missing=1 if you want to include them too.
@@ -1122,7 +1088,7 @@ def main() -> None:
             b_missing_exp = torch.zeros(u_exp.size(0), 1, device=u_bc.device)
             return u_exp, v_exp, b_missing_exp
 
-        def _infer_half_window_error_from_meta(workspace, anchor_name: str, target_name: str) -> Optional[float]:
+    def _infer_half_window_error_from_meta(workspace, anchor_name: str, target_name: str) -> Optional[float]:
             """Prefer dataset_window_spacing from integration metadata json."""
             try:
                 # Direct path construction
@@ -1161,85 +1127,101 @@ def main() -> None:
                 
             return None
 
-        u_overlap = anchor_overlap_samples["features"].float()
-        v_overlap = target_overlap_samples["features"].float()
+    if args.train_cls_2:
+        # u_overlap = anchor_overlap_samples["features"].float()
+        # v_overlap = target_overlap_samples["features"].float()
+        # # make b_to_a that is an integer vector of length Nb where each B sample is mapped to the row index of its matched A sample
+        # half_win_err = _infer_half_window_error_from_meta(workspace, anchor_name, target_name)
+        # # print("[DEVVVVVVVVVVVVVVVVVVVVVVVV] half_win_err is NOW TEMPORALY 20 times ", half_win_err*20)
+        # # half_win_err = half_win_err * 20
+        # if half_win_err is not None and math.isfinite(half_win_err) and half_win_err > 0:
+        #     max_coord_error = half_win_err
+        #     run_logger.log(f"[cls] Using half window spacing as matching radius: {max_coord_error}")
+        # else:
+        #     max_coord_error = auto_coord_error(workspace, anchor_name, target_name)
+        #     run_logger.log(f"[cls] Falling back to auto_coord_error: {max_coord_error}")
 
-        # make b_to_a that is an integer vector of length Nb where each B sample is mapped to the row index of its matched A sample
-        half_win_err = _infer_half_window_error_from_meta(workspace, anchor_name, target_name)
-        print("[DEVVVVVVVVVVVVVVVVVVVVVVVV] half_win_err is NOW TEMPORALY 20 times ", half_win_err*20)
-        half_win_err = half_win_err * 20
-        if half_win_err is not None and math.isfinite(half_win_err) and half_win_err > 0:
-            max_coord_error = half_win_err
-            run_logger.log(f"[cls] Using half window spacing as matching radius: {max_coord_error}")
-        else:
-            max_coord_error = auto_coord_error(workspace, anchor_name, target_name)
-            run_logger.log(f"[cls] Falling back to auto_coord_error: {max_coord_error}")
+        # if max_coord_error is None or not math.isfinite(max_coord_error) or max_coord_error <= 0:
+        #     raise ValueError(f"Could not determine valid coordinate matching radius (half_win_err={half_win_err}, auto_coord_error={max_coord_error})")
 
-        if max_coord_error is None or not math.isfinite(max_coord_error) or max_coord_error <= 0:
-            raise ValueError(f"Could not determine valid coordinate matching radius (half_win_err={half_win_err}, auto_coord_error={max_coord_error})")
+        # anchor_coords = anchor_overlap_samples["coords"]
+        # target_coords = target_overlap_samples["coords"]
+        # b_to_a = build_b_to_a_mapping(target_coords, anchor_coords, max_coord_error)
+        # u_exp, v_exp, bmiss_exp = expand_pairs(u_overlap, v_overlap, b_to_a)
+        # run_logger.log(f"[cls] For cls-2; Pair expansion ended up from {u_overlap.shape[0], v_overlap.shape[0]} to {u_exp.shape[0], v_exp.shape[0]}")
 
-        anchor_coords = anchor_overlap_samples["coords"]
-        target_coords = target_overlap_samples["coords"]
-        b_to_a = build_b_to_a_mapping(target_coords, anchor_coords, max_coord_error)
-        u_exp, v_exp, bmiss_exp = expand_pairs(u_overlap, v_overlap, b_to_a)
-        run_logger.log(f"[cls] Pair expansion ended up from {u_overlap.shape[0], v_overlap.shape[0]} to {u_exp.shape[0], v_exp.shape[0]}")
+        u_exp, v_exp, bmiss_exp = build_cls2_dataset_from_dcca_pairs(anchor_vecs, target_stack_per_anchor, projector_a, projector_b, device)
+        run_logger.log(f"[cls] For cls-2; Pair expansion ended up from {len(anchor_vecs), len(target_stack_per_anchor)} to {u_exp.shape[0], v_exp.shape[0]}")
+
         dataset_uv = UVDataset(u_exp, v_exp, bmiss_exp)
-
         gAB = fit_unified_head_OVERLAP_from_uv(gA, DataLoader(dataset_uv, batch_size=cfg.cls_training.batch_size, shuffle=True), 
-                                                d_u=u_overlap.size(1), device=device, lr=cfg.cls_training.lr, steps=cfg.cls_training.epochs, 
-                                                view_dropout=0.3, noise_sigma=0.0)
+                                              d_u=u_exp.size(1), device=device, lr=cfg.cls_training.lr, steps=cfg.cls_training.epochs
+                                              )
+        # gAB = fit_unified_head_OVERLAP_from_uv(gA, DataLoader(dataset_uv, batch_size=cfg.cls_training.batch_size, shuffle=True), 
+        #                                         d_u=u_exp.size(1), device=device, lr=cfg.cls_training.lr, steps=cfg.cls_training.epochs, 
+        #                                         view_dropout=0.3, noise_sigma=0.0)
+
         #################################### Training Cls - 2) GLOBAL\OVERLAP using GLOBAL data (END) ####################################
+        # Run gAB (unified) inference
+        inference_results["gAB_Overlap"] = run_overlap_inference_gAB_from_pairs(
+            anchor_vecs=anchor_vecs,
+            target_stack_per_anchor=target_stack_per_anchor,
+            pair_metadata=pair_metadata,
+            projector_a=projector_a,
+            projector_b=projector_b,  # AggregatorTargetHead if you trained with the transformer aggregator
+            gAB=gAB,
+            device=device,
+            cfg=cfg,
+            output_dir=Path(cfg.output_dir) / "cls_2_inference_results" / "Overlap",
+            run_logger=run_logger,
+            passes=cfg.cls_training.mc_dropout_passes,
+            target_vecs=target_vecs,  # if projector_b is a plain ProjectionHead (no transformer)
+            batch_size=INFERENCE_BATCH_SIZE,
+        )
+        
+        # inference_results["gAB_Overlap"] = run_overlap_inference_gAB(
+        #     u_overlap=u_overlap, v_overlap=v_overlap,b_to_a=b_to_a,
+        #     anchor_overlap_samples=anchor_overlap_samples,
+        #     target_overlap_samples=target_overlap_samples,
+        #     gAB=gAB, device=device, cfg=cfg,
+        #     output_dir=Path(cfg.output_dir) / "cls_2_inference_results" / "Overlap",
+        #     run_logger=run_logger,
+        #     passes=cfg.cls_training.mc_dropout_passes
+        # )
 
 
+    # After training gAB (around line)
+    if gAB is not None:
+        # Get input dimension from the first layer of gA's network
+        d_u = gAB.net[0].in_features  # Get dimension from first linear layer
 
-        # After training gAB (around line)
-        if gAB is not None:
-            # Get input dimension from the first layer of gA's network
-            d_u = gAB.net[0].in_features  # Get dimension from first linear layer
+        # Save unified PN head
+        gAB_state = {
+            'state_dict': gAB.state_dict(),
+            'input_shape': d_u,  # feature dimension
+            'architecture': 'PNHeadUnified'
+        }
+        save_path = Path(cfg.output_dir) / "cls_2_unified.pt"
+        torch.save(gAB_state, save_path)
+        run_logger.log(f"[cls] Saved unified PN head (input dim={d_u}) to {save_path}")
 
-            # Save unified PN head
-            gAB_state = {
-                'state_dict': gAB.state_dict(),
-                'input_shape': d_u,  # feature dimension
-                'architecture': 'PNHeadUnified'
-            }
-            save_path = Path(cfg.output_dir) / "pn_head_unified.pt"
-            torch.save(gAB_state, save_path)
-            run_logger.log(f"[cls] Saved unified PN head (input dim={d_u}) to {save_path}")
-
-        # After gAB training
-        if gAB is None:
-            # Try to load saved A-only PN head
-            gA_path = Path(cfg.output_dir) / "pn_head_unified.pt"
-            if gA_path.exists():
-                try:
-                    gAB_state = torch.load(gA_path)
-                    d = gAB_state['input_shape']
-                    gAB = PNHeadAOnly(d=d).to(device)
-                    gAB.load_state_dict(gAB_state['state_dict'])
-                    gAB.eval()
-                    run_logger.log(f"[cls] Loaded A-only PN head (input dim={d}) from {gA_path}")
-                except Exception as e:
-                    run_logger.log(f"[cls] Failed to load A-only PN head from {gA_path}: {str(e)}")
-                    raise RuntimeError("Could not train or load A-only PN head required for unified training")
-            else:
-                raise RuntimeError("A-only PN head not found and training failed; cannot proceed with unified training")
-
-
-    # After training gA and gAB
-    inference_results = run_overlap_inference(
-        u_overlap=u_overlap,
-        v_overlap=v_overlap,
-        b_to_a=b_to_a,  # Add this parameter
-        anchor_overlap_samples=anchor_overlap_samples,
-        target_overlap_samples=target_overlap_samples,
-        gA=gA,
-        gAB=gAB,
-        device=device,
-        cfg=cfg,
-        output_dir=Path(cfg.output_dir),
-        run_logger=run_logger
-    )
+    # After gAB training
+    if gAB is None:
+        # Try to load saved A-only PN head
+        gA_path = Path(cfg.output_dir) / "cls_2_unified.pt"
+        if gA_path.exists():
+            try:
+                gAB_state = torch.load(gA_path)
+                d = gAB_state['input_shape']
+                gAB = PNHeadAOnly(d=d).to(device)
+                gAB.load_state_dict(gAB_state['state_dict'])
+                gAB.eval()
+                run_logger.log(f"[cls] Loaded unified PN head (input dim={d}) from {gA_path}")
+            except Exception as e:
+                run_logger.log(f"[cls] Failed to load unified PN head from {gA_path}: {str(e)}")
+                raise RuntimeError("Could not train or load unified PN head required for unified training")
+        else:
+            raise RuntimeError("A-only PN head not found and training failed; cannot proceed with unified training")
 
     #################################### Temporal Debugging Module ####################################
     _debug_root = Path(cfg.output_dir)
@@ -1368,169 +1350,485 @@ def main() -> None:
     #################################### Temporal Debugging Module ####################################
 
     return
-
 #####################################################################################   #####################################################################################   #####################################################################################   
 
-#####################################################################################   
+@torch.no_grad()
+def build_cls2_dataset_from_dcca_pairs(
+    anchor_vecs,                 # List[Tensor], length = num_pairs
+    target_stack_per_anchor,     # List[Tensor], each [M_i, d_B]
+    projector_a,                 # nn.Module, A head
+    projector_b,                 # nn.Module, B head (AggregatorTargetHead if used)
+    device: torch.device,
+):
+    u_list, v_list, bmiss_list = [], [], []
+    for a_emb, b_stack in zip(anchor_vecs, target_stack_per_anchor):
+        a = a_emb.to(device).unsqueeze(0)          # [1, dA]
+        if hasattr(projector_b, "forward") and b_stack is not None and b_stack.numel() > 0:
+            # aggregator uses (anchor, target_stack)
+            v = projector_b(a, b_stack.to(device).unsqueeze(0)).squeeze(0)  # [d]
+            b_missing = 0.0
+        else:
+            v = torch.zeros_like(a_emb, device=device)  # fallback
+            b_missing = 1.0
+        u = projector_a(a).squeeze(0)                   # [d]
+        u_list.append(u)
+        v_list.append(v)
+        bmiss_list.append(torch.tensor([b_missing], device=device, dtype=torch.float32))
+    U = torch.stack(u_list)                # [N_A, d]
+    V = torch.stack(v_list)                # [N_A, d]
+    Bmiss = torch.stack(bmiss_list)        # [N_A, 1]
+    return U, V, Bmiss
 
-def run_overlap_inference(u_overlap: torch.Tensor, 
-                         v_overlap: torch.Tensor,
-                         b_to_a: torch.Tensor,
-                         anchor_overlap_samples: Dict,
-                         target_overlap_samples: Dict,
-                         gA: nn.Module,
-                         gAB: nn.Module,
-                         device: torch.device,
-                         cfg: AlignmentConfig,
-                         output_dir: Path,
-                         run_logger: "_RunLogger") -> Dict[str, Dict[str, object]]:
-    """Run inference on overlap data using trained gA and gAB models."""
+
+#####################################################################################   
+def run_inference_gA_only(
+    uA: torch.Tensor,
+    samples: Dict,
+    gA: nn.Module,
+    device: torch.device,
+    cfg: AlignmentConfig,
+    output_dir: Path,
+    run_logger: "_RunLogger",
+    passes: int = 10
+) -> Dict[str, object]:
+    """Run inference on overlap data using only the gA (anchor-only) model."""
+    
+   
+    # Get corresponding metadata
+    matched_coords = samples["coords"]
+    matched_labels = samples.get("labels", None)
+    
+    run_logger.log(f"[inference-gA] Processing {len(matched_coords)} anchor samples")
+    
+    # Prepare output directory
+    model_dir = output_dir / "overlap_inference" / "gA"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    
+    # MC Dropout inference
+    gA.train()  # Enable dropout
+    predictions_list = []
+    
+    with torch.no_grad():
+        for _ in range(passes):
+            pred = gA(uA)
+            predictions_list.append(pred.cpu().numpy())
+    
+    gA.eval()  # Disable dropout
+    
+    # Compute statistics
+    predictions_array = np.stack(predictions_list, axis=0)  # (passes, N)
+    mean_pred = predictions_array.mean(axis=0)
+    std_pred = predictions_array.std(axis=0)
+    
+    # Save raw predictions
+    np.save(model_dir / "predictions_mean.npy", mean_pred)
+    np.save(model_dir / "predictions_std.npy", std_pred)
+    np.save(model_dir / "coordinates.npy", np.array(matched_coords))
+    
+    # Create scatter plots
+    _create_inference_plots(
+        model_dir=model_dir,
+        model_name="gA",
+        coords=matched_coords,
+        mean_pred=mean_pred,
+        std_pred=std_pred
+    )
+
+    # print("TODO: USE write_prediction_outputs function here to save outputs consistently.")
+    # write_prediction_outputs(
+    #         prediction,
+    #         stack,
+    #         out_dir = model_dir,
+    #         pos_coords_by_region=pos_coords_by_region,
+    #         neg_coords_by_region=None,
+    #     )
+
+    # Compute summary statistics
+    summary = _compute_inference_summary(
+        model_name="gA",
+        mean_pred=mean_pred,
+        std_pred=std_pred,
+        labels=matched_labels
+    )
+    
+    # Save summary
+    with open(model_dir / "summary.json", 'w') as f:
+        json.dump(summary, f, indent=2)
+    
+    run_logger.log(f"[inference-gA] Saved results to {model_dir}")
+    
+    return {
+        "predictions_mean": mean_pred,
+        "predictions_std": std_pred,
+        "coordinates": matched_coords,
+        "labels": matched_labels,
+        "summary": summary
+    }
+
+def run_overlap_inference_gAB_from_pairs(
+    *,
+    anchor_vecs: List[torch.Tensor],
+    target_stack_per_anchor: List[torch.Tensor],
+    pair_metadata: List[Dict[str, object]],
+    projector_a: nn.Module,
+    projector_b: nn.Module,      # AggregatorTargetHead if you trained with the transformer aggregator; ProjectionHead otherwise
+    gAB: nn.Module,
+    device: torch.device,
+    cfg: AlignmentConfig,
+    output_dir: Path,
+    run_logger: "_RunLogger",
+    passes: int = 10,
+    target_vecs: Optional[List[torch.Tensor]] = None,  # optional fast-path if you already have fused B vectors
+    batch_size: int = INFERENCE_BATCH_SIZE
+) -> Dict[str, object]:
+    """
+    Inference on overlap using the SAME pairing/aggregation as DCCA:
+      U = projector_a(anchor_vec)
+      V = projector_b(anchor_vec, target_stack)  # if aggregator-wrapped
+        or projector_b(target_vec)               # if plain ProjectionHead and target_vecs provided
+    """
+
+    # ----- 1) Build U (A-projected) in batches -----
+    run_logger.log(f"[inference-gAB] Preparing A/B projections for {len(anchor_vecs)} overlap pairs")
+    A_all = torch.stack([a.detach().clone() for a in anchor_vecs]).to(device)  # [N, dA]
+
+    def _proj_in_batches(X, head):
+        outs = []
+        for s in range(0, X.size(0), batch_size):
+            outs.append(head(X[s:s+batch_size]).detach())
+        return torch.cat(outs, dim=0)
+
+    with torch.no_grad():
+        projector_a.eval()
+        U = _proj_in_batches(A_all, projector_a)  # [N, d]
+
+    # ----- 2) Build V (B-projected) using the SAME path as training -----
+    with torch.no_grad():
+        projector_b.eval()
+        if hasattr(projector_b, "aggregator"):  # AggregatorTargetHead path
+            # Use the same helper you used during training to handle variable-length stacks
+            V_list = _apply_transformer_target_head(
+                projector_b,
+                anchor_vecs,
+                target_stack_per_anchor,
+                pair_metadata,
+                batch_size=batch_size,
+                device=device,
+            )
+            if not V_list or len(V_list) != len(anchor_vecs):
+                raise RuntimeError("[inference-gAB] Aggregator output mismatch; got "
+                                   f"{0 if not V_list else len(V_list)} for N={len(anchor_vecs)}.")
+            V = torch.stack([v.detach().to(device) for v in V_list])  # [N, d]
+        else:
+            # Plain ProjectionHead: expect pre-fused target vectors (same as DCCA input)
+            if target_vecs is None or len(target_vecs) != len(anchor_vecs):
+                raise RuntimeError("[inference-gAB] target_vecs must be provided (and match N) "
+                                   "when projector_b is a plain ProjectionHead.")
+            T_all = torch.stack([t.detach().clone() for t in target_vecs]).to(device)  # [N, dB]
+            V = _proj_in_batches(T_all, projector_b)  # [N, d]
+
+    # ----- 3) Coordinates & (optional) labels pulled from the DCCA pairing metadata -----
+    coords = []
+    labels = None
+    maybe_labels = []
+    for meta in pair_metadata:
+        c = meta.get("anchor_coord")
+        coords.append(c if c is not None else (None, None))
+        # Try to recover labels if present; otherwise keep None
+        lb = meta.get("anchor_label", None)
+        maybe_labels.append(int(lb) if isinstance(lb, (int, np.integer)) else None)
+    if any(l is not None for l in maybe_labels):
+        labels = np.array([(-1 if l is None else l) for l in maybe_labels], dtype=np.int32)  # -1 means unknown
+
+    run_logger.log(f"[inference-gAB] Projected shapes: U={tuple(U.shape)}, V={tuple(V.shape)}")
+
+    # ----- 4) MC-Dropout inference on the unified head -----
+    model_dir = output_dir / "overlap_inference" / "gAB"
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    gAB.train()  # enable dropout
+    preds_mc = []
+
+    with torch.no_grad():
+        N = U.size(0)
+        zeros = torch.zeros(N, 1, device=device)  # B is present → b_missing=0
+        for _ in range(int(max(1, passes))):
+            batch_out = []
+            for s in range(0, N, batch_size):
+                u_b = U[s:s+batch_size]
+                v_b = V[s:s+batch_size]
+                bm_b = zeros[s:s+batch_size]
+                out = gAB(u_b, v_b, bm_b)  # [B]
+                batch_out.append(out.detach().cpu())
+            preds_mc.append(torch.cat(batch_out, dim=0).numpy())
+
+    gAB.eval()
+
+    preds_mc = np.stack(preds_mc, axis=0)          # (passes, N)
+    mean_pred = preds_mc.mean(axis=0)              # (N,)
+    std_pred  = preds_mc.std(axis=0)               # (N,)
+
+    # ----- 5) Save results -----
+    np.save(model_dir / "predictions_mean.npy", mean_pred)
+    np.save(model_dir / "predictions_std.npy",  std_pred)
+    np.save(model_dir / "coordinates.npy",      np.asarray(coords, dtype=object))
+
+    _create_inference_plots(
+        model_dir=model_dir,
+        model_name="gAB",
+        coords=coords,
+        mean_pred=mean_pred,
+        std_pred=std_pred
+    )
+
+    summary = _compute_inference_summary(
+        model_name="gAB",
+        mean_pred=mean_pred,
+        std_pred=std_pred,
+        labels=labels
+    )
+    with open(model_dir / "summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
+
+    run_logger.log(f"[inference-gAB] Saved results to {model_dir}")
+
+    return {
+        "predictions_mean": mean_pred,
+        "predictions_std": std_pred,
+        "coordinates": coords,
+        "labels": labels,
+        "summary": summary,
+    }
+
+
+def run_overlap_inference_gAB(
+    u_overlap: torch.Tensor,
+    v_overlap: torch.Tensor,
+    b_to_a: torch.Tensor,
+    anchor_overlap_samples: Dict,
+    target_overlap_samples: Dict,
+    gAB: nn.Module,
+    device: torch.device,
+    cfg: AlignmentConfig,
+    output_dir: Path,
+    run_logger: "_RunLogger",
+    passes: int = 10
+) -> Dict[str, object]:
+    """Run inference on overlap data using the gAB (unified) model."""
     
     # Align v features with u using b_to_a mapping
     valid_matches = b_to_a >= 0
-    u_matched = u_overlap[b_to_a[valid_matches]]
-    v_matched = v_overlap[valid_matches]
+    u_matched = u_overlap[b_to_a[valid_matches]].to(device)
+    v_matched = v_overlap[valid_matches].to(device)
     
-    # Get corresponding coordinates and metadata for matched pairs
-    matched_coords = [anchor_overlap_samples["coords"][int(idx)] for idx in b_to_a[valid_matches]]
+    # Get corresponding metadata
+    matched_indices = b_to_a[valid_matches].cpu().numpy()
+    matched_coords = [anchor_overlap_samples["coords"][int(idx)] for idx in matched_indices]
     matched_labels = anchor_overlap_samples.get("labels", None)
     if matched_labels is not None:
-        matched_labels = matched_labels[b_to_a[valid_matches]]
+        matched_labels = matched_labels[matched_indices]
     
-    matched_row_cols = [anchor_overlap_samples.get("row_cols", [])[int(idx)] for idx in b_to_a[valid_matches]]
+    run_logger.log(f"[inference-gAB] Processing {len(matched_coords)} matched pairs")
     
-    # Prepare dataset for inference
-    inference_dataset = {
-        "features": torch.cat([u_matched, v_matched], dim=1),  # Now aligned features
-        "row_cols": matched_row_cols,
-        "coords": matched_coords,
+    # Prepare output directory
+    model_dir = output_dir / "overlap_inference" / "gAB"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    
+    # MC Dropout inference
+    gAB.train()  # Enable dropout
+    predictions_list = []
+    
+    with torch.no_grad():
+        for _ in range(passes):
+            # For unified model, use proper forward signature
+            b_missing = torch.zeros(u_matched.size(0), 1, device=device)
+            pred = gAB(u_matched, v_matched, b_missing)
+            predictions_list.append(pred.cpu().numpy())
+    
+    gAB.eval()  # Disable dropout
+    
+    print("TODO: USE write_prediction_outputs function here to save outputs consistently.")
+
+    # Compute statistics
+    predictions_array = np.stack(predictions_list, axis=0)  # (passes, N)
+    mean_pred = predictions_array.mean(axis=0)
+    std_pred = predictions_array.std(axis=0)
+    
+    # Save raw predictions
+    np.save(model_dir / "predictions_mean.npy", mean_pred)
+    np.save(model_dir / "predictions_std.npy", std_pred)
+    np.save(model_dir / "coordinates.npy", np.array(matched_coords))
+    
+    # Create scatter plots
+    _create_inference_plots(
+        model_dir=model_dir,
+        model_name="gAB",
+        coords=matched_coords,
+        mean_pred=mean_pred,
+        std_pred=std_pred
+    )
+    
+    # Compute summary statistics
+    summary = _compute_inference_summary(
+        model_name="gAB",
+        mean_pred=mean_pred,
+        std_pred=std_pred,
+        labels=matched_labels
+    )
+    
+    # Save summary
+    with open(model_dir / "summary.json", 'w') as f:
+        json.dump(summary, f, indent=2)
+    
+    run_logger.log(f"[inference-gAB] Saved results to {model_dir}")
+    
+    return {
+        "predictions_mean": mean_pred,
+        "predictions_std": std_pred,
+        "coordinates": matched_coords,
         "labels": matched_labels,
-        "metadata": [anchor_overlap_samples.get("metadata", [])[int(idx)] for idx in b_to_a[valid_matches]],
-        "name": "overlap_inference"
+        "summary": summary
     }
 
-    run_logger.log(f"[inference] Processing {len(matched_coords)} matched pairs")
 
-    # Create MaskStack for spatial reference
-    overlap_mask_info = _load_overlap_mask_data(cfg.overlap_mask_path)
-    if overlap_mask_info is None:
-        run_logger.log("[inference] No overlap mask available; using default reference")
-    stack = _MaskStack(overlap_mask_info) if overlap_mask_info else None
-
-    # Run MC-dropout inference
-    passes = max(1, int(getattr(cfg.cls_training, "mc_dropout_passes", 10)))
+def _create_inference_plots(
+    model_dir: Path,
+    model_name: str,
+    coords: List[Tuple[float, float]],
+    mean_pred: np.ndarray,
+    std_pred: np.ndarray
+) -> None:
+    """Create and save scatter plots for inference results."""
+    if plt is None:
+        return
     
-    # Create a more focused embedding lookup
-    embedding_lookup_gA = {}
-    grid_positions = []
-    for idx, (row, col) in enumerate(matched_row_cols):
-        key = (int(row), int(col))
-        embedding_lookup_gA[key] = idx
-        grid_positions.append(key)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    
+    # Plot mean predictions
+    coords_array = np.array(coords)
+    sc1 = axes[0].scatter(coords_array[:, 0], coords_array[:, 1], 
+                         c=mean_pred, cmap='RdYlGn', s=5, marker='H', alpha=0.7, vmin=0, vmax=1)
+    axes[0].set_title(f'{model_name} - Mean Prediction')
+    axes[0].set_xlabel('X Coordinate')
+    axes[0].set_ylabel('Y Coordinate')
+    axes[0].set_aspect('equal', adjustable='datalim')
+    plt.colorbar(sc1, ax=axes[0], label='Probability')
+    
+    # Plot uncertainty (std)
+    sc2 = axes[1].scatter(coords_array[:, 0], coords_array[:, 1], 
+                         c=std_pred, cmap='viridis', s=5, marker='H', alpha=0.7)
+    axes[1].set_title(f'{model_name} - Uncertainty (Std)')
+    axes[1].set_xlabel('X Coordinate')
+    axes[1].set_ylabel('Y Coordinate')
+    axes[1].set_aspect('equal', adjustable='datalim')
+    plt.colorbar(sc2, ax=axes[1], label='Std Dev')
+    
+    plt.tight_layout()
+    plt.savefig(model_dir / "predictions_scatter.png", dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def _compute_inference_summary(
+    model_name: str,
+    mean_pred: np.ndarray,
+    std_pred: np.ndarray,
+    labels: Optional[np.ndarray]
+) -> Dict[str, object]:
+    """Compute summary statistics for inference results."""
+    summary = {
+        "model": model_name,
+        "n_points": len(mean_pred),
+        "mean_prediction": float(mean_pred.mean()),
+        "std_prediction": float(std_pred.mean()),
+        "min_prediction": float(mean_pred.min()),
+        "max_prediction": float(mean_pred.max()),
+        "median_prediction": float(np.median(mean_pred)),
+        "mean_uncertainty": float(std_pred.mean()),
+        "max_uncertainty": float(std_pred.max()),
+    }
+    
+    if labels is not None:
+        pos_mask = labels > 0
+        neg_mask = labels <= 0
         
-    # Run inference using both models
-    prediction_gA = mc_predict_map_from_embeddings(
-        {"GLOBAL": (u_matched.cpu().numpy(), embedding_lookup_gA)},
-        gA,
-        stack,
-        passes=passes,
-        device=str(device),
-        show_progress=True
-    )
-
-    # Need to handle u and v features separately for gAB
-    u_matched_numpy = u_matched.cpu().numpy()
-    v_matched_numpy = v_overlap[valid_matches].cpu().numpy()
+        summary["n_positive"] = int(pos_mask.sum())
+        summary["n_negative"] = int(neg_mask.sum())
+        
+        if pos_mask.any():
+            summary["mean_pred_positive"] = float(mean_pred[pos_mask].mean())
+            summary["std_pred_positive"] = float(std_pred[pos_mask].mean())
+        else:
+            summary["mean_pred_positive"] = None
+            summary["std_pred_positive"] = None
+            
+        if neg_mask.any():
+            summary["mean_pred_negative"] = float(mean_pred[neg_mask].mean())
+            summary["std_pred_negative"] = float(std_pred[neg_mask].mean())
+        else:
+            summary["mean_pred_negative"] = None
+            summary["std_pred_negative"] = None
     
-    # Store both u and v in the embeddings map
-    embeddings_gAB = {
-        "u": u_matched_numpy,
-        "v": v_matched_numpy
+    return summary
+
+def _compare_models(
+    results: Dict[str, Dict[str, object]],
+    output_dir: Path,
+    run_logger: "_RunLogger"
+) -> None:
+    """Compare predictions from gA and gAB models."""
+    if plt is None:
+        return
+    
+    gA_pred = results["gA"]["predictions_mean"]
+    gAB_pred = results["gAB"]["predictions_mean"]
+    
+    comparison_dir = output_dir / "overlap_inference" / "comparison"
+    comparison_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Scatter plot: gA vs gAB predictions
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    
+    # Direct comparison
+    axes[0].scatter(gA_pred, gAB_pred, alpha=0.5, s=30)
+    axes[0].plot([0, 1], [0, 1], 'r--', label='y=x')
+    axes[0].set_xlabel('gA Predictions')
+    axes[0].set_ylabel('gAB Predictions')
+    axes[0].set_title('Model Prediction Comparison')
+    axes[0].legend()
+    axes[0].set_aspect('equal')
+    axes[0].grid(True, alpha=0.3)
+    
+    # Difference map
+    diff = gAB_pred - gA_pred
+    axes[1].hist(diff, bins=50, alpha=0.7, edgecolor='black')
+    axes[1].axvline(x=0, color='r', linestyle='--', label='No difference')
+    axes[1].set_xlabel('Difference (gAB - gA)')
+    axes[1].set_ylabel('Frequency')
+    axes[1].set_title('Prediction Differences Distribution')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(comparison_dir / "model_comparison.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    # Compute comparison metrics
+    mae = float(np.abs(diff).mean())
+    rmse = float(np.sqrt((diff**2).mean()))
+    corr = float(np.corrcoef(gA_pred, gAB_pred)[0, 1])
+    
+    comparison_stats = {
+        "mean_absolute_error": mae,
+        "root_mean_squared_error": rmse,
+        "correlation": corr,
+        "mean_difference": float(diff.mean()),
+        "std_difference": float(diff.std()),
     }
     
-    prediction_gAB = mc_predict_map_from_embeddings(
-        {"GLOBAL": (embeddings_gAB, embedding_lookup_gA)},
-        gAB,
-        stack,
-        passes=passes,
-        device=str(device),
-        show_progress=True
-    )
-
-    # Prepare outputs directory
-    inference_dir = output_dir / "overlap_inference"
-    inference_dir.mkdir(parents=True, exist_ok=True)
-
-    # Export results for both models
-    results = {}
-    for name, prediction in [("gA", prediction_gA), ("gAB", prediction_gAB)]:
-        model_dir = inference_dir / name
-        model_dir.mkdir(exist_ok=True)
-
-        if isinstance(prediction, tuple):
-            mean_map, std_map = prediction
-            prediction_payload = {
-                "GLOBAL": {
-                    "prediction": {  # Add this nested structure
-                        "mean": mean_map,
-                        "std": std_map
-                    }
-                }
-            }
-        else:
-            prediction_payload = {"GLOBAL": {"prediction": prediction}}
-
-        # Group coordinates by label
-        pos_coords = []
-        neg_coords = []
-        labels = inference_dataset.get("labels", [])
-        if labels is not None:
-            for idx, (rc, label) in enumerate(zip(matched_row_cols, labels)):
-                if label > 0:
-                    pos_coords.append(("GLOBAL", rc[0], rc[1]))
-                else:
-                    neg_coords.append(("GLOBAL", rc[0], rc[1]))
-
-        pos_map = group_coords(pos_coords, stack) if pos_coords else {}
-        neg_map = group_coords(neg_coords, stack) if neg_coords else {}
-
-        # Save results
-        results[name] = {
-            "prediction": prediction_payload,
-            "pos_map": pos_map,
-            "neg_map": neg_map,
-            "counts": {
-                "pos": len(pos_coords),
-                "neg": len(neg_coords)
-            },
-            "row_cols": matched_row_cols,
-            "coords": matched_coords,
-            "labels": labels
-        }
-
-        # Export using fusion export helper with proper reference data
-        fusion_export_payload = {
-            name: results[name],
-            "default_reference": stack,  # Add stack as default reference
-            "metrics_summary": {"inference_only": True},
-            "history": [],  # history_payload not needed for inference
-            "evaluation": {},  # evaluation_summary not needed for inference
-        }
-
-        try:
-            fusion_summary = _fusion_export_results(
-                model_dir,
-                gA if name == "gA" else gAB,
-                fusion_export_payload["history"],
-                fusion_export_payload["evaluation"],
-                fusion_export_payload["metrics_summary"],
-                fusion_export_payload,
-            )
-            run_logger.log(f"[inference] Exported {name} results to {model_dir}")
-        except Exception as e:
-            run_logger.log(f"[warn] Failed to export {name} results: {str(e)}")
-
-    return results
+    with open(comparison_dir / "comparison_stats.json", 'w') as f:
+        json.dump(comparison_stats, f, indent=2)
+    
+    run_logger.log(f"[inference] Model comparison: MAE={mae:.4f}, RMSE={rmse:.4f}, Corr={corr:.4f}")
 
 #####################################################################################   
 
@@ -1579,96 +1877,325 @@ def build_phi(u, v, b_missing):
     return torch.cat(feats, dim=-1)  # [B, 4d + 2]
 
 # ---------- unified head training from u/v ----------
-def fit_unified_head_OVERLAP_from_uv(gA, data_loader_uv, d_u=None, device=None, 
-                                    lr=5e-4, steps=1500, view_dropout=0.3, noise_sigma=0.0):
+import math
+import torch
+import torch.nn.functional as F
+from torch import nn
+from tqdm import tqdm
 
+def fit_unified_head_OVERLAP_from_uv(
+    gA,
+    data_loader_uv,
+    d_u=None,
+    device=None,
+    *,
+    lr=5e-4,
+    steps=30,
+    eps=1e-6,
+    # schedules / weights
+    kd_max=0.20,
+    kd_warmdown_epochs=5,
+    lambda_cons=1.0,
+    lambda_ent=0.10,      # entropy *maximization* (we flip sign inside loss)
+    lambda_prior=5.0,     # match global positive rate to π̂
+    lambda_delta=0.10,    # ensure B changes the prediction
+    delta_margin=0.08,
+    # stochastic B views
+    jitter_sigma=0.05,
+    jitter_drop=0.20,     # elementwise dropout prob on v
+):
     """
-    gA: trained A-only PN head (expects u)
-    data_loader_uv: yields (u, v, b_missing)
-    d_u: feature dim; if None inferred from first batch
+    gA:   trained A-only PN head; returns probabilities in (0,1)
+    data_loader_uv: yields (u, v, b_missing) from the SAME pairing/aggregator used in DCCA
+    d_u:  feature dim; if None inferred from first batch
+    steps: epochs
     """
-    # infer dim and device
+    # --- helpers ---
+    def safe_logit(p, eps_=eps):
+        p = p.clamp(eps_, 1.0 - eps_)
+        return torch.log(p) - torch.log(1.0 - p)
+
+    def jitter(v, sigma=jitter_sigma, drop=jitter_drop):
+        if sigma > 0.0:
+            v = v + sigma * torch.randn_like(v)
+        if drop > 0.0:
+            m = (torch.rand_like(v) > drop).float()
+            v = v * m
+        return v
+
+    # infer dim / device
     u0, v0, _ = next(iter(data_loader_uv))
-    if d_u is None: d_u = u0.size(-1)
-    if device is None: device = u0.device
+    if d_u is None:
+        d_u = u0.size(-1)
+    if device is None:
+        device = u0.device
 
+    # student head
     gAB = PNHeadUnified(d=d_u).to(device).train()
     opt = torch.optim.AdamW(gAB.parameters(), lr=lr, weight_decay=1e-4)
     gA = gA.to(device).eval()
 
-    step = 0
-    while step < steps:
-        for u, v, bmiss in data_loader_uv:
+    # training loop
+    epochs = int(steps)
+    for epoch in range(1, epochs + 1):
+        # cosine warm-down for KD
+        if kd_warmdown_epochs <= 0:
+            lambda_kd = 0.0
+        else:
+            t = min(epoch - 1, kd_warmdown_epochs) / max(1, kd_warmdown_epochs)
+            lambda_kd = kd_max * 0.5 * (1.0 + math.cos(math.pi * t))  # kd_max → 0
+
+        epoch_loss = epoch_kd = epoch_ent = epoch_cons = epoch_prior = epoch_delta = 0.0
+        batches = 0
+
+        pbar = tqdm(data_loader_uv, desc=f"    [cls - 2] Epoch {epoch:3d}/{epochs}", leave=False)
+        for u, v, bmiss in pbar:
             u, v, bmiss = u.to(device), v.to(device), bmiss.to(device)
 
             with torch.no_grad():
-                # optional tiny noise to stabilize (set noise_sigma>0 to enable)
-                if noise_sigma > 0:
-                    u_noisy = u + noise_sigma*torch.randn_like(u)
-                    v_noisy = v + noise_sigma*torch.randn_like(v)
-                else:
-                    u_noisy, v_noisy = u, v
+                t_p = gA(u).clamp(eps, 1 - eps)  # teacher prob (A-only)
+                t_logit = safe_logit(t_p)
+                # batch prior estimate from teacher
+                pi_hat = float(t_p.mean().item())
 
-                teacher = gA(u_noisy).detach()  # A-only teacher
+            # ------- student passes -------
+            # no-B path (for KD and ΔB reference)
+            p_noB = gAB(u, torch.zeros_like(v), torch.ones(u.size(0), 1, device=device)).clamp(eps, 1 - eps)
+            s_noB = safe_logit(p_noB)
 
-            # view-dropout to teach robustness when B is absent
-            if torch.rand(1).item() < view_dropout:
-                v_in = torch.zeros_like(v_noisy)
-                b_in = torch.ones(u_noisy.size(0), 1, device=device)
-            else:
-                v_in = v_noisy
-                b_in = bmiss  # use real mask (probably zeros if v present)
+            # two stochastic B views (for consistency & main prediction)
+            v1 = jitter(v, jitter_sigma, jitter_drop)
+            v2 = jitter(v, jitter_sigma, jitter_drop)
+            p_B1 = gAB(u, v1, torch.zeros_like(bmiss)).clamp(eps, 1 - eps)
+            p_B2 = gAB(u, v2, torch.zeros_like(bmiss)).clamp(eps, 1 - eps)
+            s_B1 = safe_logit(p_B1)
+            s_B2 = safe_logit(p_B2)
 
-            # student forward
-            p_student = gAB(u_noisy, v_in, b_in)
+            # ------- losses -------
+            # 1) KD ONLY on the no-B path (student should match teacher when B is absent)
+            loss_kd = F.mse_loss(s_noB, t_logit)
 
-            # consistency target (weak vs strong): here just no-drop vs drop mask
-            p_cons = gAB(u_noisy, v, torch.zeros_like(b_in))
+            # 2) Consistency between two B views (on logits for stronger grads)
+            loss_cons = F.mse_loss(s_B1, s_B2.detach())
 
-            # losses (same as your recipe)
-            loss_kd  = F.mse_loss(p_student, teacher)
-            loss_ent = -(p_student*torch.log(p_student+1e-6)
-                        + (1-p_student)*torch.log(1-p_student+1e-6)).mean()
-            loss_cons = F.mse_loss(p_student, p_cons.detach())
-            loss = loss_kd + 0.1*loss_ent + 0.5*loss_cons
+            # 3) Entropy *maximization* on unlabeled BC (flip sign: -H)
+            H = -(p_B1 * torch.log(p_B1) + (1 - p_B1) * torch.log(1 - p_B1)).mean()
+            loss_ent = -H  # minimizing -H == maximizing H
 
-            opt.zero_grad(); loss.backward(); opt.step()
-            step += 1
-            if step % 100 == 0:
-                print(f"[UNIFIED-BC/uv] step {step:04d} | "
-                      f"total_loss={loss.item():.4f} | "
-                      f"kd_loss={loss_kd.item():.4f} | "
-                      f"entropy_loss={loss_ent.item():.4f} | "
-                      f"consistency_loss={loss_cons.item():.4f}")
-            if step >= steps: break
+            # 4) Prior matching: keep average positive rate near π̂
+            loss_prior = (p_B1.mean() - pi_hat) ** 2
 
+            # 5) Ensure B changes the prediction (margin on |p(B) - p(noB)|)
+            loss_delta = F.relu(delta_margin - (p_B1 - p_noB).abs()).mean()
+
+            # total
+            loss = (
+                lambda_kd   * loss_kd
+                + lambda_cons  * loss_cons
+                + lambda_ent   * loss_ent
+                + lambda_prior * loss_prior
+                + lambda_delta * loss_delta
+            )
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+
+            # bookkeeping
+            batches += 1
+            epoch_loss   += float(loss.item())
+            epoch_kd     += float(loss_kd.item())
+            epoch_cons   += float(loss_cons.item())
+            epoch_ent    += float((-loss_ent).item())  # report H (positive)
+            epoch_prior  += float(loss_prior.item())
+            epoch_delta  += float(loss_delta.item())
+
+            # live stats
+            with torch.no_grad():
+                dB = (p_B1 - p_noB).abs().mean().item()
+                pbar.set_postfix({
+                    'loss': f'{loss.item():.4e}',
+                    'kd': f'{(lambda_kd*loss_kd).item():.4e}',
+                    'ent(H+)': f'{(-loss_ent).item():.4e}',
+                    'cons': f'{(lambda_cons*loss_cons).item():.4e}',
+                    'ΔB': f'{dB:.3f}',
+                    'π̂': f'{pi_hat:.3f}',
+                })
+        pbar.close()
+
+        # epoch summary
+        denom = max(1, batches)
+        print(
+            f"    [cls - 2] Epoch {epoch:3d} | "
+            f"loss={(epoch_loss/denom):.4e} | "
+            f"kd={(epoch_kd/denom):.4e} | "
+            f"ent(H+)={(epoch_ent/denom):.4e} | "
+            f"cons={(epoch_cons/denom):.4e} | "
+            f"prior={(epoch_prior/denom):.4e} | "
+            f"delta={(epoch_delta/denom):.4e} | "
+            f"batches={batches}"
+        )
+
+    print(f"\n    [cls - 2] Training completed after {epochs} epochs")
     return gAB.eval()
 
 
+# def fit_unified_head_OVERLAP_from_uv(gA, data_loader_uv, d_u=None, device=None, 
+#                                     lr=5e-4, steps=1500, view_dropout=0.3, noise_sigma=0.0, eps=1e-7, lambda_ent=0.1, lambda_cons=0.25):
+#     """
+#     gA: trained A-only PN head (expects u)
+#     data_loader_uv: yields (u, v, b_missing)
+#     d_u: feature dim; if None inferred from first batch
+#     steps: number of epochs (renamed from steps for clarity)
+#     """
+#     # infer dim and device
+#     u0, v0, _ = next(iter(data_loader_uv))
+#     if d_u is None: d_u = u0.size(-1)
+#     if device is None: device = u0.device
+
+#     gAB = PNHeadUnified(d=d_u).to(device).train()
+#     opt = torch.optim.AdamW(gAB.parameters(), lr=lr, weight_decay=1e-4)
+#     gA = gA.to(device).eval()
+
+#     epochs = steps  # treating steps as epochs for clarity
+    
+#     # Training loop with epoch-based progress
+#     for epoch in range(1, epochs + 1):
+#         epoch_loss = 0.0
+#         epoch_loss_kd = 0.0
+#         epoch_loss_ent = 0.0
+#         epoch_loss_cons = 0.0
+#         batch_count = 0
+        
+#         # Progress bar for batches within epoch
+#         pbar = tqdm(data_loader_uv, desc=f"    [cls - 2] Epoch {epoch:3d}/{epochs}", leave=False)
+        
+#         for u, v, bmiss in pbar:
+#             u, v, bmiss = u.to(device), v.to(device), bmiss.to(device)
+
+#             with torch.no_grad():
+#                 # optional tiny noise to stabilize (set noise_sigma>0 to enable)
+#                 if noise_sigma > 0:
+#                     u_noisy = u + noise_sigma*torch.randn_like(u)
+#                     v_noisy = v + noise_sigma*torch.randn_like(v)
+#                 else:
+#                     u_noisy, v_noisy = u, v
+
+#                 teacher = gA(u_noisy).detach()  # A-only teacher
+
+#             # view-dropout to teach robustness when B is absent
+#             if torch.rand(1).item() < view_dropout:
+#                 v_in = torch.zeros_like(v_noisy)
+#                 b_in = torch.ones(u_noisy.size(0), 1, device=device)
+#             else:
+#                 v_in = v_noisy
+#                 b_in = bmiss  # use real mask (probably zeros if v present)
+
+#             # student forward
+#             p_student = gAB(u_noisy, v_in, b_in)
+
+#             # consistency target (weak vs strong): here just no-drop vs drop mask
+#             p_cons = gAB(u_noisy, v, torch.zeros_like(b_in))
+
+#             # losses (same as your recipe)
+#             loss_kd  = F.mse_loss(p_student, teacher)
+#             loss_ent = -(p_student*torch.log(p_student+eps)+ (1-p_student)*torch.log(1-p_student+eps)).mean()
+#             loss_cons = F.mse_loss(p_student, p_cons.detach())
+#             loss = loss_kd + lambda_ent*loss_ent + lambda_cons*loss_cons
+
+#             opt.zero_grad()
+#             loss.backward()
+#             opt.step()
+            
+#             epoch_loss += loss.item()
+#             epoch_loss_kd += loss_kd.item()
+#             epoch_loss_ent += loss_ent.item()
+#             epoch_loss_cons += loss_cons.item()
+#             batch_count += 1
+            
+#             # Update progress bar with current batch metrics
+#             pbar.set_postfix({
+#                 'loss': f'{loss.item():.4e}',
+#                 'kd': f'{loss_kd.item():.4e}',
+#                 'ent': f'{loss_ent.item():.4e}',
+#                 'cons': f'{loss_cons.item():.4e}'
+#             })
+        
+#         pbar.close()
+        
+#         # Compute epoch averages
+#         avg_epoch_loss = epoch_loss / batch_count if batch_count > 0 else 0.0
+#         avg_kd = epoch_loss_kd / batch_count if batch_count > 0 else 0.0
+#         avg_ent = epoch_loss_ent / batch_count if batch_count > 0 else 0.0
+#         avg_cons = epoch_loss_cons / batch_count if batch_count > 0 else 0.0
+        
+#         # Print epoch summary (matching cls-1 style)
+#         print(f"    [cls - 2] Epoch {epoch:3d} | "
+#               f"loss={avg_epoch_loss:.4e} | "
+#               f"kd={avg_kd:.4e} | "
+#               f"ent={avg_ent:.4e} | "
+#               f"cons={avg_cons:.4e} | "
+#               f"batches={batch_count}")
+
+#     print(f"\n    [cls - 2] Training completed after {epochs} epochs")
+#     return gAB.eval()
+    
 #####################################################################################   
 
+class PUBatchSampler(Sampler[list]):
+    def __init__(self, pos_idx, unl_idx, k_pos, k_unl, epoch_len=None, seed=0):
+        self.pos_idx = pos_idx
+        self.unl_idx = unl_idx
+        self.k_pos = k_pos
+        self.k_unl = k_unl
+        self.seed = seed
+        # how many batches per epoch (by unlabeled supply)
+        self.epoch_len = epoch_len or (len(unl_idx) // k_unl)
+
+    def __iter__(self):
+        rng = random.Random(self.seed)
+        # reshuffle every epoch
+        pos = self.pos_idx[:] ; unl = self.unl_idx[:]
+        rng.shuffle(pos) ; rng.shuffle(unl)
+        # cycle positives if we run out
+        p_ptr = 0
+        for b in range(self.epoch_len):
+            if (b * self.k_unl + self.k_unl) > len(unl):
+                break
+            batch_unl = unl[b*self.k_unl : (b+1)*self.k_unl]
+            # take k_pos positives, cycling if necessary
+            if p_ptr + self.k_pos > len(pos):
+                rng.shuffle(pos)
+                p_ptr = 0
+            batch_pos = pos[p_ptr : p_ptr + self.k_pos]
+            p_ptr += self.k_pos
+            yield batch_pos + batch_unl
+
+    def __len__(self):
+        return self.epoch_len
+
+
+class PNHeadAOnly(nn.Module):
+    def __init__(self, d, hidden=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d, hidden), nn.GELU(),
+            nn.Linear(hidden, hidden), nn.GELU(),
+            nn.Linear(hidden, 1)
+        )
+    def forward(self, u): return torch.sigmoid(self.net(u)).squeeze(-1)
+
+class NNPULoss(nn.Module):
+    def __init__(self, pi_p): super().__init__(); self.pi_p = float(pi_p); self.eps=1e-6
+    def logloss(self,p,y): return -(y*torch.log(p+self.eps)+(1-y)*torch.log(1-p+self.eps))
+    def forward(self,p,labels):
+        Pm=(labels==1).float(); Um=(labels==-1).float()
+        Lp=(self.logloss(p, torch.ones_like(p))*Pm).sum()  /(Pm.sum()+self.eps)
+        LnU=(self.logloss(p, torch.zeros_like(p))*Um).sum()/(Um.sum()+self.eps)
+        LnP=(self.logloss(p, torch.zeros_like(p))*Pm).sum()/(Pm.sum()+self.eps)
+        return self.pi_p*Lp + torch.clamp(LnU - self.pi_p*LnP, min=0.0)
 
 def train_nnpu_a_only(encA, pA, train_loader, val_loader, pi_p, lr=1e-3, epochs=3, device='cuda'):
-    class PNHeadAOnly(nn.Module):
-        def __init__(self, d, hidden=256):
-            super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(d, hidden), nn.GELU(),
-                nn.Linear(hidden, hidden), nn.GELU(),
-                nn.Linear(hidden, 1)
-            )
-        def forward(self, u): return torch.sigmoid(self.net(u)).squeeze(-1)
-
-    class NNPULoss(nn.Module):
-        def __init__(self, pi_p): super().__init__(); self.pi_p = float(pi_p); self.eps=1e-6
-        def logloss(self,p,y): return -(y*torch.log(p+self.eps)+(1-y)*torch.log(1-p+self.eps))
-        def forward(self,p,labels):
-            Pm=(labels==1).float(); Um=(labels==-1).float()
-            Lp=(self.logloss(p, torch.ones_like(p))*Pm).sum()  /(Pm.sum()+self.eps)
-            LnU=(self.logloss(p, torch.zeros_like(p))*Um).sum()/(Um.sum()+self.eps)
-            LnP=(self.logloss(p, torch.zeros_like(p))*Pm).sum()/(Pm.sum()+self.eps)
-            return self.pi_p*Lp + torch.clamp(LnU - self.pi_p*LnP, min=0.0)
-    
     # Probe a batch to infer feature dimension; handle empty loader gracefully.
     try:
         it = iter(train_loader)
@@ -1755,13 +2282,27 @@ def train_nnpu_a_only(encA, pA, train_loader, val_loader, pi_p, lr=1e-3, epochs=
         if not math.isnan(comparable_f1) and comparable_f1 > best["f1"]:
             best = {"f1": comparable_f1, "state_dict": gA.state_dict()}
 
-        train_log = {"loss": float(avg_loss), **train_metrics}
-        val_log = {"loss": float(val_loss), **val_metrics}
+        # Format loss separately in scientific notation
+        train_loss_str = f"{avg_loss:.4e}" if math.isfinite(avg_loss) else "nan"
+        val_loss_str = f"{val_loss:.4e}" if math.isfinite(val_loss) else "nan"
 
-        log_metrics("train", train_log, order=DEFAULT_METRIC_ORDER)
-        log_metrics("val", val_log, order=DEFAULT_METRIC_ORDER)
+        # Create log dictionaries without loss first
+        train_log = {**train_metrics}
+        val_log = {**val_metrics}
 
-        history.append({"epoch": int(ep), "train": normalize_metrics(train_log), "val": normalize_metrics(val_log)})
+        # Print custom formatted output with loss in scientific notation
+        print(f"    [cls - 1] Epoch {ep:3d} | loss={train_loss_str}/{val_loss_str} | ")
+        print(f"    [cls - 1] TRAIN | loss={train_loss_str} | " + 
+            " | ".join(f"{k}={v:.4f}" if isinstance(v, (int, float)) and math.isfinite(v) else f"{k}={v}" for k, v in train_log.items()))
+        print(f"    [cls - 1] VAL   | loss={val_loss_str} | " + 
+            " | ".join(f"{k}={v:.4f}" if isinstance(v, (int, float)) and math.isfinite(v) else f"{k}={v}" for k, v in val_log.items()))
+
+        # Still log to history with original numeric values for later analysis
+        history.append({
+            "epoch": int(ep), 
+            "train": {"loss": float(avg_loss), **normalize_metrics(train_log)}, 
+            "val": {"loss": float(val_loss), **normalize_metrics(val_log)}
+        })
 
     if best["state_dict"] is not None:
         gA.load_state_dict(best["state_dict"])

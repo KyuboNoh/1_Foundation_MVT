@@ -535,6 +535,89 @@ __all__ = [
 ]
 
 
+
+
+def _build_aligned_pairs_OneToOne(
+    pairs: Sequence[OverlapAlignmentPair],
+    *,
+    anchor_name: str,
+    target_name: str,
+    use_positive_only: bool,
+    aggregator: str,
+    gaussian_sigma: Optional[float],
+    debug: bool,
+    dataset_meta_map: Dict[str, Dict[str, object]],
+    anchor_augment_map: Optional[Dict[str, List[np.ndarray]]] = None,
+    target_augment_map: Optional[Dict[str, List[np.ndarray]]] = None,
+    pn_label_maps: Optional[Dict[str, Optional[Dict[str, set[Tuple[str, int, int]]]]]] = None,
+    overlap_set: Optional[OverlapSet] = None,
+) -> Tuple[
+    List[torch.Tensor],
+    List[torch.Tensor],
+    Counter,
+    Optional[Dict[str, List[Dict[str, object]]]],
+    Dict[str, int],
+    List[Dict[str, object]],
+    List[torch.Tensor],
+    Dict[str, Dict[str, Dict[str, object]]],
+]:
+    return _build_aligned_pairs_core(
+        pairs,
+        anchor_name=anchor_name,
+        target_name=target_name,
+        use_positive_only=use_positive_only,
+        aggregator=aggregator,
+        gaussian_sigma=gaussian_sigma,
+        debug=debug,
+        dataset_meta_map=dataset_meta_map,
+        anchor_augment_map=anchor_augment_map,
+        target_augment_map=target_augment_map,
+        pn_label_maps=pn_label_maps,
+        pairing_mode="one_to_one",
+        overlap_set=overlap_set,
+    )
+
+
+def _build_aligned_pairs_SetToSet(
+    pairs: Sequence[OverlapAlignmentPair],
+    *,
+    anchor_name: str,
+    target_name: str,
+    use_positive_only: bool,
+    aggregator: str,
+    gaussian_sigma: Optional[float],
+    debug: bool,
+    dataset_meta_map: Dict[str, Dict[str, object]],
+    anchor_augment_map: Optional[Dict[str, List[np.ndarray]]] = None,
+    target_augment_map: Optional[Dict[str, List[np.ndarray]]] = None,
+    pn_label_maps: Optional[Dict[str, Optional[Dict[str, set[Tuple[str, int, int]]]]]] = None,
+    overlap_set: Optional[OverlapSet] = None,
+) -> Tuple[
+    List[torch.Tensor],
+    List[torch.Tensor],
+    Counter,
+    Optional[Dict[str, List[Dict[str, object]]]],
+    Dict[str, int],
+    List[Dict[str, object]],
+    List[torch.Tensor],
+    Dict[str, Dict[str, Dict[str, object]]],
+]:
+    return _build_aligned_pairs_core(
+        pairs,
+        anchor_name=anchor_name,
+        target_name=target_name,
+        use_positive_only=use_positive_only,
+        aggregator=aggregator,
+        gaussian_sigma=gaussian_sigma,
+        debug=debug,
+        dataset_meta_map=dataset_meta_map,
+        anchor_augment_map=anchor_augment_map,
+        target_augment_map=target_augment_map,
+        pn_label_maps=pn_label_maps,
+        pairing_mode="set_to_set",
+        overlap_set=overlap_set,
+    )
+
 def _build_aligned_pairs_core(
     pairs: Sequence[OverlapAlignmentPair],
     *,
@@ -868,87 +951,6 @@ def _build_aligned_pairs_core(
     return anchor_vecs, target_vecs, label_hist, debug_payload, aug_stats, pair_metadata, target_stack_per_anchor, pn_index_summary
 
 
-def _build_aligned_pairs_OneToOne(
-    pairs: Sequence[OverlapAlignmentPair],
-    *,
-    anchor_name: str,
-    target_name: str,
-    use_positive_only: bool,
-    aggregator: str,
-    gaussian_sigma: Optional[float],
-    debug: bool,
-    dataset_meta_map: Dict[str, Dict[str, object]],
-    anchor_augment_map: Optional[Dict[str, List[np.ndarray]]] = None,
-    target_augment_map: Optional[Dict[str, List[np.ndarray]]] = None,
-    pn_label_maps: Optional[Dict[str, Optional[Dict[str, set[Tuple[str, int, int]]]]]] = None,
-    overlap_set: Optional[OverlapSet] = None,
-) -> Tuple[
-    List[torch.Tensor],
-    List[torch.Tensor],
-    Counter,
-    Optional[Dict[str, List[Dict[str, object]]]],
-    Dict[str, int],
-    List[Dict[str, object]],
-    List[torch.Tensor],
-    Dict[str, Dict[str, Dict[str, object]]],
-]:
-    return _build_aligned_pairs_core(
-        pairs,
-        anchor_name=anchor_name,
-        target_name=target_name,
-        use_positive_only=use_positive_only,
-        aggregator=aggregator,
-        gaussian_sigma=gaussian_sigma,
-        debug=debug,
-        dataset_meta_map=dataset_meta_map,
-        anchor_augment_map=anchor_augment_map,
-        target_augment_map=target_augment_map,
-        pn_label_maps=pn_label_maps,
-        pairing_mode="one_to_one",
-        overlap_set=overlap_set,
-    )
-
-
-def _build_aligned_pairs_SetToSet(
-    pairs: Sequence[OverlapAlignmentPair],
-    *,
-    anchor_name: str,
-    target_name: str,
-    use_positive_only: bool,
-    aggregator: str,
-    gaussian_sigma: Optional[float],
-    debug: bool,
-    dataset_meta_map: Dict[str, Dict[str, object]],
-    anchor_augment_map: Optional[Dict[str, List[np.ndarray]]] = None,
-    target_augment_map: Optional[Dict[str, List[np.ndarray]]] = None,
-    pn_label_maps: Optional[Dict[str, Optional[Dict[str, set[Tuple[str, int, int]]]]]] = None,
-    overlap_set: Optional[OverlapSet] = None,
-) -> Tuple[
-    List[torch.Tensor],
-    List[torch.Tensor],
-    Counter,
-    Optional[Dict[str, List[Dict[str, object]]]],
-    Dict[str, int],
-    List[Dict[str, object]],
-    List[torch.Tensor],
-    Dict[str, Dict[str, Dict[str, object]]],
-]:
-    return _build_aligned_pairs_core(
-        pairs,
-        anchor_name=anchor_name,
-        target_name=target_name,
-        use_positive_only=use_positive_only,
-        aggregator=aggregator,
-        gaussian_sigma=gaussian_sigma,
-        debug=debug,
-        dataset_meta_map=dataset_meta_map,
-        anchor_augment_map=anchor_augment_map,
-        target_augment_map=target_augment_map,
-        pn_label_maps=pn_label_maps,
-        pairing_mode="set_to_set",
-        overlap_set=overlap_set,
-    )
-
 def _add_debug_sample(
     store: Dict[str, Dict[str, object]],
     record,
@@ -1200,8 +1202,97 @@ def _mask_contains_coord(coord: Optional[Tuple[float, float]], mask_info: Option
         pass
     return bool(value)
 
+def _apply_projector_based_PUNlabels(
+    workspace: OverlapAlignmentWorkspace,
+    dataset_name: str,
+    pn_lookup: Optional[Dict[str, set[Tuple[str, int, int]]]],
+    projector: nn.Module,
+    device: torch.device,
+    run_logger: Any,
+    *,
+    overlap_mask: Optional[Dict[str, object]] = None,
+    apply_overlap_filter: bool = False,
+) -> Optional[Dict[str, object]]:
+    bundle = workspace.datasets.get(dataset_name)
+    if bundle is None:
+        run_logger.log(f"[cls] dataset {dataset_name} not found in workspace; skipping classifier samples.")
+        return None
+    if apply_overlap_filter and overlap_mask is None:
+        run_logger.log(f"[cls] overlap mask unavailable; cannot filter samples for dataset {dataset_name}.")
+        apply_overlap_filter = False
+    matched_records: List[EmbeddingRecord] = []
+    labels: List[int] = []
+    coords: List[Optional[Tuple[float, float]]] = []
+    regions: List[Optional[str]] = []
+    row_cols: List[Optional[Tuple[int, int]]] = []
+    indices: List[int] = []
+    metadata: List[Dict[str, object]] = []
+    
+    for record in bundle.records:
+        if pn_lookup is not None:
+            label = _lookup_pn_label(record.region, record.row_col, pn_lookup)
+            if label is None:
+                label_int = -1  # Unlabelled
+            elif int(label) == 1:
+                label_int = 1
+            elif int(label) == 0:
+                label_int = 0
+            else:
+                raise ValueError(f"Invalid PN label value: {label}")
+        else:
+            label_int = -1  # Unlabelled
 
-def _collect_classifier_samples(
+        coord_norm = _normalise_coord(record.coord)
+        if apply_overlap_filter and not _mask_contains_coord(coord_norm, overlap_mask):
+            continue
+        matched_records.append(record)
+        labels.append(label_int)
+        coords.append(coord_norm)
+        regions.append(getattr(record, "region", None))
+        row_cols.append(getattr(record, "row_col", None))
+        indices.append(int(getattr(record, "index", len(indices))))
+        metadata.append(
+            {
+                "dataset": dataset_name,
+                "label": label_int,
+                "coord": coord_norm,
+                "region": getattr(record, "region", None),
+                "row_col": getattr(record, "row_col", None),
+                "embedding_index": int(getattr(record, "index", len(indices))),
+                "tile_id": getattr(record, "tile_id", None),
+                "overlap_filtered": bool(apply_overlap_filter),
+            }
+        )
+    if not matched_records:
+        run_logger.log(f"[cls] No PN-labelled samples found for dataset {dataset_name}; skipping classifier samples.")
+        return None
+    if torch is None:
+        raise RuntimeError("PyTorch is required to collect classifier samples.")
+    embeddings = np.stack([np.asarray(rec.embedding, dtype=np.float32) for rec in matched_records])
+    projector = projector.to(device)
+    projector.eval()
+    with torch.no_grad():
+        embed_tensor = torch.from_numpy(embeddings).to(device)
+        if hasattr(projector, 'aggregator'):
+        # For AggregatorTargetHead, reshape input for aggregation
+            target_tensor = embed_tensor.unsqueeze(1)  # Add sequence length dimension [B, 1, D]
+            projected = projector(embed_tensor, target_tensor).detach().cpu()
+        else:
+            projected = projector(embed_tensor).detach().cpu()
+    # label_tensor = torch.tensor(labels, dtype=torch.float32)
+    label_tensor = torch.tensor(labels, dtype=torch.int16)
+    return {
+        "dataset": dataset_name,
+        "features": projected,
+        "labels": label_tensor,
+        "metadata": metadata,
+        "coords": coords,
+        "regions": regions,
+        "row_cols": row_cols,
+        "indices": indices,
+    }
+
+def _apply_projector_based_PNlabels(
     workspace: OverlapAlignmentWorkspace,
     dataset_name: str,
     pn_lookup: Optional[Dict[str, set[Tuple[str, int, int]]]],

@@ -76,7 +76,7 @@ from Common.Unifying.Labels_TwoDatasets import (
     _build_aligned_pairs_SetToSet,
     _normalise_coord,
     _normalise_row_col,
-    _collect_classifier_samples,
+    _apply_projector_based_PNlabels,
 )
 from Common.Unifying.Labels_TwoDatasets.fusion_utils import (
     align_overlap_embeddings_for_pn_one_to_one as _align_overlap_embeddings_for_pn_OneToOne,
@@ -778,7 +778,7 @@ def main() -> None:
                 run_logger.log(f"[cls] projector unavailable for dataset {dataset_name}; skipping.")
                 continue
 
-            sample_set = _collect_classifier_samples(
+            sample_set = _apply_projector_based_PNlabels(
                 workspace=workspace,
                 dataset_name=dataset_name,
                 pn_lookup=pn_label_maps.get(dataset_name),

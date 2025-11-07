@@ -41,13 +41,9 @@ def fusion_export_results(
     inference_summary: Dict[str, object] = {}
     for dataset_name, payload in inference_outputs.items():
         out_dir = fusion_dir / dataset_name
-        write_prediction_outputs(
-            payload["prediction"],
-            payload["default_reference"],
-            out_dir,
-            pos_coords_by_region=payload["pos_map"],
-            neg_coords_by_region=payload["neg_map"],
-        )
+        write_prediction_outputs(payload["prediction"], payload["default_reference"], out_dir,
+                                pos_coords_by_region=payload["pos_map"], neg_coords_by_region=payload["neg_map"],
+                                )
         # predictions_path = out_dir / "predictions.npy"
         predictions_path = out_dir / "predictions.npz"
         try:
