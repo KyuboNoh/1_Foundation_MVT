@@ -1,6 +1,6 @@
 {
-  "project_main_dir": "/home/qubuntu25/Desktop/Research/Data/1_Foundation_MVT_Result/",
-  "output_dir": "2_UFM_v2/Ex1_TransformerDCCA",
+  "project_main_dir": "/home/wslqubuntu24/Research/Data/1_Foundation_MVT_Result/",
+  "output_dir": "2_UFM_v2/TransAggDCCA_Ex1_dim128",
   "pipeline_presteps": {
     "step1_datasets": [
       {
@@ -23,23 +23,23 @@
   "optimization": {
     "step1_DCCA": {
       "batch_size": 256,
-      "epochs": 60,
+      "epochs": 100,
       "lr": 0.0005,
       "projection_dim": 128,
       "mlp_hidden_dims": [256, 128],
-      "validation_fraction": 0.3,
+      "validation_fraction": 0.2,
       "dcca_eps": 1e-5,
-      "singular_value_drop_ratio": 0.0,
+      "singular_value_drop_ratio": 0.05,
       "tcc_ratio": 0.0005
     },
     "step2_CLS": {
       "overlapregion_label": "BC",
-      "batch_size": 16,
-      "epochs": 60,
+      "batch_size": 128,
+      "epochs": 70,
       "lr": 0.0005,
-      "mlp_hidden_dims": [256, 128, 64, 32],
-      "validation_fraction": 0.3,
-      "mc_dropout_passes" : 10
+      "mlp_hidden_dims": [256, 128],
+      "validation_fraction": 0.2,
+      "mc_dropout_passes" : 5
     }
   }
 }
