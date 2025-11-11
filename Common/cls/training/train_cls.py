@@ -12,6 +12,7 @@ from tqdm import tqdm
 from Common.metrics_logger import DEFAULT_METRIC_ORDER, log_metrics, normalize_metrics
 from Common.data_utils import read_stack_patch
 from torch.utils.data import DataLoader, Dataset
+import torch.nn as nn
 
 def _collect_outputs(encoder, mlp, loader, device) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run encoder+MLP over a loader and return stacked labels and probabilities on CPU."""
@@ -21,13 +22,21 @@ def _collect_outputs(encoder, mlp, loader, device) -> Tuple[torch.Tensor, torch.
             torch.empty(0, dtype=torch.float32),
         )
 
+    # Check if encoder is Identity (pre-computed embeddings)
+    is_identity_encoder = isinstance(encoder, nn.Identity)
+
     labels: List[torch.Tensor] = []
     probs: List[torch.Tensor] = []
     for x, y in loader:
         x = x.to(device)
         y = y.to(device)
         with torch.no_grad():
-            z = encoder.encode(x)
+            if is_identity_encoder:
+                # x is already embeddings, just pass through identity
+                z = encoder(x)
+            else:
+                # x is patches, encode them
+                z = encoder.encode(x)
             p = mlp(z)
         labels.append(y.detach().view(-1).cpu().long())
         probs.append(p.detach().view(-1).cpu().float())
@@ -102,6 +111,10 @@ def train_classifier(
     mlp.to(device)
     opt = torch.optim.AdamW(mlp.parameters(), lr=lr)
     bce = torch.nn.BCELoss()
+
+    # Check if encoder is Identity (pre-computed embeddings)
+    is_identity_encoder = isinstance(encoder, nn.Identity)
+        
     if loss_weights is None:
         loss_weights = {"bce": 1.0}
     best = {"f1": -1, "state_dict": None}
@@ -113,7 +126,12 @@ def train_classifier(
         for x, y in tqdm(train_loader, desc=f"CLS epoch {ep}"):
             x, y = x.to(device), y.float().to(device)
             with torch.no_grad():
-                z = encoder.encode(x)
+                if is_identity_encoder:
+                    # x is already embeddings, just pass through identity
+                    z = encoder(x)
+                else:
+                    # x is patches, encode them
+                    z = encoder.encode(x)
             p = mlp(z)
             raw_loss = bce(p, y)
             weighted_loss = loss_weights.get("bce", 1.0) * raw_loss
@@ -170,6 +188,7 @@ def eval_classifier(encoder, mlp, loader, device=None):
     mlp.eval().to(device)
     targets, probs = _collect_outputs(encoder, mlp, loader, device)
     metrics = _compute_metrics(targets, probs)
+
     if targets.numel():
         raw_loss = torch.nn.functional.binary_cross_entropy(probs, targets.float())
         metrics["loss"] = float(raw_loss.item())
@@ -183,7 +202,7 @@ def dataloader_metric_inputORembedding(Xtr, Xval, ytr, yval, batch_size, positiv
                       augmented_patches_all: Optional[np.ndarray]=None, augmented_sources_all: Optional[np.ndarray]=None,
                       pos_coord_to_index: Optional[Dict[Tuple[int, ...], int]]=None,
                       window_size=None, stack=None,
-                      embedding: Optional[np.ndarray]=None,
+                      embedding = False,
                       epochs=50) -> Tuple[DataLoader, DataLoader, Dict[str, Any]]:
     # Prepare dataloaders and compute dataset metrics for training
     # Robust to have input in input domain (data domain) or embedding
@@ -223,20 +242,16 @@ def dataloader_metric_inputORembedding(Xtr, Xval, ytr, yval, batch_size, positiv
     if 'train_augmented' not in metrics_summary:
         metrics_summary['train_augmented'] = int(len(extra_train_samples))
     metrics_summary['train_samples_with_aug'] = len(Xtr) + len(extra_train_samples)
-    if window_size is not None:
+    if embedding == True:
+        # ds_tr = torch.utils.data.TensorDataset(torch.from_numpy(embedding[np.array(Xtr)]).float(),  torch.from_numpy(np.array(ytr)).long())
+        # ds_va = torch.utils.data.TensorDataset(torch.from_numpy(embedding[np.array(Xval)]).float(), torch.from_numpy(np.array(yval)).long())
+        ds_tr = torch.utils.data.TensorDataset(torch.from_numpy(np.array(Xtr)).float(),  torch.from_numpy(np.array(ytr)).long())
+        ds_va = torch.utils.data.TensorDataset(torch.from_numpy(np.array(Xval)).float(), torch.from_numpy(np.array(yval)).long())
+        worker_count = 0
+    elif window_size is not None:
         ds_tr = LabeledPatches(stack, Xtr, ytr, window=window_size, extra_samples=extra_train_samples)
         ds_va = LabeledPatches(stack, Xval, yval, window=window_size)
         worker_count = 0 if getattr(stack, 'kind', None) == 'raster' else 8
-    elif embedding is not None:
-        ds_tr = torch.utils.data.TensorDataset(
-            torch.from_numpy(embedding[np.array(Xtr)]).float(),
-            torch.from_numpy(np.array(ytr)).long()
-        )
-        ds_va = torch.utils.data.TensorDataset(
-            torch.from_numpy(embedding[np.array(Xval)]).float(),
-            torch.from_numpy(np.array(yval)).long()
-        )
-        worker_count = 0
     else:
         raise NotImplementedError("Non-windowed data loading is not implemented.")
 

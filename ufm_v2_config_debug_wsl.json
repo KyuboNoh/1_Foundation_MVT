@@ -1,6 +1,6 @@
 {
   "project_main_dir": "/home/wslqubuntu24/Research/Data/1_Foundation_MVT_Result/",
-  "output_dir": "2_UFM_v2/TransAggDCCA_Ex1_dim128",
+  "output_dir": "2_UFM_v2/TransAggDCCA_Ex1_dim256",
   "pipeline_presteps": {
     "step1_datasets": [
       {
@@ -25,7 +25,7 @@
       "batch_size": 256,
       "epochs": 100,
       "lr": 0.0005,
-      "projection_dim": 128,
+      "projection_dim": 256,
       "mlp_hidden_dims": [256, 128],
       "validation_fraction": 0.2,
       "dcca_eps": 1e-5,
@@ -38,7 +38,7 @@
       "epochs": 50,
       "lr": 0.0005,
       "mlp_hidden_dims": [256, 128],
-      "validation_fraction": 0.3,
+      "validation_fraction": 0.2,
       "mc_dropout_passes" : 5
     }
   }

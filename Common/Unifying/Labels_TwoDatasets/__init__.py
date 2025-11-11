@@ -1207,6 +1207,7 @@ def _apply_projector_based_PUNlabels(
     dataset_name: str,
     pn_lookup: Optional[Dict[str, set[Tuple[str, int, int]]]],
     projector: nn.Module,
+    batch_size: int,
     device: torch.device,
     run_logger: Any,
     *,
@@ -1268,17 +1269,45 @@ def _apply_projector_based_PUNlabels(
         return None
     if torch is None:
         raise RuntimeError("PyTorch is required to collect classifier samples.")
+    
     embeddings = np.stack([np.asarray(rec.embedding, dtype=np.float32) for rec in matched_records])
     projector = projector.to(device)
     projector.eval()
+    
+    # Process in batches to avoid OOM
+    batch_size = 4096  # Adjust based on available memory
+    num_samples = embeddings.shape[0]
+    projected_list = []
+    
+    # run_logger.log(f"[cls] Processing {num_samples} samples for {dataset_name} in batches of {batch_size}")
+    
     with torch.no_grad():
-        embed_tensor = torch.from_numpy(embeddings).to(device)
-        if hasattr(projector, 'aggregator'):
-        # For AggregatorTargetHead, reshape input for aggregation
-            target_tensor = embed_tensor.unsqueeze(1)  # Add sequence length dimension [B, 1, D]
-            projected = projector(embed_tensor, target_tensor).detach().cpu()
-        else:
-            projected = projector(embed_tensor).detach().cpu()
+        for start_idx in range(0, num_samples, batch_size):
+            end_idx = min(start_idx + batch_size, num_samples)
+            batch_embeddings = embeddings[start_idx:end_idx]
+            
+            embed_tensor = torch.from_numpy(batch_embeddings).to(device)
+            
+            if hasattr(projector, 'aggregator'):
+                # For AggregatorTargetHead, use self-attention: each sample attends to itself
+                # This reduces dimensionality (512→256) via aggregator before final projection
+                target_tensor = embed_tensor.unsqueeze(1)  # [B, 1, D] - single-item sequence per sample
+                batch_projected = projector(embed_tensor, target_tensor).detach().cpu()
+            else:
+                batch_projected = projector(embed_tensor).detach().cpu()
+            
+            projected_list.append(batch_projected)
+            
+            # Clear GPU memory after each batch
+            del embed_tensor
+            if hasattr(projector, 'aggregator'):
+                del target_tensor
+            del batch_projected
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    
+    projected = torch.cat(projected_list, dim=0)
+    # run_logger.log(f"[cls] Projection complete for {dataset_name}: {projected.shape}")
+    
     # label_tensor = torch.tensor(labels, dtype=torch.float32)
     label_tensor = torch.tensor(labels, dtype=torch.int16)
     return {
@@ -1357,8 +1386,9 @@ def _apply_projector_based_PNlabels(
     with torch.no_grad():
         embed_tensor = torch.from_numpy(embeddings).to(device)
         if hasattr(projector, 'aggregator'):
-        # For AggregatorTargetHead, reshape input for aggregation
-            target_tensor = embed_tensor.unsqueeze(1)  # Add sequence length dimension [B, 1, D]
+            # For AggregatorTargetHead, use self-attention: each sample attends to itself
+            # This reduces dimensionality (512→256) via aggregator before final projection
+            target_tensor = embed_tensor.unsqueeze(1)  # [B, 1, D] - single-item sequence per sample
             projected = projector(embed_tensor, target_tensor).detach().cpu()
         else:
             projected = projector(embed_tensor).detach().cpu()

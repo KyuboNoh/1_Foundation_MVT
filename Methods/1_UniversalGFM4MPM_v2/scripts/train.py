@@ -97,6 +97,7 @@ from Common.Unifying.DCCA import (
     ProjectionHead
 )
 from Common.cls.infer.infer_maps import (group_coords, mc_predict_map_from_embeddings, write_prediction_outputs,)
+from Common.cls.sampling.likely_negatives import pu_select_negatives
 from Common.cls.models.mlp_dropout import MLPDropout
 from Common.cls.training.train_cls import (
     dataloader_metric_inputORembedding,
@@ -134,6 +135,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dcca-weights-path", type=str, default=None, help="Optional path to a saved DCCA checkpoint used when --read-dcca is enabled.",)
 
     parser.add_argument("--train-cls-1", action=argparse.BooleanOptionalAction, default=False, help="Train the PN classifier for Non-Overlapping part.",)
+    parser.add_argument("--train-cls-1-Method", choices=["PN", "PU"], default="PU", help="Classifier training method (default: PU). ")
+    parser.add_argument('--filter_top_pct', type=float, default=0.10)
+    parser.add_argument('--negs_per_pos', type=int, default=10)
+
     parser.add_argument("--train-cls-2", action=argparse.BooleanOptionalAction, default=False, help="Train the PN classifier for Overlapping part.",)
     parser.add_argument(
         "--mlp-hidden-dims",
@@ -696,7 +701,8 @@ def main() -> None:
                     try:
                         aggregator = CrossAttentionAggregator(
                             anchor_dim=anchor_dim,
-                            target_dim=(kv_dim - 2) if pos_enc and key_proj is not None else (kv_dim if key_proj is not None else target_dim or anchor_dim),
+                            # target_dim=(kv_dim - 2) if pos_enc and key_proj is not None else (kv_dim if key_proj is not None else target_dim or anchor_dim),
+                            target_dim=target_dim,
                             agg_dim=agg_dim,
                             num_layers=max(1, args.agg_trans_num_layers),
                             num_heads=max(1, args.agg_trans_num_heads),
@@ -772,6 +778,7 @@ def main() -> None:
                 dataset_name=dataset_name,
                 pn_lookup=pn_label_maps.get(dataset_name),
                 projector=projector,
+                batch_size=cfg.dcca_training.batch_size,
                 device=device,
                 run_logger=run_logger,
                 overlap_mask=overlap_mask_info,
@@ -788,7 +795,7 @@ def main() -> None:
             if dataset_name == anchor_name and sample_set:
                 anchor_overlap_samples = _apply_projector_based_PUNlabels(
                     workspace=workspace, dataset_name=dataset_name, pn_lookup=pn_label_maps.get(dataset_name),
-                    projector=projector, device=device, run_logger=run_logger,
+                    projector=projector, batch_size=cfg.dcca_training.batch_size, device=device, run_logger=run_logger,
                     overlap_mask=overlap_mask_info, apply_overlap_filter=True,
                 )
                 overlap_indices = set(anchor_overlap_samples.get("indices", [])) if anchor_overlap_samples else set()
@@ -807,7 +814,7 @@ def main() -> None:
                 run_logger.log( "[DEVVVVV] ")
                 target_overlap_samples = _apply_projector_based_PUNlabels(
                     workspace=workspace, dataset_name=dataset_name, pn_lookup=pn_label_maps.get(dataset_name),
-                    projector=projector, device=device, run_logger=run_logger,
+                    projector=projector, batch_size=cfg.dcca_training.batch_size, device=device, run_logger=run_logger,
                     overlap_mask=None, apply_overlap_filter=False,
                 )
         #################################### Training Cls - 0) GET Training data ready (END) ####################################
@@ -896,60 +903,179 @@ def main() -> None:
             val_frac = float(getattr(cfg.dcca_training, "validation_fraction", 0.2) if getattr(cfg, "dcca_training", None) else 0.2)
         val_frac = max(0.0, min(val_frac, 0.9))
 
-        total = n_u
-        val_count = int(total * val_frac)
-        # ensure at least one training sample if possible
-        minimum_train = 1
-        if total - val_count < minimum_train and total >= minimum_train:
-            val_count = max(0, total - minimum_train)
+        if args.train_cls_1_Method == "PU":
+            total = n_u
+            val_count = int(total * val_frac)
+            # ensure at least one training sample if possible
+            minimum_train = 1
+            if total - val_count < minimum_train and total >= minimum_train:
+                val_count = max(0, total - minimum_train)
 
-        if val_count <= 0:
-            train_indices = torch.arange(total, dtype=torch.long)
-            val_indices = torch.empty(0, dtype=torch.long)
-        else:
+            if val_count <= 0:
+                train_indices = torch.arange(total, dtype=torch.long)
+                val_indices = torch.empty(0, dtype=torch.long)
+            else:
+                gen = torch.Generator()
+                try:
+                    gen.manual_seed(int(cfg.seed))
+                except Exception:
+                    gen.manual_seed(0)
+                indices = torch.randperm(total, generator=gen)
+                val_indices = indices[:val_count]
+                train_indices = indices[val_count:]
+
+            train_idx_list = train_indices.tolist() if train_indices.numel() else []
+            val_idx_list = val_indices.tolist() if val_indices.numel() else []
+
+            uA_train = uA[train_idx_list].contiguous() if train_idx_list else uA.new_empty((0, uA.size(1)))
+            yA_pu_train = yA_pu[train_idx_list].contiguous() if train_idx_list else yA_pu.new_empty((0,))
+            uA_val = uA[val_idx_list].contiguous() if val_idx_list else uA.new_empty((0, uA.size(1)))
+            yA_pu_val = yA_pu[val_idx_list].contiguous() if val_idx_list else yA_pu.new_empty((0,))
+
+            train_ds = TensorDataset(uA_train, yA_pu_train)
+            val_ds   = TensorDataset(uA_val,   yA_pu_val)
+
+            # --- indices for P and U ---
+            pos_idx = (yA_pu_train == 1).nonzero(as_tuple=True)[0].tolist()
+            unl_idx = (yA_pu_train != 1).nonzero(as_tuple=True)[0].tolist()
+            if len(pos_idx) == 0:
+                raise RuntimeError("No positives in training set; cannot construct PU batches.")
+
+            # choose at least 2 positive per batch:
+            # k_pos = min(int(max(2, math.ceil(0.05 * cfg.cls_training.batch_size))) , len(pos_idx))  # e.g., 5% of batch or at least 2
+            k_pos = min(int(max(2, math.ceil(0.25 * cfg.cls_training.batch_size))) , len(pos_idx))  # e.g., 25% of batch or at least 2
+
+            k_unl = cfg.cls_training.batch_size - k_pos
+            PUsampler = PUBatchSampler(pos_idx, unl_idx, k_pos=k_pos, k_unl=k_unl, seed=cfg.seed)
+
+            # IMPORTANT: when using batch_sampler, do not pass batch_size/shuffle
+            train_loader = DataLoader(train_ds, batch_sampler=PUsampler, num_workers=0)
+            val_loader   = DataLoader(val_ds,   batch_size=cfg.cls_training.batch_size, shuffle=False, num_workers=0)
+
+            # --- global prior (use your dataset-wide estimate; don't recompute per batch) ---
+            pi_p = float((yA_pu == 1).sum().item()) / max(1, int(yA_pu.numel()))
+            pi_p = float(min(max(pi_p, 1e-4), 0.1))     # clamp only to keep numerics sane
+
+            encA = nn.Identity(); pA = nn.Identity()    # we are already in u-space
+
+            # TODO: Add loss_type in input configuration
+
+            # basic loss_type:
+            # gA = train_nnpu_a_only(encA, pA, train_loader, val_loader, pi_p, lr=cfg.dcca_training.lr, epochs=cfg.cls_training.epochs, device=device, loss_type='basic')
+            
+            # weighted loss_type:
+            gA = train_nnpu_a_only(encA, pA, train_loader, val_loader, pi_p, lr=cfg.dcca_training.lr, epochs=cfg.cls_training.epochs, device=device, loss_type='weighted',
+                                    alpha=0.9, w_p_max=20.0,
+                                    focal_gamma=0.5, prior_penalty=10.0,
+                                    logit_adjust_tau=0.0)   # optional for metrics calibration
+            # gA = train_nnpu_a_only(encA, pA, train_loader, val_loader, pi_p, lr=cfg.dcca_training.lr, epochs=cfg.cls_training.epochs, device=device, loss_type='weighted',
+            #                         alpha=0.75, w_p_max=25.0,
+            #                         focal_gamma=1.5, prior_penalty=5.0,
+            #                         logit_adjust_tau=1.0)   # optional for metrics calibration
+
+        elif args.train_cls_1_Method == "PN":
+            # Phase 1: Negative Selection & Dataset Preparation
+            pos_idx = (yA_pu == 1).nonzero(as_tuple=True)[0].tolist()
+            unl_idx = (yA_pu != 1).nonzero(as_tuple=True)[0].tolist()
+            pos_idx_arr = np.asarray(pos_idx, dtype=int)
+            unk_idx_arr = np.asarray(unl_idx, dtype=int)
+
+            neg_idx_region = pu_select_negatives(
+                Z_all = uA.cpu().numpy(),
+                pos_idx = pos_idx_arr,
+                unk_idx = unk_idx_arr,
+                filter_top_pct = args.filter_top_pct,
+                negatives_per_pos = args.negs_per_pos,
+            )
+            neg_idx_arr = np.asarray(neg_idx_region, dtype=int)
+
+            # Phase 2: Create Balanced P+N Dataset
+            # Create balanced PN dataset
+            pn_indices = np.concatenate([pos_idx_arr, neg_idx_arr], axis=0)  # Selected P+N
+            inf_indices = np.setdiff1d(np.arange(len(uA)), pn_indices)  # Remaining for inference
+
+            # Extract features and labels for P+N
+            uA_pn = uA[pn_indices]  # [N_pn, d]
+            yA_pn = torch.where(
+                torch.tensor([i in pos_idx for i in pn_indices], dtype=torch.bool),
+                1,  # Positive
+                0   # Negative (changed from -1 to 0 for BCE loss)
+            ).long()
+
+            # Extract coordinates for dataloaders
+            coords_pn = [anchor_non_overlap_samples["coords"][i] for i in pn_indices]
+
+            # Phase 3: Train/Val Split on P+N
+            # Split P+N dataset into train/val
+            total_pn = len(pn_indices)
+            val_count = int(total_pn * val_frac)
+
             gen = torch.Generator()
-            try:
-                gen.manual_seed(int(cfg.seed))
-            except Exception:
-                gen.manual_seed(0)
-            indices = torch.randperm(total, generator=gen)
-            val_indices = indices[:val_count]
-            train_indices = indices[val_count:]
+            gen.manual_seed(int(cfg.seed))
+            indices_pn = torch.randperm(total_pn, generator=gen)
 
-        train_idx_list = train_indices.tolist() if train_indices.numel() else []
-        val_idx_list = val_indices.tolist() if val_indices.numel() else []
+            val_indices_pn = indices_pn[:val_count].tolist()
+            train_indices_pn = indices_pn[val_count:].tolist()
 
-        uA_train = uA[train_idx_list].contiguous() if train_idx_list else uA.new_empty((0, uA.size(1)))
-        yA_pu_train = yA_pu[train_idx_list].contiguous() if train_idx_list else yA_pu.new_empty((0,))
-        uA_val = uA[val_idx_list].contiguous() if val_idx_list else uA.new_empty((0, uA.size(1)))
-        yA_pu_val = yA_pu[val_idx_list].contiguous() if val_idx_list else yA_pu.new_empty((0,))
+            # Create train/val data
+            Xtr = uA_pn[train_indices_pn]  # Features OR coordinates
+            ytr = yA_pn[train_indices_pn]  # Labels (0/1)
+            Xval = uA_pn[val_indices_pn]
+            yval = yA_pn[val_indices_pn]
 
-        train_ds = TensorDataset(uA_train, yA_pu_train)
-        val_ds   = TensorDataset(uA_val,   yA_pu_val)
+            # Phase 4: Create DataLoaders
+            # Option A: Use embeddings directly (recommended since you already have uA)
+            dl_tr, dl_va, metrics_summary_append = dataloader_metric_inputORembedding(
+                Xtr=Xtr,  # [N_tr, d] tensor
+                Xval=Xval,  # [N_val, d] tensor
+                ytr=ytr,  # [N_tr] tensor
+                yval=yval,  # [N_val] tensor
+                batch_size=cfg.cls_training.batch_size,
+                positive_augmentation=False,  
+                augmented_patches_all=None,
+                pos_coord_to_index=None,
+                window_size=None,
+                stack=None,  # No need for MaskStack since using embeddings
+                embedding=True,  
+                epochs=cfg.cls_training.epochs
+            )
 
-        # --- indices for P and U ---
-        pos_idx = (yA_pu_train == 1).nonzero(as_tuple=True)[0].tolist()
-        unl_idx = (yA_pu_train != 1).nonzero(as_tuple=True)[0].tolist()
-        if len(pos_idx) == 0:
-            raise RuntimeError("No positives in training set; cannot construct PU batches.")
+            # Phase 5 : Build Model & Train
+            # Determine input dimension
+            in_dim = uA.size(1)  # Already in projected space (e.g., 128)
 
-        # choose at least 2 positive per batch:
-        k_pos = min(int(max(2, math.ceil(0.05 * cfg.cls_training.batch_size))) , len(pos_idx))  # e.g., 5% of batch or at least 2
+            # Build classifier (matching reference)
+            hidden_dims = mlp_hidden_dims  # From args, e.g., [256, 128]
+            gA = MLPDropout(
+                in_dim=in_dim,
+                hidden_dims=hidden_dims,
+                p=float(mlp_dropout)  # e.g., 0.2
+            ).to(device)
 
-        k_unl = cfg.cls_training.batch_size - k_pos
-        PUsampler = PUBatchSampler(pos_idx, unl_idx, k_pos=k_pos, k_unl=k_unl, seed=cfg.seed)
+            # Encoder is identity since we're already in projected space
+            encA = nn.Identity().to(device)
 
-        # IMPORTANT: when using batch_sampler, do not pass batch_size/shuffle
-        train_loader = DataLoader(train_ds, batch_sampler=PUsampler, num_workers=0)
-        val_loader   = DataLoader(val_ds,   batch_size=cfg.cls_training.batch_size, shuffle=False, num_workers=0)
+            # Train classifier (matching reference)
+            print("[info] Training PN classifier...")
+            gA, epoch_history = train_classifier(
+                encA,  # Identity encoder
+                gA,    # MLPDropout classifier
+                dl_tr,
+                dl_va,
+                epochs=cfg.cls_training.epochs,
+                return_history=True,
+                loss_weights={'bce': 1.0},  # Binary cross-entropy
+            )
 
-        # --- global prior (use your dataset-wide estimate; don't recompute per batch) ---
-        pi_p = float((yA_pu == 1).sum().item()) / max(1, int(yA_pu.numel()))
-        pi_p = float(min(max(pi_p, 1e-4), 0.2))  # clamp only to keep numerics sane
+            # Evaluate
+            train_eval = eval_classifier(encA, gA, dl_tr)
+            val_eval = eval_classifier(encA, gA, dl_va)
+            log_metrics("final train", train_eval, order=DEFAULT_METRIC_ORDER)
+            log_metrics("final val", val_eval, order=DEFAULT_METRIC_ORDER)
 
-        encA = nn.Identity(); pA = nn.Identity()    # we are already in u-space
-        gA = train_nnpu_a_only(encA, pA, train_loader, val_loader, pi_p, lr=cfg.dcca_training.lr, epochs=cfg.cls_training.epochs, device=device,)
-        
+        else:
+            raise RuntimeError(f"Unsupported cls_1 training method: {args.train_cls_1_Method}")
+
         # After training gA inference
         uA_overlap = anchor_overlap_samples["features"].float()
         inference_results["gA_Overlap"] = run_inference_gA_only(
@@ -978,18 +1104,27 @@ def main() -> None:
     if args.train_cls_1 or args.train_cls_2:
         # After training gA (around line 1037)
         if gA is not None:
-            # Get input dimension from the first layer of gA's network
-            d = gA.net[0].in_features  # Get dimension from first linear layer            
+            # Get input dimension based on the model type
+            if isinstance(gA, PNHeadAOnly):
+                # PNHeadAOnly has .mlp[0] structure
+                d = gA.mlp[0].in_features  # Get dimension from first linear layer
+                architecture = 'PNHeadAOnly'
+            elif isinstance(gA, MLPDropout):
+                # MLPDropout has .net[0] structure
+                d = gA.net[0].in_features  # Get dimension from first linear layer
+                architecture = 'MLPDropout'
+            else:
+                raise RuntimeError(f"Unknown gA model type: {type(gA)}")
 
             # Save A-only PN head
             gA_state = {
                 'state_dict': gA.state_dict(),
                 'input_shape': d,  # feature dimension
-                'architecture': 'PNHeadAOnly'
+                'architecture': architecture  # Store actual architecture type
             }
             save_path = Path(cfg.output_dir) / "cls_1_nonoverlap.pt"
             torch.save(gA_state, save_path)
-            run_logger.log(f"[cls] Saved A-only PN head (input dim={d}) to {save_path}")        
+            run_logger.log(f"[cls] Saved A-only PN head (architecture={architecture}, input dim={d}) to {save_path}")        
 
         # After gA training and before gAB training 
         if gA is None:
@@ -999,16 +1134,27 @@ def main() -> None:
                 try:
                     gA_state = torch.load(gA_path)
                     d = gA_state['input_shape']
-                    gA = PNHeadAOnly(d=d).to(device)
+                    architecture = gA_state.get('architecture', 'PNHeadAOnly')  # Default to old format
+                    
+                    # Reconstruct the correct model type
+                    if architecture == 'PNHeadAOnly':
+                        gA = PNHeadAOnly(d=d).to(device)
+                    elif architecture == 'MLPDropout':
+                        # Need to infer hidden_dims from the saved state
+                        # For now, use default hidden dims
+                        gA = MLPDropout(in_dim=d, hidden_dims=mlp_hidden_dims, p=mlp_dropout).to(device)
+                    else:
+                        raise ValueError(f"Unknown architecture type: {architecture}")
+                    
                     gA.load_state_dict(gA_state['state_dict'])
                     gA.eval()
-                    run_logger.log(f"[cls] Loaded A-only PN head (input dim={d}) from {gA_path}")
+                    run_logger.log(f"[cls] Loaded A-only PN head (architecture={architecture}, input dim={d}) from {gA_path}")
                 except Exception as e:
                     run_logger.log(f"[cls] Failed to load A-only PN head from {gA_path}: {str(e)}")
                     raise RuntimeError("Could not train or load A-only PN head required for unified training")
             else:
                 raise RuntimeError("A-only PN head not found and training failed; cannot proceed with unified training")
-
+                
         #################################### Training Cls - 2) GLOBAL\OVERLAP using GLOBAL data (START) ####################################
         # ---------- simple dataset for precomputed u/v ----------
     class UVDataset(Dataset):
@@ -1205,15 +1351,6 @@ def main() -> None:
         #     batch_size=INFERENCE_BATCH_SIZE,
         # )
 
-        # inference_results["gAB_Overlap"] = run_overlap_inference_gAB(
-        #     u_overlap=u_overlap, v_overlap=v_overlap,b_to_a=b_to_a,
-        #     anchor_overlap_samples=anchor_overlap_samples,
-        #     target_overlap_samples=target_overlap_samples,
-        #     gAB=gAB, device=device, cfg=cfg,
-        #     output_dir=Path(cfg.output_dir) / "cls_2_inference_results" / "Overlap",
-        #     run_logger=run_logger,
-        #     passes=cfg.cls_training.mc_dropout_passes
-        # )
         #################################### Training Cls - 2) GLOBAL\OVERLAP using GLOBAL data (END) ####################################
 
     if args.train_cls_1 and args.train_cls_2:
@@ -1234,21 +1371,21 @@ def main() -> None:
 
         # After gAB training
         if gAB is None:
-            # Try to load saved A-only PN head
-            gA_path = Path(cfg.output_dir) / "cls_2_unified.pt"
-            if gA_path.exists():
+            # Try to load saved unified PN head
+            gAB_path = Path(cfg.output_dir) / "cls_2_unified.pt"
+            if gAB_path.exists():
                 try:
-                    gAB_state = torch.load(gA_path)
+                    gAB_state = torch.load(gAB_path)
                     d = gAB_state['input_shape']
-                    gAB = PNHeadAOnly(d=d).to(device)
+                    gAB = PNHeadUnified(d=d).to(device)  # Fixed: use PNHeadUnified instead of PNHeadAOnly
                     gAB.load_state_dict(gAB_state['state_dict'])
                     gAB.eval()
-                    run_logger.log(f"[cls] Loaded unified PN head (input dim={d}) from {gA_path}")
+                    run_logger.log(f"[cls] Loaded unified PN head (input dim={d}) from {gAB_path}")
                 except Exception as e:
-                    run_logger.log(f"[cls] Failed to load unified PN head from {gA_path}: {str(e)}")
+                    run_logger.log(f"[cls] Failed to load unified PN head from {gAB_path}: {str(e)}")
                     raise RuntimeError("Could not train or load unified PN head required for unified training")
             else:
-                raise RuntimeError("A-only PN head not found and training failed; cannot proceed with unified training")
+                raise RuntimeError("Unified PN head not found and training failed; cannot proceed with unified training")
 
     #################################### Temporal Debugging Module ####################################
     _debug_root = Path(cfg.output_dir)
@@ -1427,16 +1564,27 @@ def run_inference_gA_only(
     run_logger.log(f"[inference-gA] Processing {len(matched_coords)} anchor samples")
     
     # Prepare output directory
-    model_dir = output_dir / "overlap_inference" / "gA"
+    model_dir = output_dir / "gA"
     model_dir.mkdir(parents=True, exist_ok=True)
     
     # MC Dropout inference
     gA.train()  # Enable dropout
     predictions_list = []
     
+    # ✅ Check if model outputs probabilities or logits (To handle both PN and PU cases)
+    outputs_probs = isinstance(gA, MLPDropout)  # MLPDropout outputs probabilities directly
+
     with torch.no_grad():
         for _ in range(passes):
-            pred = gA(uA)
+            output = gA(uA)
+            
+            if outputs_probs:
+                # ✅ Model already outputs probabilities, use directly
+                pred = output
+            else:
+                # ✅ Model outputs logits, apply sigmoid
+                pred = torch.sigmoid(output)
+            
             predictions_list.append(pred.cpu().numpy())
     
     gA.eval()  # Disable dropout
@@ -1568,9 +1716,12 @@ def run_overlap_inference_gAB_from_pairs(
     run_logger.log(f"[inference-gAB] Projected shapes: U={tuple(U.shape)}, V={tuple(V.shape)}")
 
     # ----- 4) MC-Dropout inference on the unified head -----
-    model_dir = output_dir / "overlap_inference" / "gAB"
+    model_dir = output_dir / "gAB"
     model_dir.mkdir(parents=True, exist_ok=True)
 
+    # ✅ Check if unified model outputs probabilities or logits
+    outputs_probs = isinstance(gAB, PNHeadUnified)  # PNHeadUnified outputs probabilities
+    
     gAB.train()  # enable dropout
     preds_mc = []
 
@@ -1583,8 +1734,17 @@ def run_overlap_inference_gAB_from_pairs(
                 u_b = U[s:s+batch_size]
                 v_b = V[s:s+batch_size]
                 bm_b = zeros[s:s+batch_size]
-                out = gAB(u_b, v_b, bm_b)  # [B]
-                batch_out.append(out.detach().cpu())
+                
+                output = gAB(u_b, v_b, bm_b)  # [B]
+                
+                if outputs_probs:
+                    # ✅ Model already outputs probabilities
+                    probs = output
+                else:
+                    # ✅ Model outputs logits, apply sigmoid
+                    probs = torch.sigmoid(output)
+                
+                batch_out.append(probs.detach().cpu())
             preds_mc.append(torch.cat(batch_out, dim=0).numpy())
 
     gAB.eval()
@@ -1625,93 +1785,6 @@ def run_overlap_inference_gAB_from_pairs(
         "summary": summary,
     }
 
-
-def run_overlap_inference_gAB(
-    u_overlap: torch.Tensor,
-    v_overlap: torch.Tensor,
-    b_to_a: torch.Tensor,
-    anchor_overlap_samples: Dict,
-    target_overlap_samples: Dict,
-    gAB: nn.Module,
-    device: torch.device,
-    cfg: AlignmentConfig,
-    output_dir: Path,
-    run_logger: "_RunLogger",
-    passes: int = 10
-) -> Dict[str, object]:
-    """Run inference on overlap data using the gAB (unified) model."""
-    
-    # Align v features with u using b_to_a mapping
-    valid_matches = b_to_a >= 0
-    u_matched = u_overlap[b_to_a[valid_matches]].to(device)
-    v_matched = v_overlap[valid_matches].to(device)
-    
-    # Get corresponding metadata
-    matched_indices = b_to_a[valid_matches].cpu().numpy()
-    matched_coords = [anchor_overlap_samples["coords"][int(idx)] for idx in matched_indices]
-    
-    run_logger.log(f"[inference-gAB] Processing {len(matched_coords)} matched pairs")
-    
-    # Prepare output directory
-    model_dir = output_dir / "overlap_inference" / "gAB"
-    model_dir.mkdir(parents=True, exist_ok=True)
-    
-    # MC Dropout inference
-    gAB.train()  # Enable dropout
-    predictions_list = []
-    
-    with torch.no_grad():
-        for _ in range(passes):
-            # For unified model, use proper forward signature
-            b_missing = torch.zeros(u_matched.size(0), 1, device=device)
-            pred = gAB(u_matched, v_matched, b_missing)
-            predictions_list.append(pred.cpu().numpy())
-    
-    gAB.eval()  # Disable dropout
-    
-    print("TODO: USE write_prediction_outputs function here to save outputs consistently.")
-
-    # Compute statistics
-    predictions_array = np.stack(predictions_list, axis=0)  # (passes, N)
-    mean_pred = predictions_array.mean(axis=0)
-    std_pred = predictions_array.std(axis=0)
-    
-    # Save raw predictions
-    np.save(model_dir / "predictions_mean.npy", mean_pred)
-    np.save(model_dir / "predictions_std.npy", std_pred)
-    np.save(model_dir / "coordinates.npy", np.array(matched_coords))
-    
-    # Create scatter plots
-    _create_inference_plots(
-        model_dir=model_dir,
-        model_name="gAB",
-        coords=matched_coords,
-        mean_pred=mean_pred,
-        std_pred=std_pred
-    )
-    
-    # Compute summary statistics
-    summary = _compute_inference_summary(
-        model_name="gAB",
-        mean_pred=mean_pred,
-        std_pred=std_pred,
-        labels=None,  # gAB (this version) doesn't have labels available
-    )
-    
-    # Save summary
-    with open(model_dir / "summary.json", 'w') as f:
-        json.dump(summary, f, indent=2)
-    
-    run_logger.log(f"[inference-gAB] Saved results to {model_dir}")
-    
-    return {
-        "predictions_mean": mean_pred,
-        "predictions_std": std_pred,
-        "coordinates": matched_coords,
-        "summary": summary
-    }
-
-
 def _create_inference_plots(
     model_dir: Path,
     model_name: str,
@@ -1728,7 +1801,7 @@ def _create_inference_plots(
     # Plot mean predictions
     coords_array = np.array(coords)
     # sc1 = axes[0].scatter(coords_array[:, 0], coords_array[:, 1], c=mean_pred, cmap='RdYlGn', s=5, marker='H', alpha=1.0, vmin=0, vmax=1)
-    sc1 = axes[0].scatter(coords_array[:, 0], coords_array[:, 1], c=mean_pred, cmap='RdYlGn', s=5, marker='H', alpha=1.0)
+    sc1 = axes[0].scatter(coords_array[:, 0], coords_array[:, 1], c=mean_pred, cmap='RdYlGn', s=2, marker='s', alpha=1.0)
     axes[0].set_title(f'{model_name} - Mean Prediction')
     axes[0].set_xlabel('X Coordinate')
     axes[0].set_ylabel('Y Coordinate')
@@ -1736,7 +1809,7 @@ def _create_inference_plots(
     plt.colorbar(sc1, ax=axes[0], label='Probability')
     
     # Plot uncertainty (std)
-    sc2 = axes[1].scatter(coords_array[:, 0], coords_array[:, 1], c=std_pred, cmap='viridis', s=5, marker='H', alpha=1.0)
+    sc2 = axes[1].scatter(coords_array[:, 0], coords_array[:, 1], c=std_pred, cmap='viridis', s=2, marker='s', alpha=1.0)
     axes[1].set_title(f'{model_name} - Uncertainty (Std)')
     axes[1].set_xlabel('X Coordinate')
     axes[1].set_ylabel('Y Coordinate')
@@ -1802,7 +1875,7 @@ def _compare_models(
     gA_pred = results["gA"]["predictions_mean"]
     gAB_pred = results["gAB"]["predictions_mean"]
     
-    comparison_dir = output_dir / "overlap_inference" / "comparison"
+    comparison_dir = output_dir / "comparison"
     comparison_dir.mkdir(parents=True, exist_ok=True)
     
     # Scatter plot: gA vs gAB predictions
@@ -1904,247 +1977,140 @@ from torch import nn
 from tqdm import tqdm
 
 def fit_unified_head_OVERLAP_from_uv(
-    gA,
-    data_loader_uv,
-    d_u=None,
-    device=None,
-    *,
-    # optimization
-    lr=5e-4,
-    steps=30,
-    eps=1e-6,
-    weight_decay=1e-4,
-    max_grad_norm=1.0,
-    # KD scheduling
-    kd_max=0.20,
-    kd_warmdown_epochs=5,
-    # loss weights
-    lambda_cons=1.0,
-    lambda_ent=0.10,
-    lambda_prior=5.0,
-    lambda_delta=0.10,
-    delta_margin=0.08,
-    # stochastic B views
-    jitter_sigma=0.05,
-    jitter_drop=0.20,
-    noise_sigma=None,
-    view_dropout=None,
-    # prior smoothing
-    pi_ema_alpha=0.9,
-    pi_clip_max=0.2
-):
-    """Train a unified PN head gAB(u, v, b_missing) on overlap pairs."""
-
-    # Helpers
-    def safe_logit(p, eps_=eps):
-        p = p.clamp(eps_, 1.0 - eps_)
-        return torch.log(p) - torch.log(1.0 - p)
-
-    def to_prob(z, eps_=eps):
-        return torch.sigmoid(z).clamp(eps_, 1.0 - eps_)
-
-    def bin_entropy_from_logit(z):
-        p = to_prob(z)
-        return -(p * torch.log(p) + (1 - p) * torch.log(1 - p))
-
-    # Accept legacy kwargs
-    if noise_sigma is not None:
-        jitter_sigma = float(noise_sigma)
-    if view_dropout is not None:
-        jitter_drop = float(view_dropout)
-
-    def jitter(v, sigma=jitter_sigma, drop=jitter_drop):
-        if sigma and sigma > 0.0:
-            v = v + sigma * torch.randn_like(v)
-        if drop and drop > 0.0:
-            mask = (torch.rand_like(v) > drop).float()
-            v = v * mask
-        return v
-
-    # Infer dims / device
-    u0, v0, b0 = next(iter(data_loader_uv))
-    if d_u is None:
-        d_u = int(u0.size(-1))
-    if device is None:
-        device = u0.device
-
-    # Models / optimizer
-    gA = gA.to(device).eval()
-    gAB = PNHeadUnified(d=d_u).to(device).train()
-    opt = torch.optim.AdamW(gAB.parameters(), lr=lr, weight_decay=weight_decay)
-
-    # Prior target (EMA)
-    pi_ema = None
-
-    # Training loop
-    epochs = int(steps)
-    for epoch in range(1, epochs + 1):
-        # Cosine warm-down for KD
-        if kd_warmdown_epochs <= 0:
-            lambda_kd = 0.0
-        else:
-            t = min(epoch - 1, kd_warmdown_epochs) / max(1, kd_warmdown_epochs)
-            lambda_kd = kd_max * 0.5 * (1.0 + math.cos(math.pi * t))
-
-        epoch_loss = epoch_kd = epoch_ent = epoch_cons = epoch_prior = epoch_delta = 0.0
-        batches = 0
-
-        pbar = tqdm(data_loader_uv, desc=f"    [cls - 2] Epoch {epoch:3d}/{epochs}", leave=False)
-
+    gA: nn.Module,
+    data_loader_uv: DataLoader,
+    d_u: int,
+    device: torch.device,
+    lr: float = 1e-3,
+    steps: int = 10,
+    lambda_ent: float = 0.0,
+    lambda_cons: float = 0.5,
+    lambda_focal: float = 2.0,    # ✅ NEW: focal weight for positives
+    view_dropout: float = 0.1,
+    noise_sigma: float = 0.0
+) -> nn.Module:
+    
+    # ✅ Check what type of outputs gA produces
+    gA_outputs_probs = isinstance(gA, MLPDropout)  # MLPDropout outputs probs
+    
+    # Build unified head
+    gAB = PNHeadUnified(d=d_u).to(device)
+    gAB_outputs_probs = True  # PNHeadUnified outputs probabilities
+    
+    opt = torch.optim.AdamW(gAB.parameters(), lr=lr, weight_decay=1e-4)
+    eps = 1e-6
+    
+    for epoch in range(1, steps + 1):
+        epoch_loss = 0.0
+        epoch_loss_kd = 0.0
+        epoch_loss_focal = 0.0
+        epoch_loss_ent = 0.0
+        epoch_loss_cons = 0.0
+        batch_count = 0
+        
+        pbar = tqdm(data_loader_uv, desc=f"    [cls - 2] Epoch {epoch:3d}/{steps}", leave=False)
+        
         for u, v, bmiss in pbar:
             u, v, bmiss = u.to(device), v.to(device), bmiss.to(device)
             
-            # ✅ FIX: Ensure bmiss is [B, 1] and create mB as [B] for scalar operations
-            if bmiss.ndim == 1:
-                bmiss = bmiss.unsqueeze(-1)
-            
-            mB = (1.0 - bmiss).squeeze(-1)  # ✅ [B] - scalar mask for element-wise ops
-            hasB = bool(mB.sum().item() > 0.0)
-
-            # Teacher (probabilities + logits)
             with torch.no_grad():
-                t_p = gA(u).clamp(eps, 1 - eps)  # [B] (probabilities, already squeezed by gA)
-                t_logit = safe_logit(t_p)        # [B]
-                pi_batch = float(t_p.mean().item())
-                pi_batch = float(min(max(pi_batch, 1e-4), pi_clip_max))
-                pi_ema = (pi_batch if pi_ema is None else 
-                         pi_ema_alpha * pi_ema + (1 - pi_ema_alpha) * pi_batch)
-
-            # Student passes
-            # No-B path
-            z_noB = gAB(u, torch.zeros_like(v), torch.ones_like(bmiss))  # [B] logits
-            p_noB = to_prob(z_noB)  # [B]
-
-            # Two stochastic B views
-            v1 = jitter(v)
-            v2 = jitter(v)
-            # Mask views where B is missing
-            v1 = v1 * mB.unsqueeze(-1)  # [B, d]
-            v2 = v2 * mB.unsqueeze(-1)  # [B, d]
-
-            z_B1 = gAB(u, v1, bmiss)  # [B] logits
-            z_B2 = gAB(u, v2, bmiss)  # [B] logits
-            p_B1 = to_prob(z_B1)      # [B]
-            p_B2 = to_prob(z_B2)      # [B]
-
-            # ========== Losses ==========
-            # 1) KD on logits for no-B path
-            loss_kd = F.mse_loss(z_noB, t_logit)
-
-            # 2) Consistency on logits (where B exists)
-            if hasB:
-                # ✅ Both z_B1 and mB are now [B], so element-wise multiplication works
-                loss_cons = F.mse_loss(z_B1 * mB, (z_B2.detach()) * mB)
-            else:
-                loss_cons = z_B1.sum() * 0.0
-
-            # 3) Entropy maximization on B path (where B exists)
-            if hasB:
-                H = bin_entropy_from_logit(z_B1)  # [B]
-                loss_ent = -(H * mB).sum() / mB.sum().clamp_min(1.0)
-            else:
-                loss_ent = z_B1.sum() * 0.0
-
-            # 4) Prior matching (where B exists)
-            if hasB:
-                p_mean = (p_B1 * mB).sum() / mB.sum().clamp_min(1.0)
-                loss_prior = (p_mean - float(pi_ema)) ** 2
-            else:
-                loss_prior = z_B1.sum() * 0.0
-
-            # 5) Delta loss: ensure B changes prediction (where B exists)
-            if hasB:
-                dB = (p_B1 - p_noB).abs()  # [B]
-                loss_delta = (F.relu(delta_margin - dB) * mB).mean()
-            else:
-                loss_delta = z_B1.sum() * 0.0
-
-            # Total loss
-            loss = (
-                lambda_kd   * loss_kd +
-                lambda_cons * loss_cons +
-                lambda_ent  * loss_ent +
-                lambda_prior* loss_prior +
-                lambda_delta* loss_delta
-            )
-
-            # Optimization step
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            if max_grad_norm and max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(gAB.parameters(), max_grad_norm)
-            opt.step()
-
-            # Bookkeeping
-            batches += 1
-            epoch_loss  += float(loss.item())
-            epoch_kd    += float(loss_kd.item())
-            epoch_cons  += float(loss_cons.item())
-            epoch_ent   += float((-loss_ent).item())
-            epoch_prior += float(loss_prior.item())
-            epoch_delta += float(loss_delta.item())
-
-            # Live stats
-            with torch.no_grad():
-                if hasB:
-                    dB_mean = ((p_B1 - p_noB).abs() * mB).sum() / mB.sum().clamp_min(1.0)
-                    pB_mean = (p_B1 * mB).sum() / mB.sum().clamp_min(1.0)
+                # Optional noise for robustness
+                if noise_sigma > 0:
+                    u_noisy = u + noise_sigma * torch.randn_like(u)
+                    v_noisy = v + noise_sigma * torch.randn_like(v)
                 else:
-                    dB_mean = torch.tensor(0.0, device=device)
-                    pB_mean = torch.tensor(0.0, device=device)
-                p0_mean = p_noB.mean()
+                    u_noisy, v_noisy = u, v
+                
+                # ✅ Get teacher predictions in PROBABILITY space
+                teacher_output = gA(u_noisy)
+                if gA_outputs_probs:
+                    teacher = teacher_output.detach()
+                else:
+                    teacher = torch.sigmoid(teacher_output).detach()  # Convert logits to probs
+            
+            # View dropout: teach robustness when B is absent
+            if torch.rand(1).item() < view_dropout:
+                v_in = torch.zeros_like(v_noisy)
+                b_in = torch.ones(u_noisy.size(0), 1, device=device)
+            else:
+                v_in = v_noisy
+                b_in = bmiss
+            
+            # ✅ Student predictions (ensure probabilities)
+            student_output = gAB(u_noisy, v_in, b_in)
+            if gAB_outputs_probs:
+                p_student = student_output
+            else:
+                p_student = torch.sigmoid(student_output)
+            
+            # ✅ Consistency target (ensure probabilities)
+            cons_output = gAB(u_noisy, v, torch.zeros_like(b_in))
+            if gAB_outputs_probs:
+                p_cons = cons_output
+            else:
+                p_cons = torch.sigmoid(cons_output)
 
+            # ✅ NEW: Focal-weighted KD loss
+            # Upweight samples where teacher predicts high probability
+            with torch.no_grad():
+                # Focal weight: higher for teacher's positive predictions
+                focal_weight = teacher.pow(2.0)  # Weight = teacher²
+                # Normalize so mean weight ≈ 1 (prevents loss scale issues)
+                focal_weight = focal_weight / (focal_weight.mean() + eps)
+
+            # Inside training loop, add after getting teacher predictions:
+            if batch_count == 0:  # First batch of epoch
+                print(f"    [debug] Teacher predictions: mean={teacher.mean().item():.3f}, "
+                    f"std={teacher.std().item():.3f}, min={teacher.min().item():.3f}, max={teacher.max().item():.3f}")
+                print(f"    [debug] Student predictions: mean={p_student.mean().item():.3f}, "
+                    f"std={p_student.std().item():.3f}, min={p_student.min().item():.3f}, max={p_student.max().item():.3f}")
+
+            # ✅ All losses now operate on probabilities [0,1]
+            kd_errors = (p_student - teacher).pow(2)
+            loss_kd_base = kd_errors.mean()  # Base MSE
+            loss_focal = (focal_weight * kd_errors).mean()  # Focal MSE
+            loss_cons = F.mse_loss(p_student, p_cons.detach())
+            # loss_kd_base = F.binary_cross_entropy(p_student, teacher)     # Alternative: BCE
+            
+            # ✅ Total loss (removed entropy, added focal)
+            loss = loss_kd_base + lambda_focal * loss_focal + lambda_cons * loss_cons
+            
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            
+            epoch_loss += loss.item()
+            epoch_loss_kd += loss_kd_base.item()
+            epoch_loss_focal += loss_focal.item()
+            # epoch_loss_ent += loss_ent.item()
+            epoch_loss_cons += loss_cons.item()
+            batch_count += 1
+            
             pbar.set_postfix({
                 'loss': f'{loss.item():.4e}',
-                'kd': f'{(lambda_kd*loss_kd).item():.4e}',
-                'ent(H+)': f'{(-loss_ent).item():.4e}',
-                'cons': f'{(lambda_cons*loss_cons).item():.4e}',
-                'ΔB': f'{float(dB_mean):.3f}',
-                'π̂': f'{float(pi_ema):.3f}',
-                'p(B)': f'{float(pB_mean):.3f}',
-                'p(noB)': f'{float(p0_mean):.3f}',
+                'kd': f'{loss_kd_base.item():.4e}',
+                'focal': f'{loss_focal.item():.4e}',
+                # 'ent': f'{loss_ent.item():.4e}',
+                'cons': f'{loss_cons.item():.4e}'
             })
-
+        
         pbar.close()
-
-        # Epoch summary
-        denom = max(1, batches)
-        print(
-            f"    [cls - 2] Epoch {epoch:3d} | "
-            f"loss={(epoch_loss/denom):.4e} | "
-            f"kd={(epoch_kd/denom):.4e} | "
-            f"ent(H+)={(epoch_ent/denom):.4e} | "
-            f"cons={(epoch_cons/denom):.4e} | "
-            f"prior={(epoch_prior/denom):.4e} | "
-            f"delta={(epoch_delta/denom):.4e} | "
-            f"batches={batches}"
-        )
-
-        # Sanity check after epoch
-        with torch.no_grad():
-            try:
-                u_s, v_s, b_s = next(iter(data_loader_uv))
-                u_s, v_s, b_s = u_s.to(device), v_s.to(device), b_s.to(device)
-                if b_s.ndim == 1:
-                    b_s = b_s.unsqueeze(-1)
-                m_s = (1.0 - b_s).squeeze(-1)  # [B]
-                
-                z0 = gAB(u_s, torch.zeros_like(v_s), torch.ones_like(b_s))  # [B]
-                zB = gAB(u_s, v_s * m_s.unsqueeze(-1), b_s)  # [B]
-                p0 = to_prob(z0)  # [B]
-                pB = to_prob(zB)  # [B]
-                
-                if m_s.sum() > 0:
-                    pB_mean = (pB * m_s).sum() / m_s.sum()
-                    dB_mean = ((pB - p0).abs() * m_s).sum() / m_s.sum()
-                else:
-                    pB_mean = torch.tensor(0.0, device=device)
-                    dB_mean = torch.tensor(0.0, device=device)
-                print(f"[sanity] mean p(noB)={p0.mean().item():.3f}, mean p(B)={pB_mean.item():.3f}, ΔB={dB_mean.item():.3f}")
-            except StopIteration:
-                pass
-
-    print(f"\n    [cls - 2] Training completed after {epochs} epochs")
+        
+        # Print epoch summary
+        avg_loss = epoch_loss / batch_count if batch_count > 0 else 0.0
+        avg_kd = epoch_loss_kd / batch_count if batch_count > 0 else 0.0
+        avg_focal = epoch_loss_focal / batch_count if batch_count > 0 else 0.0
+        # avg_ent = epoch_loss_ent / batch_count if batch_count > 0 else 0.0
+        avg_cons = epoch_loss_cons / batch_count if batch_count > 0 else 0.0
+        
+        print(f"    [cls - 2] Epoch {epoch:3d} | "
+              f"loss={avg_loss:.4e} | "
+              f"kd={avg_kd:.4e} | "
+              f"focal={avg_focal:.4e} | "
+            #   f"ent={avg_ent:.4e} | "
+              f"cons={avg_cons:.4e}")
+    
+    print(f"\n    [cls - 2] Training completed after {steps} epochs")
     return gAB.eval()
 
 
@@ -2284,29 +2250,116 @@ class PUBatchSampler(Sampler[list]):
     def __len__(self):
         return self.epoch_len
 
-
+# class PNHeadAOnly(nn.Module):
+#     def __init__(self, d, hidden=256):
+#         super().__init__()
+#         self.net = nn.Sequential(
+#             nn.Linear(d, hidden), nn.GELU(),
+#             nn.Linear(hidden, hidden), nn.GELU(),
+#             nn.Linear(hidden, 1)
+#         )
+#     def forward(self, u): return torch.sigmoid(self.net(u)).squeeze(-1)
 class PNHeadAOnly(nn.Module):
-    def __init__(self, d, hidden=256):
+    def __init__(self, d, hidden=256, out_logits=True, prior_pi=None):
         super().__init__()
-        self.net = nn.Sequential(
+        self.out_logits = out_logits
+        self.mlp = nn.Sequential(
             nn.Linear(d, hidden), nn.GELU(),
             nn.Linear(hidden, hidden), nn.GELU(),
-            nn.Linear(hidden, 1)
         )
-    def forward(self, u): return torch.sigmoid(self.net(u)).squeeze(-1)
+        self.out = nn.Linear(hidden, 1)
+        # Optional: initialize bias to the prior logit to avoid all-negative start
+        if prior_pi is not None and 0.0 < prior_pi < 1.0:
+            with torch.no_grad():
+                self.out.bias.fill_(math.log(prior_pi/(1.0-prior_pi)))
 
-class NNPULoss(nn.Module):
-    def __init__(self, pi_p): super().__init__(); self.pi_p = float(pi_p); self.eps=1e-6
-    def logloss(self,p,y): return -(y*torch.log(p+self.eps)+(1-y)*torch.log(1-p+self.eps))
-    def forward(self,p,labels):
-        Pm=(labels==1).float(); Um=(labels==-1).float()
-        Lp=(self.logloss(p, torch.ones_like(p))*Pm).sum()  /(Pm.sum()+self.eps)
-        LnU=(self.logloss(p, torch.zeros_like(p))*Um).sum()/(Um.sum()+self.eps)
-        LnP=(self.logloss(p, torch.zeros_like(p))*Pm).sum()/(Pm.sum()+self.eps)
-        return self.pi_p*Lp + torch.clamp(LnU - self.pi_p*LnP, min=0.0)
+    def forward(self, u):
+        z = self.out(self.mlp(u)).squeeze(-1)  # logits
+        return z if self.out_logits else torch.sigmoid(z)  # toggle if needed
 
-def train_nnpu_a_only(encA, pA, train_loader, val_loader, pi_p, lr=1e-3, epochs=3, device='cuda'):
+# class NNPULoss(nn.Module):
+#     def __init__(self, pi_p): super().__init__(); self.pi_p = float(pi_p); self.eps=1e-6
+#     def logloss(self,p,y): return -(y*torch.log(p+self.eps)+(1-y)*torch.log(1-p+self.eps))
+#     def forward(self,p,labels):
+#         Pm=(labels==1).float(); Um=(labels==-1).float()
+#         Lp=(self.logloss(p, torch.ones_like(p))*Pm).sum()  /(Pm.sum()+self.eps)
+#         LnU=(self.logloss(p, torch.zeros_like(p))*Um).sum()/(Um.sum()+self.eps)
+#         LnP=(self.logloss(p, torch.zeros_like(p))*Pm).sum()/(Pm.sum()+self.eps)
+#         return self.pi_p*Lp + torch.clamp(LnU - self.pi_p*LnP, min=0.0)
+
+def _ensure_logits(y: torch.Tensor) -> torch.Tensor:
+    """
+    Accepts network output that might be logits (preferred) or probs in [0,1].
+    Returns logits tensor of shape [B].
+    """
+    if y.ndim == 2 and y.size(-1) == 1:
+        y = y.squeeze(-1)
+    # if looks like probs, convert to logits
+    if torch.isfinite(y).all() and y.min() >= 0.0 and y.max() <= 1.0:
+        y = torch.logit(y.clamp(1e-6, 1 - 1e-6))
+    return y
+
+def nnpu_basic_loss_from_logits(logits_p, logits_u, pi_p: float):
+    """
+    Classic non-negative PU risk (Kiryo et al., 2017) on logits.
+    """
+    pos_loss = F.softplus(-logits_p)   # ell^+(z)
+    neg_on_p = F.softplus( logits_p)   # ell^-(z) on P
+    neg_on_u = F.softplus( logits_u)   # ell^-(z) on U
+
+    R_p = pi_p * pos_loss.mean()
+    R_n = torch.clamp(neg_on_u.mean() - pi_p * neg_on_p.mean(), min=0.0)
+    return R_p + R_n
+
+def nnpu_weighted_loss_from_logits(
+    logits_p, logits_u, pi_p: float,
+    w_p: float = 10.0, w_n: float = 1.0,
+    focal_gamma: float | None = 1.5,
+    prior_penalty: float | None = 5.0
+):
+    """
+    Weighted nnPU risk with optional focalization (positives) and prior matching on U.
+    """
+    pos_loss = F.softplus(-logits_p)   # ell^+(z)
+    neg_on_p = F.softplus( logits_p)   # ell^-(z)
+    neg_on_u = F.softplus( logits_u)   # ell^-(z)
+
+    # focalize only the positive term (helps rare positives)
+    if focal_gamma is not None:
+        with torch.no_grad():
+            p_pos = torch.sigmoid(logits_p).clamp_(1e-6, 1-1e-6)
+        pos_loss = ((1.0 - p_pos) ** float(focal_gamma)) * pos_loss
+
+    R_p = pi_p * pos_loss.mean()
+    R_n = torch.clamp(neg_on_u.mean() - pi_p * neg_on_p.mean(), min=0.0)
+    loss = w_p * R_p + w_n * R_n
+
+    # prior-matching penalty to avoid all-negative collapse
+    if prior_penalty is not None and prior_penalty > 0:
+        p_u = torch.sigmoid(logits_u).mean()
+        loss = loss + prior_penalty * (p_u - float(pi_p))**2
+    return loss
+
+def train_nnpu_a_only(
+    encA, pA, train_loader, val_loader, pi_p,
+    lr: float = 1e-3, epochs: int = 3, device: str = "cuda",
+    loss_type: str = "weighted",         # 'basic' or 'weighted'
+    # weighted-loss knobs:
+    alpha: float = 0.75,                 # w_p ~ (U/P)^alpha
+    w_p_max: float = 25.0,               # cap on w_p
+    focal_gamma: float | None = 1.5,     # None to disable
+    prior_penalty: float | None = 5.0,   # None/0 to disable
+    # extras:
+    grad_clip: float | None = 2.0,
+    logit_adjust_tau: float | None = None  # prior-aware bias for metrics; None to skip
+):                    
     # Probe a batch to infer feature dimension; handle empty loader gracefully.
+
+    # Trains PNHeadAOnly on projected features u = pA(encA(x)).
+    # Labels are +1 (positive) and -1 (unlabeled) in the loaders.
+    # loss_type='basic'   -> classic non-negative PU (no weights/focal/prior)
+    # loss_type='weighted'-> positive-upweighted,
+
     try:
         it = iter(train_loader)
         x0, _ = next(it)
@@ -2315,6 +2368,7 @@ def train_nnpu_a_only(encA, pA, train_loader, val_loader, pi_p, lr=1e-3, epochs=
     except Exception as exc:
         raise RuntimeError(f"Failed to fetch a probe batch from train_loader: {exc}")
 
+    encA = encA.to(device);  pA = pA.to(device)
     with torch.no_grad():
         u0 = pA(encA(x0.to(device)))
     if u0.ndim < 2:
@@ -2323,9 +2377,26 @@ def train_nnpu_a_only(encA, pA, train_loader, val_loader, pi_p, lr=1e-3, epochs=
 
     gA = PNHeadAOnly(d=d).to(device)
     opt = torch.optim.AdamW(gA.parameters(), lr=lr, weight_decay=1e-4)
-    nnpu = NNPULoss(pi_p)
+    
+    if loss_type == 'basic':
+        w_p = 1.0
+        w_n = 1.0
+        focal_gamma = None
+        prior_penalty = None
+    elif loss_type == 'weighted':
+        # --- Estimate dataset-level P/U counts once to set w_p ---
+        with torch.no_grad():
+            P = 0; U = 0
+            for _, pu in train_loader:
+                pu = pu.to(device)
+                P += int((pu == 1).sum().item())
+                U += int((pu != 1).sum().item())
+        ratio = (U / max(1, P)) if P > 0 else 100.0
+        w_p = float(min(w_p_max, ratio**alpha))   # e.g., ~ (U/P)^0.75 but capped
+        w_n = 1.0
+    else:
+        raise ValueError(f"Unsupported loss_type: {loss_type}")
 
-    encA = encA.to(device);  pA = pA.to(device)
 
     # simple history tracking similar to v1
     best = {"f1": -1.0, "state_dict": None}
@@ -2334,18 +2405,40 @@ def train_nnpu_a_only(encA, pA, train_loader, val_loader, pi_p, lr=1e-3, epochs=
         gA.train()
         running_loss = 0.0
         sample_count = 0
+        
         for xA, pu in _progress_iter(train_loader, desc=f"CLS epoch {ep}"):
             xA, pu = xA.to(device), pu.to(device)
             with torch.no_grad():
                 u = pA(encA(xA))
-            p = gA(u)
-            loss = nnpu(p, pu)
+            out = gA(u)
+            logits = _ensure_logits(out)
+
+            pos_mask = (pu == 1)
+            unl_mask = ~pos_mask
+            if not pos_mask.any() or not unl_mask.any():
+                # ensure sampler includes both; if not, skip batch
+                continue
+            logits_p = logits[pos_mask]
+            logits_u = logits[unl_mask]
+
+            if loss_type == 'weighted':
+                loss = nnpu_weighted_loss_from_logits(
+                    logits_p, logits_u, pi_p,
+                    w_p=w_p, w_n=w_n,
+                    focal_gamma=focal_gamma,
+                    prior_penalty=prior_penalty
+                )
+            elif loss_type == 'basic':
+                loss = nnpu_basic_loss_from_logits(logits_p, logits_u, pi_p)
+
             opt.zero_grad()
             loss.backward()
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(gA.parameters(), grad_clip)            
             opt.step()
 
-            running_loss += float(loss.item()) * int(pu.size(0))
-            sample_count += int(pu.size(0))
+            running_loss += float(loss.item()) * int(xA.size(0))
+            sample_count += int(xA.size(0))
 
         avg_loss = running_loss / sample_count if sample_count else float('nan')
 
@@ -2366,6 +2459,24 @@ def train_nnpu_a_only(encA, pA, train_loader, val_loader, pi_p, lr=1e-3, epochs=
         train_targets, train_probs = _collect_outputs(encoder_wrapper, gA, train_loader, device)
         val_targets, val_probs = _collect_outputs(encoder_wrapper, gA, val_loader, device)
 
+        # optional prior-aware logit adjustment for metrics only
+        if logit_adjust_tau is not None:
+            # If you pass a probability here (e.g., 0.5 for balanced), compute delta from priors;
+            # otherwise treat logit_adjust_tau as the direct log-odds shift.
+            if 0.0 < float(logit_adjust_tau) < 1.0:
+                pi_s = float(pi_p)
+                pi_t = float(logit_adjust_tau)
+                delta = math.log(pi_t/(1.0-pi_t)) - math.log(pi_s/(1.0-pi_s))
+            else:
+                delta = float(logit_adjust_tau)
+
+            train_probs = torch.sigmoid(_ensure_logits(train_probs) + delta)
+            val_probs   = torch.sigmoid(_ensure_logits(val_probs)   + delta)
+        else:
+            # ensure probabilities for metrics/BCE
+            train_probs = torch.sigmoid(_ensure_logits(train_probs))
+            val_probs   = torch.sigmoid(_ensure_logits(val_probs))
+
         # PN labels in the pipeline are coded as +1 (positive) and -1 (unlabeled);
         # convert to 0/1 for sklearn metrics and BCE loss to avoid multiclass issues
         try:
@@ -2380,21 +2491,26 @@ def train_nnpu_a_only(encA, pA, train_loader, val_loader, pi_p, lr=1e-3, epochs=
         train_metrics = _compute_metrics(train_targets, train_probs)
         val_metrics = _compute_metrics(val_targets, val_probs)
 
-        if val_targets.numel():
-            try:
-                val_loss = torch.nn.functional.binary_cross_entropy(val_probs, val_targets.float()).item()
-            except Exception:
-                val_loss = float('nan')
-        else:
-            val_loss = float('nan')
+        # monitor predicted positive rate on U (val set proxy)
+        with torch.no_grad():
+            mu_pred = float(val_probs.mean().item()) if val_probs.numel() else float('nan')
+        prior_mse = (mu_pred - float(pi_p))**2 if math.isfinite(mu_pred) else float('nan')
 
-        comparable_f1 = val_metrics.get("f1", float('nan'))
-        if not math.isnan(comparable_f1) and comparable_f1 > best["f1"]:
-            best = {"f1": comparable_f1, "state_dict": gA.state_dict()}
+        # BCE for logging only (targets are 0/1 here)
+        try:
+            import torch.nn.functional as F
+            val_loss_bce = F.binary_cross_entropy(val_probs, val_targets.float()).item() if val_targets.numel() else float('nan')
+        except Exception:
+            val_loss_bce = float('nan')
+
+        # model selection by F1 on val
+        val_f1 = val_metrics.get("f1", float('nan'))
+        if not math.isnan(val_f1) and val_f1 > best["f1"]:
+            best = {"f1": val_f1, "state_dict": gA.state_dict()}
 
         # Format loss separately in scientific notation
         train_loss_str = f"{avg_loss:.4e}" if math.isfinite(avg_loss) else "nan"
-        val_loss_str = f"{val_loss:.4e}" if math.isfinite(val_loss) else "nan"
+        val_loss_str = f"{val_loss_bce:.4e}" if math.isfinite(val_loss_bce) else "nan"
 
         # Create log dictionaries without loss first
         train_log = {**train_metrics}
@@ -2411,15 +2527,13 @@ def train_nnpu_a_only(encA, pA, train_loader, val_loader, pi_p, lr=1e-3, epochs=
         history.append({
             "epoch": int(ep), 
             "train": {"loss": float(avg_loss), **normalize_metrics(train_log)}, 
-            "val": {"loss": float(val_loss), **normalize_metrics(val_log)}
+            "val": {"loss": float(val_loss_bce), **normalize_metrics(val_log)}
         })
 
     if best["state_dict"] is not None:
         gA.load_state_dict(best["state_dict"])
 
     return gA.eval().to(device)
-
-
 
 class TargetSetDataset(Dataset):
     def __init__(self, anchor_vecs: Sequence[torch.Tensor], target_stack_per_anchor: Sequence[torch.Tensor], metadata: Sequence[Dict[str, object]]):
@@ -2827,14 +2941,14 @@ def _train_transformer_aggregator(
 
 
         if had_nan_grad:
-            run_logger.log(f"[agg] WARNING: NaN gradients detected in epoch {epoch_idx+1}. Corresponding {ihad_nan_grad} batches skipped among total {epoch_batches} batches.")
+            run_logger.log(f"[Trans-AGG-DCCA] INFO: NaN gradients detected in epoch {epoch_idx+1}. Corresponding {ihad_nan_grad} batches skipped among total {epoch_batches} batches.")
 
         train_metrics = _evaluate(train_eval_loader)
         val_metrics = _evaluate(val_loader) if has_validation else None
         
-        # Debug: Print what _evaluate returned
-        run_logger.log(f"[DEBUG] train_metrics = {train_metrics}")
-        run_logger.log(f"[DEBUG] val_metrics = {val_metrics}")
+        # # Debug: Print what _evaluate returned
+        # run_logger.log(f"[DEBUG] train_metrics = {train_metrics}")
+        # run_logger.log(f"[DEBUG] val_metrics = {val_metrics}")
 
         train_loss_log = train_metrics.get("loss") if train_metrics else epoch_loss / max(1, epoch_batches)
         train_corr_log = train_metrics.get("mean_corr") if train_metrics else None
@@ -2849,16 +2963,12 @@ def _train_transformer_aggregator(
         train_batches_count = train_metrics.get("batches") if train_metrics else epoch_batches
         val_batches_count = val_metrics.get("batches") if val_metrics else None
         run_logger.log(
-            "[agg] epoch {epoch}: train_loss={train_loss}, train_mean_corr={train_corr}, "
-            "train_TCC = {train_tcc}, val_loss={val_loss}, val_mean_corr={val_corr}, "
-            "val_TCC = {val_tcc}, batches={batches}".format(
+            "[Trans-AGG-DCCA] epoch {epoch}: train_loss={train_loss}, train_mean_corr={train_corr}, "
+            "[Trans-AGG-DCCA] train_TCC = {train_tcc}, val_loss={val_loss}, val_mean_corr={val_corr}, "
+            "[Trans-AGG-DCCA] val_TCC = {val_tcc}, batches={batches}".format(
                 epoch=epoch_idx + 1,
-                train_loss=_format(train_loss_log),
-                train_corr=_format(train_corr_log),
-                train_tcc=_format(train_tcc_log),
-                val_loss=_format(val_loss_log),
-                val_corr=_format(val_corr_log),
-                val_tcc=_format(val_tcc_log),
+                train_loss=_format(train_loss_log), train_corr=_format(train_corr_log), train_tcc=_format(train_tcc_log),
+                val_loss=_format(val_loss_log),     val_corr=_format(val_corr_log),     val_tcc=_format(val_tcc_log),
                 batches=train_batches_count,
             )
         )

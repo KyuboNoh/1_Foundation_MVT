@@ -11,7 +11,7 @@ python -m Methods.1_UniversalGFM4MPM_v2.scripts.train --config ./ufm_v2_config_d
 
 ## Stage-2 nnPU for Global\Overlap using Global data
 ```bash
-python -m Methods.1_UniversalGFM4MPM_v2.scripts.train --config ./ufm_v2_config_debug.json --read-dcca --dcca-weights-path /home/wslqubuntu24/Research/Data/1_Foundation_MVT_Result/2_UFM_v2/Ex1_TransformerDCCA/overlap_alignment_stage1_dcca.pt --train-cls-1 --train-cls-2 --debug
+python -m Methods.1_UniversalGFM4MPM_v2.scripts.train --config ./ufm_v2_config_debug_wsl_128.json --read-dcca --dcca-weights-path /home/wslqubuntu24/Research/Data/1_Foundation_MVT_Result/2_UFM_v2/TransAggDCCA_Ex1_dim128/overlap_alignment_stage1_dcca.pt --train-cls-1 --train-cls-1-Method PN --train-cls-2 --debug
 ```
 
 ```bash
