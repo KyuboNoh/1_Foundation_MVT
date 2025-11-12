@@ -23,7 +23,7 @@
   "optimization": {
     "step1_DCCA": {
       "batch_size": 256,
-      "epochs": 30,
+      "epochs": 100,
       "lr": 0.0005,
       "projection_dim": 256,
       "mlp_hidden_dims": [256, 128],
@@ -35,11 +35,12 @@
     "step2_CLS": {
       "overlapregion_label": "BC",
       "batch_size": 128,
-      "epochs": 10,
-      "lr": 0.0010,
+      "epochs": 50,
+      "lr": 0.0005,
       "mlp_hidden_dims": [256, 128],
-      "validation_fraction": 0.2,
-      "mc_dropout_passes" : 2
+      "validation_fraction": 0.3,
+      "mc_dropout_passes" : 5
     }
   }
 }
+

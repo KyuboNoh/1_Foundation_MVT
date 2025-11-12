@@ -238,7 +238,6 @@ def main() -> None:
                 )
             )
 
-
     #################################### Prepare Overlap Workspace ####################################
     workspace = OverlapAlignmentWorkspace(cfg)
     anchor_name, target_name = _dataset_pair(cfg)
@@ -980,14 +979,21 @@ def main() -> None:
             pos_idx_arr = np.asarray(pos_idx, dtype=int)
             unk_idx_arr = np.asarray(unl_idx, dtype=int)
 
+            if debug_mode:
+                run_logger.log(f"[cls-1-PN] Starting negative selection: {len(pos_idx_arr)} positives, {len(unk_idx_arr)} unlabeled")
+
+            run_logger.log(f"[cls-1-PN] Converting uA to numpy...")
+            run_logger.log(f"[cls-1-PN] Starting negative selection...")
+
             neg_idx_region = pu_select_negatives(
-                Z_all = uA.cpu().numpy(),
+                Z_all = uA.cpu().numpy(),  
                 pos_idx = pos_idx_arr,
                 unk_idx = unk_idx_arr,
                 filter_top_pct = args.filter_top_pct,
                 negatives_per_pos = args.negs_per_pos,
             )
-            neg_idx_arr = np.asarray(neg_idx_region, dtype=int)
+            if debug_mode:
+                run_logger.log(f"[cls-1-PN] Finished negative selection: selected {len(neg_idx_region)} negatives")
 
             # Phase 2: Create Balanced P+N Dataset
             # Create balanced PN dataset
@@ -1302,54 +1308,50 @@ def main() -> None:
         run_logger.log(f"[cls] For cls-2; Pair expansion ended up from {len(anchor_vecs), len(target_stack_per_anchor)} to {u_exp.shape[0], v_exp.shape[0]}")
 
         dataset_uv = UVDataset(u_exp, v_exp, bmiss_exp)
-        # gAB = fit_unified_head_OVERLAP_from_uv(gA, DataLoader(dataset_uv, batch_size=cfg.cls_training.batch_size, shuffle=True), 
-        #                                         d_u=u_exp.size(1), device=device, lr=cfg.cls_training.lr, steps=cfg.cls_training.epochs, 
-        #                                         view_dropout=0.3, noise_sigma=0.0)
+        gAB = fit_unified_head_OVERLAP_from_uv(gA, DataLoader(dataset_uv, batch_size=cfg.cls_training.batch_size, shuffle=True), 
+                                            d_u=u_exp.size(1), device=device, lr=cfg.cls_training.lr, 
+                                            steps=cfg.cls_training.epochs
+                                            )
+        # Run gAB (unified) inference
+        inference_results["gAB_Overlap"] = run_overlap_inference_gAB_from_pairs(
+            anchor_vecs=anchor_vecs,
+            target_stack_per_anchor=target_stack_per_anchor,
+            pair_metadata=pair_metadata,
+            projector_a=projector_a,
+            projector_b=projector_b,  # AggregatorTargetHead if you trained with the transformer aggregator
+            gAB=gAB,
+            device=device,
+            cfg=cfg,
+            output_dir=Path(cfg.output_dir) / "cls_2_inference_results" / "Overlap",
+            run_logger=run_logger,
+            passes=cfg.cls_training.mc_dropout_passes,
+            target_vecs=target_vecs,  # if projector_b is a plain ProjectionHead (no transformer)
+            batch_size=INFERENCE_BATCH_SIZE,
+        )
 
-        for iepoch in range(1, 10):
-            gAB = fit_unified_head_OVERLAP_from_uv(gA, DataLoader(dataset_uv, batch_size=cfg.cls_training.batch_size, shuffle=True), 
-                                                d_u=u_exp.size(1), device=device, lr=cfg.cls_training.lr, 
-                                                # steps=cfg.cls_training.epochs
-                                                steps=iepoch
-                                                )
+        # for iepoch in range(1, 20):
+        #     gAB = fit_unified_head_OVERLAP_from_uv(gA, DataLoader(dataset_uv, batch_size=cfg.cls_training.batch_size, shuffle=True), 
+        #                                         d_u=u_exp.size(1), device=device, lr=cfg.cls_training.lr, 
+        #                                         # steps=cfg.cls_training.epochs
+        #                                         steps=iepoch
+        #                                         )
 
-            # Run gAB (unified) inference
-            inference_results["gAB_Overlap"] = run_overlap_inference_gAB_from_pairs(
-                anchor_vecs=anchor_vecs,
-                target_stack_per_anchor=target_stack_per_anchor,
-                pair_metadata=pair_metadata,
-                projector_a=projector_a,
-                projector_b=projector_b,  # AggregatorTargetHead if you trained with the transformer aggregator
-                gAB=gAB,
-                device=device,
-                cfg=cfg,
-                output_dir=Path(cfg.output_dir) / "cls_2_inference_results" / f"epoch_{iepoch}",
-                run_logger=run_logger,
-                passes=cfg.cls_training.mc_dropout_passes,
-                target_vecs=target_vecs,  # if projector_b is a plain ProjectionHead (no transformer)
-                batch_size=INFERENCE_BATCH_SIZE,
-            )
-
-        # gAB = fit_unified_head_OVERLAP_from_uv(gA, DataLoader(dataset_uv, batch_size=cfg.cls_training.batch_size, shuffle=True), 
-        #                                       d_u=u_exp.size(1), device=device, lr=cfg.cls_training.lr, steps=cfg.cls_training.epochs
-        #                                       )
-
-        # # Run gAB (unified) inference
-        # inference_results["gAB_Overlap"] = run_overlap_inference_gAB_from_pairs(
-        #     anchor_vecs=anchor_vecs,
-        #     target_stack_per_anchor=target_stack_per_anchor,
-        #     pair_metadata=pair_metadata,
-        #     projector_a=projector_a,
-        #     projector_b=projector_b,  # AggregatorTargetHead if you trained with the transformer aggregator
-        #     gAB=gAB,
-        #     device=device,
-        #     cfg=cfg,
-        #     output_dir=Path(cfg.output_dir) / "cls_2_inference_results" / "Overlap",
-        #     run_logger=run_logger,
-        #     passes=cfg.cls_training.mc_dropout_passes,
-        #     target_vecs=target_vecs,  # if projector_b is a plain ProjectionHead (no transformer)
-        #     batch_size=INFERENCE_BATCH_SIZE,
-        # )
+        #     # Run gAB (unified) inference
+        #     inference_results["gAB_Overlap"] = run_overlap_inference_gAB_from_pairs(
+        #         anchor_vecs=anchor_vecs,
+        #         target_stack_per_anchor=target_stack_per_anchor,
+        #         pair_metadata=pair_metadata,
+        #         projector_a=projector_a,
+        #         projector_b=projector_b,  # AggregatorTargetHead if you trained with the transformer aggregator
+        #         gAB=gAB,
+        #         device=device,
+        #         cfg=cfg,
+        #         output_dir=Path(cfg.output_dir) / "cls_2_inference_results" / f"epoch_{iepoch}",
+        #         run_logger=run_logger,
+        #         passes=cfg.cls_training.mc_dropout_passes,
+        #         target_vecs=target_vecs,  # if projector_b is a plain ProjectionHead (no transformer)
+        #         batch_size=INFERENCE_BATCH_SIZE,
+        #     )
 
         #################################### Training Cls - 2) GLOBAL\OVERLAP using GLOBAL data (END) ####################################
 
@@ -1983,7 +1985,6 @@ def fit_unified_head_OVERLAP_from_uv(
     device: torch.device,
     lr: float = 1e-3,
     steps: int = 10,
-    lambda_ent: float = 0.0,
     lambda_cons: float = 0.5,
     lambda_focal: float = 2.0,    # ✅ NEW: focal weight for positives
     view_dropout: float = 0.1,
