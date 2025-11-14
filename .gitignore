@@ -1,5 +1,6 @@
 .gitattributes
 .venv/
+.temp/
 *.log
 outputs/
 # large binaries

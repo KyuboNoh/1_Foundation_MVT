@@ -1,5 +1,7 @@
 # src/gfm4mpm/sampling/likely_negatives.py
 from typing import Optional
+import os
+import hashlib
 
 import numpy as np
 import torch
@@ -26,6 +28,7 @@ def pu_select_negatives(
     filter_top_pct=0.5,
     negatives_per_pos=5,
     rng=None,
+    tag: Optional[str] = None,
     *,
     return_info: bool = False,
 ):
@@ -35,43 +38,118 @@ def pu_select_negatives(
     distance-to-positive scores and masks used during filtering is returned
     alongside the sampled negative indices.
     """
+    # Create cache directory
+    cache_dir = os.path.join(os.getcwd(), ".temp", "pu_distances")
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # Generate cache filename based on tag or data hash
+    if tag is not None:
+        cache_filename = f"{tag}.npz"
+    else:
+        # Generate hash from data parameters for unique cache key
+        data_hash = hashlib.md5(
+            f"{len(pos_idx)}_{len(unk_idx)}_{filter_top_pct}_{negatives_per_pos}".encode()
+        ).hexdigest()[:8]
+        cache_filename = f"auto_{data_hash}.npz"
+    
+    cache_path = os.path.join(cache_dir, cache_filename)
+    
+    # Check if cached file exists
+    file_not_found = not os.path.exists(cache_path)
+    
+    if file_not_found:
+        if rng is None:
+            rng = np.random.default_rng(1337)
+        Zp = np.asarray(Z_all[pos_idx], dtype=np.float32)
+        Zu = Z_all[unk_idx]
 
-    if rng is None:
-        rng = np.random.default_rng(1337)
-    Zp = np.asarray(Z_all[pos_idx], dtype=np.float32)
-    Zu = Z_all[unk_idx]
+        # normalize for fair distance
+        Zp_norm = np.linalg.norm(Zp, axis=1, keepdims=True)
+        Zp_norm = np.where(Zp_norm == 0.0, 1.0, Zp_norm)
+        Zp = Zp / Zp_norm
+        Zu_norm = np.linalg.norm(Zu, axis=1, keepdims=True)
+        Zu_norm = np.where(Zu_norm == 0.0, 1.0, Zu_norm)
+        Zu = Zu / Zu_norm
 
-    # normalize for fair distance
-    Zp_norm = np.linalg.norm(Zp, axis=1, keepdims=True)
-    Zp_norm = np.where(Zp_norm == 0.0, 1.0, Zp_norm)
-    Zp = Zp / Zp_norm
-    Zu_norm = np.linalg.norm(Zu, axis=1, keepdims=True)
-    Zu_norm = np.where(Zu_norm == 0.0, 1.0, Zu_norm)
-    Zu = Zu / Zu_norm
+        # Compute min distance to any positive for each unknown
+        dists = []
+        step = 4096
+        for i in range(0, len(Zu), step):
+            chunk = Zu[i:i+step]
+            dm = ((chunk[:,None,:] - Zp[None,:,:])**2).sum(-1)**0.5
+            dmin = dm.min(axis=1)
+            dists.append(dmin)
+        dmin = np.concatenate(dists)
 
-    # Compute min distance to any positive for each unknown
-    dists = []
-    step = 4096
-    for i in range(0, len(Zu), step):
-        chunk = Zu[i:i+step]
-        dm = ((chunk[:,None,:] - Zp[None,:,:])**2).sum(-1)**0.5
-        dmin = dm.min(axis=1)
-        dists.append(dmin)
-    dmin = np.concatenate(dists)
+        # filter top‑similar (smallest distance)
+        k = int(len(dmin) * filter_top_pct)
+        keep_mask = np.ones_like(dmin, dtype=bool)
+        cutoff = None
+        if k > 0:
+            cutoff = float(np.partition(dmin, k)[:k].max())
+            keep_mask &= dmin > cutoff
+        kept_unk = np.array(unk_idx)[keep_mask]
 
-    # filter top‑similar (smallest distance)
-    k = int(len(dmin) * filter_top_pct)
-    keep_mask = np.ones_like(dmin, dtype=bool)
-    cutoff = None
-    if k > 0:
-        cutoff = float(np.partition(dmin, k)[:k].max())
-        keep_mask &= dmin > cutoff
-    kept_unk = np.array(unk_idx)[keep_mask]
+        # sample negatives
+        effective_pos = max(len(pos_idx), 1)
+        n_neg = min(effective_pos * negatives_per_pos, len(kept_unk))
+        neg_idx = rng.choice(kept_unk, size=n_neg, replace=False)
+    
+        # Save to cache file
+        try:
+            np.savez_compressed(
+                cache_path,
+                neg_idx=neg_idx,
+                dmin=dmin,
+                kept_unk=kept_unk,
+                cutoff=cutoff,
+                keep_mask=keep_mask,
+                effective_pos=effective_pos,
+                # Save parameters for validation
+                pos_idx_len=len(pos_idx),
+                unk_idx_len=len(unk_idx),
+                filter_top_pct=filter_top_pct,
+                negatives_per_pos=negatives_per_pos
+            )
+            print(f"[pu_select_negatives] Cached results to {cache_path}")
+        except Exception as e:
+            print(f"[pu_select_negatives] Warning: Failed to cache results: {e}")
 
-    # sample negatives
-    effective_pos = max(len(pos_idx), 1)
-    n_neg = min(effective_pos * negatives_per_pos, len(kept_unk))
-    neg_idx = rng.choice(kept_unk, size=n_neg, replace=False)
+    else:
+        # Load from cache file
+        try:
+            cached_data = np.load(cache_path)
+            
+            # Validate cached data matches current parameters
+            if (cached_data['pos_idx_len'] == len(pos_idx) and
+                cached_data['unk_idx_len'] == len(unk_idx) and
+                np.isclose(cached_data['filter_top_pct'], filter_top_pct) and
+                cached_data['negatives_per_pos'] == negatives_per_pos):
+                
+                # Load cached results
+                neg_idx = cached_data['neg_idx']
+                dmin = cached_data['dmin']
+                kept_unk = cached_data['kept_unk']
+                cutoff = float(cached_data['cutoff']) if cached_data['cutoff'].size > 0 else None
+                keep_mask = cached_data['keep_mask']
+                effective_pos = int(cached_data['effective_pos'])
+                
+                print(f"[pu_select_negatives] Loaded cached results from {cache_path}")
+            else:
+                print(f"[pu_select_negatives] Cache parameters mismatch, recomputing...")
+                # Remove invalid cache and recompute
+                os.remove(cache_path)
+                return pu_select_negatives(Z_all, pos_idx, unk_idx, filter_top_pct, 
+                                         negatives_per_pos, rng, tag, return_info=return_info)
+        
+        except Exception as e:
+            print(f"[pu_select_negatives] Warning: Failed to load cache ({e}), recomputing...")
+            # Remove corrupted cache and recompute
+            if os.path.exists(cache_path):
+                os.remove(cache_path)
+            return pu_select_negatives(Z_all, pos_idx, unk_idx, filter_top_pct, 
+                                     negatives_per_pos, rng, tag, return_info=return_info)
+    info = None
     if return_info:
         info = {
             "distances": dmin,

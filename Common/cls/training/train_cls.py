@@ -119,6 +119,7 @@ def train_classifier(
         loss_weights = {"bce": 1.0}
     best = {"f1": -1, "state_dict": None}
     history = []
+    
     for ep in range(1, epochs+1):
         mlp.train()
         running_loss = 0.0
@@ -243,10 +244,29 @@ def dataloader_metric_inputORembedding(Xtr, Xval, ytr, yval, batch_size, positiv
         metrics_summary['train_augmented'] = int(len(extra_train_samples))
     metrics_summary['train_samples_with_aug'] = len(Xtr) + len(extra_train_samples)
     if embedding == True:
-        # ds_tr = torch.utils.data.TensorDataset(torch.from_numpy(embedding[np.array(Xtr)]).float(),  torch.from_numpy(np.array(ytr)).long())
-        # ds_va = torch.utils.data.TensorDataset(torch.from_numpy(embedding[np.array(Xval)]).float(), torch.from_numpy(np.array(yval)).long())
-        ds_tr = torch.utils.data.TensorDataset(torch.from_numpy(np.array(Xtr)).float(),  torch.from_numpy(np.array(ytr)).long())
-        ds_va = torch.utils.data.TensorDataset(torch.from_numpy(np.array(Xval)).float(), torch.from_numpy(np.array(yval)).long())
+        # Handle case where Xtr/Xval are already tensors (e.g., from CUDA)
+        if torch.is_tensor(Xtr):
+            Xtr_tensor = Xtr.float()
+        else:
+            Xtr_tensor = torch.from_numpy(np.array(Xtr)).float()
+        
+        if torch.is_tensor(ytr):
+            ytr_tensor = ytr.long()
+        else:
+            ytr_tensor = torch.from_numpy(np.array(ytr)).long()
+            
+        if torch.is_tensor(Xval):
+            Xval_tensor = Xval.float()
+        else:
+            Xval_tensor = torch.from_numpy(np.array(Xval)).float()
+            
+        if torch.is_tensor(yval):
+            yval_tensor = yval.long()
+        else:
+            yval_tensor = torch.from_numpy(np.array(yval)).long()
+            
+        ds_tr = torch.utils.data.TensorDataset(Xtr_tensor, ytr_tensor)
+        ds_va = torch.utils.data.TensorDataset(Xval_tensor, yval_tensor)
         worker_count = 0
     elif window_size is not None:
         ds_tr = LabeledPatches(stack, Xtr, ytr, window=window_size, extra_samples=extra_train_samples)

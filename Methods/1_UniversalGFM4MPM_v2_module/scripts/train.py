@@ -16,6 +16,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Callabl
 import numpy as np
 import random
 from affine import Affine
+import torch, torch.nn as nn, torch.nn.functional as F
+
+from .config import AlignmentConfig, load_config
+
 try:
     import torch
     from torch import nn
@@ -39,8 +43,6 @@ try:
     from pyproj import CRS, Transformer
 except Exception:  # pragma: no cover - optional dependency
     CRS = Transformer = None  # type: ignore[assignment]
-
-from .config import AlignmentConfig, load_config
 from Common.Unifying.Labels_TwoDatasets.datasets import (
     auto_coord_error,
     _load_pn_lookup,
@@ -109,7 +111,8 @@ from Common.cls.training.train_cls import (
 from Common.cls.miscellaneous import _prepare_classifier_dir
 from Common.Unifying.Labels_TwoDatasets.overlaps import _load_overlap_mask_data
 
-import torch, torch.nn as nn, torch.nn.functional as F
+from . import train_cls_1
+from . inference_module import run_inference_base
 
 
 def _progress_iter(iterable, desc: str, *, leave: bool = False, total: Optional[int] = None):
@@ -816,240 +819,34 @@ def main() -> None:
 
     if args.train_cls_1:
         #################################### Training Cls - 1) GLOBAL\OVERLAP using GLOBAL data (START) ####################################
-        # data_use = anchor_non_overlap_samples
+        # make class wrapper later.
+        # data_use = {dcca_sets[anchor_name]}
+        # encoders = {projector_a}
+        # action_1 = {"learning_rates": [0.01, 0.001, 0.0001]}
+        # action = {"data": [data_use], "encoder": [projector_a], "action_1": action_1}
+
+        common = {
+            'cfg': cfg,
+            'device': device,
+            'mlp_hidden_dims': mlp_hidden_dims,
+            'mlp_dropout': mlp_dropout,
+            'debug_mode': debug_mode,
+            'run_logger': run_logger,
+        }
+
+        action = None
         data_use = dcca_sets[anchor_name]
+        encoder_name = "DCCA_Anchor"
+        tag = f"cls_1_{anchor_name}_encoder={encoder_name}"     # to save computation
+        result = train_cls_1.train_cls_1_PN_PosDrop(drop_rate=0.5,
+                                                    common=common, data_use=data_use,     
+                                                    filter_top_pct=args.filter_top_pct, negs_per_pos=args.negs_per_pos, action=action, 
+                                                    inference_fn=run_inference_base,
+                                                    tag=tag)
 
-        # Stat training of nnPU from (Global\Overlap) Anchor (Global) data
-        if data_use is None:
-            raise RuntimeError("Anchor non-overlap samples unavailable for classifier training; aborting.")
-        features = data_use["features"].float().to(device)                                 # DDCA-projected features (u)
-        yA_pu = torch.where(data_use["labels"] >= 0.9, 1, -1).long().to(device)      # nnPU labels (+1/-1) from PN labels
+        print(result)
+        exit()
 
-        temp_crd = data_use.get("coords")  # Get coordinates
-        temp_labels = data_use["labels"]
-        coords_array = np.array(temp_crd)
-        pos_mask = (yA_pu == 1).cpu().numpy()                   # Separate positive and negative samples
-        pos_crd_plot = [coords_array[i] for i in range(len(coords_array)) if pos_mask[i]]        # Example: Extract coordinates of positive samples (labels == 1)
-
-        # -- Create train/validation split for classifier training
-        val_frac = max(0.0, min(cfg.cls_training.validation_fraction, 0.9))
-
-        if args.train_cls_1_Method == "PU":
-            total = int(features.size(0))
-            val_count = int(total * val_frac)
-            # ensure at least one training sample if possible
-            minimum_train = 1
-            if total - val_count < minimum_train and total >= minimum_train:
-                val_count = max(0, total - minimum_train)
-
-            if val_count <= 0:
-                train_indices = torch.arange(total, dtype=torch.long)
-                val_indices = torch.empty(0, dtype=torch.long)
-            else:
-                gen = torch.Generator()
-                try:
-                    gen.manual_seed(int(cfg.seed))
-                except Exception:
-                    gen.manual_seed(0)
-                indices = torch.randperm(total, generator=gen)
-                val_indices = indices[:val_count]
-                train_indices = indices[val_count:]
-
-            train_idx_list = train_indices.tolist() if train_indices.numel() else []
-            val_idx_list = val_indices.tolist() if val_indices.numel() else []
-
-            features_train = features[train_idx_list].contiguous() if train_idx_list else features.new_empty((0, features.size(1)))
-            yA_pu_train = yA_pu[train_idx_list].contiguous() if train_idx_list else yA_pu.new_empty((0,))
-            features_val = features[val_idx_list].contiguous() if val_idx_list else features.new_empty((0, features.size(1)))
-            yA_pu_val = yA_pu[val_idx_list].contiguous() if val_idx_list else yA_pu.new_empty((0,))
-
-            train_ds = TensorDataset(features_train, yA_pu_train)
-            val_ds   = TensorDataset(features_val,   yA_pu_val)
-
-            # --- indices for P and U ---
-            pos_idx = (yA_pu_train == 1).nonzero(as_tuple=True)[0].tolist()
-            unl_idx = (yA_pu_train != 1).nonzero(as_tuple=True)[0].tolist()
-            if len(pos_idx) == 0:
-                raise RuntimeError("No positives in training set; cannot construct PU batches.")
-
-            # choose at least 2 positive per batch:
-            # k_pos = min(int(max(2, math.ceil(0.05 * cfg.cls_training.batch_size))) , len(pos_idx))  # e.g., 5% of batch or at least 2
-            k_pos = min(int(max(2, math.ceil(0.25 * cfg.cls_training.batch_size))) , len(pos_idx))  # e.g., 25% of batch or at least 2
-
-            k_unl = cfg.cls_training.batch_size - k_pos
-            PUsampler = PUBatchSampler(pos_idx, unl_idx, k_pos=k_pos, k_unl=k_unl, seed=cfg.seed)
-
-            # IMPORTANT: when using batch_sampler, do not pass batch_size/shuffle
-            train_loader = DataLoader(train_ds, batch_sampler=PUsampler, num_workers=0)
-            val_loader   = DataLoader(val_ds,   batch_size=cfg.cls_training.batch_size, shuffle=False, num_workers=0)
-
-            # --- global prior (use your dataset-wide estimate; don't recompute per batch) ---
-            pi_p = float((yA_pu == 1).sum().item()) / max(1, int(yA_pu.numel()))
-            pi_p = float(min(max(pi_p, 1e-4), 0.1))     # clamp only to keep numerics sane
-
-            encA = nn.Identity(); pA = nn.Identity()    # we are already in u-space
-
-            # TODO: Add loss_type in input configuration
-
-            # basic loss_type:
-            # gA = train_nnpu_a_only(encA, pA, train_loader, val_loader, pi_p, lr=cfg.dcca_training.lr, epochs=cfg.cls_training.epochs, device=device, loss_type='basic')
-            
-            # weighted loss_type:
-            gA = train_nnpu_a_only(encA, pA, train_loader, val_loader, pi_p, lr=cfg.dcca_training.lr, epochs=cfg.cls_training.epochs, device=device, loss_type='weighted',
-                                    alpha=0.9, w_p_max=20.0,
-                                    focal_gamma=0.5, prior_penalty=10.0,
-                                    logit_adjust_tau=0.0)   # optional for metrics calibration
-            # gA = train_nnpu_a_only(encA, pA, train_loader, val_loader, pi_p, lr=cfg.dcca_training.lr, epochs=cfg.cls_training.epochs, device=device, loss_type='weighted',
-            #                         alpha=0.75, w_p_max=25.0,
-            #                         focal_gamma=1.5, prior_penalty=5.0,
-            #                         logit_adjust_tau=1.0)   # optional for metrics calibration
-
-        elif args.train_cls_1_Method == "PN":
-            # Phase 1: Negative Selection & Dataset Preparation
-            pos_idx = (yA_pu == 1).nonzero(as_tuple=True)[0].tolist()
-            unl_idx = (yA_pu != 1).nonzero(as_tuple=True)[0].tolist()
-            pos_idx_arr = np.asarray(pos_idx, dtype=int)
-            unk_idx_arr = np.asarray(unl_idx, dtype=int)
-
-            if debug_mode:
-                run_logger.log(f"[cls-1-PN] Starting negative selection: {len(pos_idx_arr)} positives, {len(unk_idx_arr)} unlabeled")
-
-            run_logger.log(f"[cls-1-PN] Converting features to numpy...")
-            run_logger.log(f"[cls-1-PN] Starting negative selection...")
-
-            neg_idx_region = pu_select_negatives(
-                Z_all = features.cpu().numpy(),  
-                pos_idx = pos_idx_arr,
-                unk_idx = unk_idx_arr,
-                filter_top_pct = args.filter_top_pct,
-                negatives_per_pos = args.negs_per_pos,
-            )
-            if debug_mode:
-                run_logger.log(f"[cls-1-PN] Finished negative selection: selected {len(neg_idx_region)} negatives")
-
-            neg_idx_arr = np.asarray(neg_idx_region, dtype=int)
-
-            # Phase 2: Create Balanced P+N Dataset
-            # Create balanced PN dataset
-            pn_indices = np.concatenate([pos_idx_arr, neg_idx_arr], axis=0)  # Selected P+N
-            inf_indices = np.setdiff1d(np.arange(len(features)), pn_indices)  # Remaining for inference
-
-            # Extract features and labels for P+N
-            features_pn = features[pn_indices]  # [N_pn, d]
-            yA_pn = torch.where(
-                torch.tensor([i in pos_idx for i in pn_indices], dtype=torch.bool),
-                1,  # Positive
-                0   # Negative (changed from -1 to 0 for BCE loss)
-            ).long()
-
-            # Extract coordinates for dataloaders
-            coords_pn = [data_use["coords"][i] for i in pn_indices]
-
-            # Phase 3: Train/Val Split on P+N
-            # Split P+N dataset into train/val
-            total_pn = len(pn_indices)
-            val_count = int(total_pn * val_frac)
-
-            gen = torch.Generator()
-            gen.manual_seed(int(cfg.seed))
-            indices_pn = torch.randperm(total_pn, generator=gen)
-
-            val_indices_pn = indices_pn[:val_count].tolist()
-            train_indices_pn = indices_pn[val_count:].tolist()
-
-            # Create train/val data
-            Xtr = features_pn[train_indices_pn]  # Features OR coordinates
-            ytr = yA_pn[train_indices_pn]  # Labels (0/1)
-            Xval = features_pn[val_indices_pn]
-            yval = yA_pn[val_indices_pn]
-
-            # Phase 4: Create DataLoaders
-            # Option A: Use embeddings directly (recommended since you already have features)
-            dl_tr, dl_va, metrics_summary_append = dataloader_metric_inputORembedding(
-                Xtr=Xtr,  # [N_tr, d] tensor
-                Xval=Xval,  # [N_val, d] tensor
-                ytr=ytr,  # [N_tr] tensor
-                yval=yval,  # [N_val] tensor
-                batch_size=cfg.cls_training.batch_size,
-                positive_augmentation=False,  
-                augmented_patches_all=None,
-                pos_coord_to_index=None,
-                window_size=None,
-                stack=None,  # No need for MaskStack since using embeddings
-                embedding=True,  
-                epochs=cfg.cls_training.epochs
-            )
-
-            # Phase 5 : Build Model & Train
-            # Determine input dimension
-            in_dim = features.size(1)  # Already in projected space (e.g., 128)
-
-            # Build classifier (matching reference)
-            hidden_dims = mlp_hidden_dims  # From args, e.g., [256, 128]
-            gA = MLPDropout(in_dim=in_dim, hidden_dims=hidden_dims, p=float(mlp_dropout)).to(device)
-
-            # Encoder is identity since we're already in projected space
-            encA = nn.Identity().to(device)
-
-            # Train classifier (matching reference)
-            print("[info] Training PN classifier...")
-            gA, epoch_history = train_classifier(
-                encA,  # Identity encoder
-                gA,    # MLPDropout classifier
-                dl_tr,
-                dl_va,
-                epochs=cfg.cls_training.epochs,
-                return_history=True,
-                loss_weights={'bce': 1.0},  # Binary cross-entropy
-            )
-
-        else:
-            raise RuntimeError(f"Unsupported cls_1 training method: {args.train_cls_1_Method}")
-
-        # After training gA inference
-        # inference_results["gA_Overlap"] = run_inference_gA_only(
-        #     samples=anchor_overlap_samples,
-        #     gA=gA,
-        #     device=device,
-        #     cfg=cfg,
-        #     output_dir=Path(cfg.output_dir) / "cls_1_inference_results" / "Overlap",
-        #     run_logger=run_logger,
-        #     passes=cfg.cls_training.mc_dropout_passes,
-        #     pos_crd = pos_crd_anchor_overlap_plot
-        # )
-
-        # inference_results["gA_Non_Overlap"] = run_inference_gA_only(
-        #     samples=anchor_non_overlap_samples,
-        #     gA=gA,
-        #     device=device,
-        #     cfg=cfg,
-        #     output_dir=Path(cfg.output_dir) / "cls_1_inference_results" / "Non_Overlap",
-        #     run_logger=run_logger,
-        #     passes=cfg.cls_training.mc_dropout_passes,
-        #     pos_crd = pos_crd_anchor_non_overlap_plot
-        # )
-
-        inference_results["gA_Overlap"] = run_inference_gA_only(
-            samples=anchor_overlap_samples,
-            gA=gA,
-            device=device,
-            cfg=cfg,
-            output_dir=Path(cfg.output_dir) / "cls_1_inference_results" / "All_Overlap",
-            run_logger=run_logger,
-            passes=cfg.cls_training.mc_dropout_passes,
-            pos_crd = pos_crd_anchor_overlap_plot
-        )
-
-        inference_results["gA_All"] = run_inference_gA_only(
-            samples=data_use,
-            gA=gA,
-            device=device,
-            cfg=cfg,
-            output_dir=Path(cfg.output_dir) / "cls_1_inference_results" / "All",
-            run_logger=run_logger,
-            passes=cfg.cls_training.mc_dropout_passes,
-            pos_crd = pos_crd_plot
-        )
         #################################### Training Cls - 1) GLOBAL\OVERLAP using GLOBAL data (END) ####################################
 
     if args.train_cls_1 or args.train_cls_2:
@@ -1106,130 +903,6 @@ def main() -> None:
             else:
                 raise RuntimeError("A-only PN head not found and training failed; cannot proceed with unified training")
                 
-        #################################### Training Cls - 2) GLOBAL\OVERLAP using GLOBAL data (START) ####################################
-        # ---------- simple dataset for precomputed u/v ----------
-    class UVDataset(Dataset):
-            """
-            u: [N, d] (required)
-            v: [N, d] (optional; if None, uses zeros like u)
-            b_missing: [N, 1] float/bool mask: 1 if B missing for that sample; if None, infers 0 when v is given
-            """
-            def __init__(self, u, v=None, b_missing=None):
-                assert u.ndim == 2, "u must be [N, d]"
-                self.u = u
-                if v is None:
-                    self.v = torch.zeros_like(u)
-                    self.b_missing = torch.ones(u.size(0), 1, device=u.device) if b_missing is None else b_missing.float()
-                else:
-                    assert v.shape == u.shape, f"v shape {v.shape} must match u {u.shape}"
-                    self.v = v
-                    if b_missing is None:
-                        self.b_missing = torch.zeros(u.size(0), 1, device=u.device)
-                    else:
-                        self.b_missing = b_missing.float()
-                assert self.b_missing.shape == (u.size(0), 1), "b_missing must be [N,1]"
-            def __len__(self): return self.u.size(0)
-            def __getitem__(self, i): return self.u[i], self.v[i], self.b_missing[i]
-
-    if args.train_cls_2:
-        u_exp, v_exp, bmiss_exp = build_cls2_dataset_from_dcca_pairs(anchor_vecs, target_stack_per_anchor, projector_a, projector_b, device)
-        run_logger.log(f"[cls] For cls-2; Pair expansion ended up from {len(anchor_vecs), len(target_stack_per_anchor)} to {u_exp.shape[0], v_exp.shape[0]}")
-
-        dataset_uv = UVDataset(u_exp, v_exp, bmiss_exp)
-        gAB = fit_unified_head_OVERLAP_from_uv(gA, DataLoader(dataset_uv, batch_size=cfg.cls_training.batch_size, shuffle=True),
-                                               d_u=u_exp.size(1), device=device, lr=cfg.cls_training.lr, 
-                                               steps=cfg.cls_training.epochs
-                                               )
-        
-        # Run gAB (unified) inference
-        inference_results["gAB_Overlap"] = run_overlap_inference_gAB_from_pairs(
-            anchor_vecs=anchor_vecs,
-            target_stack_per_anchor=target_stack_per_anchor,
-            pair_metadata=pair_metadata,
-            projector_a=projector_a,
-            projector_b=projector_b,  # AggregatorTargetHead if you trained with the transformer aggregator
-            gAB=gAB,
-            device=device,
-            cfg=cfg,
-            output_dir=Path(cfg.output_dir) / "cls_2_inference_results" / "Overlap",
-            run_logger=run_logger,
-            passes=cfg.cls_training.mc_dropout_passes,
-            target_vecs=target_vecs,  # if projector_b is a plain ProjectionHead (no transformer)
-            batch_size=cfg.cls_training.batch_size,
-            pos_crd=pos_crd_anchor_overlap_plot
-        )
-
-        #################################### Training Cls - 2) GLOBAL\OVERLAP using GLOBAL data (END) ####################################
-
-    if args.train_cls_2:
-        # After training gAB (around line)
-        if gAB is not None:
-            # Get input dimension from the first layer of gA's network
-            d_u = gAB.net[0].in_features  # Get dimension from first linear layer
-
-            # Save unified PN head
-            gAB_state = {
-                'state_dict': gAB.state_dict(),
-                'input_shape': d_u,  # feature dimension
-                'architecture': 'PNHeadUnified'
-            }
-            save_path = Path(cfg.output_dir) / "cls_2_unified.pt"
-            torch.save(gAB_state, save_path)
-            run_logger.log(f"[cls] Saved unified PN head (input dim={d_u}) to {save_path}")
-
-        # After gAB training
-        if gAB is None:
-            # Try to load saved unified PN head
-            gAB_path = Path(cfg.output_dir) / "cls_2_unified.pt"
-            if gAB_path.exists():
-                try:
-                    gAB_state = torch.load(gAB_path)
-                    d = gAB_state['input_shape']
-                    gAB = PNHeadUnified(d=d).to(device)  # Fixed: use PNHeadUnified instead of PNHeadAOnly
-                    gAB.load_state_dict(gAB_state['state_dict'])
-                    gAB.eval()
-                    run_logger.log(f"[cls] Loaded unified PN head (input dim={d}) from {gAB_path}")
-                except Exception as e:
-                    run_logger.log(f"[cls] Failed to load unified PN head from {gAB_path}: {str(e)}")
-                    raise RuntimeError("Could not train or load unified PN head required for unified training")
-            else:
-                raise RuntimeError("Unified PN head not found and training failed; cannot proceed with unified training")
-
-        yA_pu = torch.where(anchor_non_overlap_samples["labels"] >= 0.9, 1, -1).long().to(device)      # nnPU labels (+1/-1) from PN labels
-
-    if args.read_inference:
-        # Read gA inference results
-        output_dir = Path(cfg.output_dir) / "cls_1_inference_results" / "Non_Overlap"
-        inference_results["gA_Non_Overlap"] = _read_inference(
-            cfg=cfg,
-            output_dir=output_dir,
-        )
-
-        _create_inference_plots(
-            model_dir=Path(inference_results["gA_Non_Overlap"]["model_dir"]),
-            model_name="gA",
-            coords=inference_results["gA_Non_Overlap"]["coordinates"],
-            mean_pred=inference_results["gA_Non_Overlap"]["predictions_mean"],
-            std_pred=inference_results["gA_Non_Overlap"]["predictions_std"],
-            pos_crd=pos_crd_anchor_non_overlap_plot
-        )
-
-        # Read gAB inference results
-        output_dir_gAB = Path(cfg.output_dir) / "cls_2_inference_results" / "Overlap"
-        inference_results["gAB_Overlap"] = _read_inference(
-            cfg=cfg,
-            output_dir=output_dir_gAB,
-        )
-
-        _create_inference_plots(
-            model_dir=Path(inference_results["gAB_Overlap"]["model_dir"]),
-            model_name="gAB",
-            coords=inference_results["gAB_Overlap"]["coordinates"],
-            mean_pred=inference_results["gAB_Overlap"]["predictions_mean"],
-            std_pred=inference_results["gAB_Overlap"]["predictions_std"],
-            pos_crd=pos_crd_anchor_overlap_plot
-        )
-
     return
 #####################################################################################   #####################################################################################   #####################################################################################   
 
@@ -1260,91 +933,9 @@ def build_cls2_dataset_from_dcca_pairs(
     Bmiss = torch.stack(bmiss_list)        # [N_A, 1]
     return U, V, Bmiss
 
-
 #####################################################################################   
-def run_inference_gA_only(
-    samples: Dict,
-    gA: nn.Module,
-    device: torch.device,
-    output_dir: Path,
-    run_logger: "_RunLogger",
-    passes: int = 10,
-    pos_crd: Optional[List[Tuple[float, float]]] = None,
-) -> Dict[str, object]:
-    """Run inference on overlap data using only the gA (anchor-only) model."""
-    
-   
-    # Get corresponding metadata
-    matched_coords = samples["coords"]
-    features = samples["features"].float().to(device)
-    run_logger.log(f"[inference-gA] Processing {len(matched_coords)} anchor samples")
-    
-    # Prepare output directory
-    model_dir = output_dir / "gA"
-    model_dir.mkdir(parents=True, exist_ok=True)
-    
-    # MC Dropout inference
-    gA.train()  # Enable dropout
-    predictions_list = []
-    
-    # ✅ Check if model outputs probabilities or logits (To handle both PN and PU cases)
-    outputs_probs = isinstance(gA, MLPDropout)  # MLPDropout outputs probabilities directly
-
-    with torch.no_grad():
-        for _ in range(passes):
-            output = gA(features)
-            
-            if outputs_probs:
-                # ✅ Model already outputs probabilities, use directly
-                pred = output
-            else:
-                # ✅ Model outputs logits, apply sigmoid
-                pred = torch.sigmoid(output)
-            
-            predictions_list.append(pred.cpu().numpy())
-    
-    gA.eval()  # Disable dropout
-    
-    # Compute statistics
-    predictions_array = np.stack(predictions_list, axis=0)  # (passes, N)
-    mean_pred = predictions_array.mean(axis=0)
-    std_pred = predictions_array.std(axis=0)
-    
-    # Save raw predictions
-    np.save(model_dir / "predictions_mean.npy", mean_pred)
-    np.save(model_dir / "predictions_std.npy", std_pred)
-    np.save(model_dir / "coordinates.npy", np.array(matched_coords))
-    
-    # Create scatter plots
-    _create_inference_plots(
-        model_dir=model_dir,
-        model_name="gA",
-        coords=matched_coords,
-        mean_pred=mean_pred,
-        std_pred=std_pred,
-        pos_crd=pos_crd
-    )
-
-    # Compute summary statistics
-    summary = _compute_inference_summary(
-        model_name="gA",
-        mean_pred=mean_pred,
-        std_pred=std_pred,
-        labels=None,  # gA doesn't have labels available
-    )
-    
-    # Save summary
-    with open(model_dir / "summary.json", 'w') as f:
-        json.dump(summary, f, indent=2)
-    
-    run_logger.log(f"[inference-gA] Saved results to {model_dir}")
-    
-    return {
-        "predictions_mean": mean_pred,
-        "predictions_std": std_pred,
-        "coordinates": matched_coords,
-        "summary": summary
-    }
+# run_inference has been moved to inference_module.py
+# Use: from . inference_module import run_inference_base
 
 def run_overlap_inference_gAB_from_pairs(
     *,
