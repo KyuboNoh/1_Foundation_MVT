@@ -85,6 +85,7 @@ from Common.Unifying.DCCA import (
     _project_in_batches,
     _load_pretrained_dcca_state,
     _projection_head_from_state,
+    _load_DCCA_projectors,
     _resolve_dcca_weights_path,
     _prepare_output_dir,
     _persist_state,
@@ -94,8 +95,29 @@ from Common.Unifying.DCCA import (
     dcca_loss,
     reembedding_DCCA,
     _train_DCCA,
-    ProjectionHead
+    ProjectionHead,
+    _compute_dcca_checkpoint_hash,
+    _save_dcca_projections,
+    _load_dcca_projections,
+    resolve_dcca_embeddings_and_projectors,
 )
+
+# Import transformer-aggregated DCCA components from the new module
+from Common.Unifying.DCCA.method1_phi_TransAgg import (
+    PNHeadUnified,
+    CrossAttentionAggregator, 
+    AggregatorTargetHead,
+    build_phi,
+    cosine_sim,
+    fit_unified_head_OVERLAP_from_uv,
+    _train_transformer_aggregator,
+    run_overlap_inference_gAB_from_pairs,
+    build_cls2_dataset_from_dcca_pairs,
+    TargetSetDataset,
+    PUBatchSampler,
+    _collate_target_sets,
+)
+
 from Common.cls.infer.infer_maps import (group_coords, mc_predict_map_from_embeddings, write_prediction_outputs,)
 from Common.cls.sampling.likely_negatives import pu_select_negatives
 from Common.cls.models.mlp_dropout import MLPDropout
@@ -147,6 +169,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mlp-dropout-passes", type=int, default=5, help="Number of Monte Carlo dropout passes for uncertainty estimation in classifier inference.", )
 
     parser.add_argument("--read-inference", action=argparse.BooleanOptionalAction, default=False, help="Read inference on aligned datasets after training (default: false).",)
+    parser.add_argument("--force-recompute-dcca", action="store_true", help="Force recomputation of DCCA projections even if cached results exist.",)
 
     return parser.parse_args()
 
@@ -177,8 +200,6 @@ def main() -> None:
 
     if args.objective is not None:
         cfg.alignment_objective = args.objective.lower()
-    # if args.aggregator is not None:
-    #     cfg.aggregator = args.aggregator.lower()
     if args.use_positive_only:
         cfg.use_positive_only = True
     if args.use_positive_augmentation:
@@ -345,19 +366,41 @@ def main() -> None:
             f"positive-overlap-pairs={debug_overlap_stats['positive_pairs']}"
         )
 
-    #################################### Preprocess - Alignment two overlapping data - getting embeddings (pairs) and labels for DCCA & cls ####################################
+    #################################### DCCA Three-Stage Resolution ####################################
+    # Stage 1: Check for cached embeddings and skip to classifier training
+    # Stage 2: If embeddings not found but weights exist, compute and cache embeddings  
+    # Stage 3: If neither embeddings nor weights exist, train from scratch
+    
+    projector_a, projector_b, dcca_sets, anchor_overlap_samples, anchor_non_overlap_samples, target_overlap_samples = resolve_dcca_embeddings_and_projectors(
+        cfg=cfg,
+        args=args,
+        workspace=workspace,
+        anchor_name=anchor_name,
+        target_name=target_name,
+        anchor_vecs=anchor_vecs,
+        target_stack_per_anchor=target_stack_per_anchor,
+        pair_metadata=pair_metadata,
+        device=device,
+        run_logger=run_logger,
+        use_transformer_agg=use_transformer_agg,
+        pn_label_maps=pn_label_maps,
+        overlap_mask_info=_load_overlap_mask_data(cfg.overlap_mask_path)
+    )
+    
+    #################################### DCCA Three-Stage Resolution END ####################################
 
-    #################################### Training Overlap Alignment (Transformer-based Aggregation DCCA) ####################################
-    if args.train_dcca:
-        objective = cfg.alignment_objective.lower()
-        # if objective not in {"dcca", "barlow"}:
-        #     raise ValueError(f"Unsupported alignment objective: {objective}")
-        if objective != "dcca":
-            raise NotImplementedError("Only DCCA objective supports adaptive projection control.")
+    #################################### Training Classifier after Overlap Alignment ####################################
+    if args.train_cls_1 or args.train_cls_2 or args.read_inference:
+        
+        #################################### Training Cls - 0) GET Training data ready (START) ####################################
+        # Projectors are now provided directly by resolve_dcca_embeddings_and_projectors
+        # Move them to device and set to evaluation mode
+        projector_a = projector_a.to(device)
+        projector_b = projector_b.to(device)
 
-        drop_ratio_source = getattr(cfg.dcca_training, "singular_value_drop_ratio", None)
-        if drop_ratio_source is None:
-            drop_ratio_source = getattr(args, "singular_value_drop_ratio", None)
+        projector_a.eval()
+        projector_b.eval()
+        projector_map = {anchor_name: projector_a, target_name: projector_b,}
         if drop_ratio_source is None:
             drop_ratio_source = 0.01
         try:
@@ -649,60 +692,31 @@ def main() -> None:
                         "Provide --dcca-weights-path or ensure overlap_alignment_stage1.pt exists."
                     )
                 run_logger.log(f"[cls] Loading DCCA projection heads from {weights_candidate}")
-                (state_a_dict, state_b_dict), _ = _load_pretrained_dcca_state(weights_candidate)
-                projector_a = _projection_head_from_state(state_a_dict).to(device)
-                # projector_b = _projection_head_from_state(state_b_dict).to(device)
-
-                # projector_b may be either a plain ProjectionHead or an AggregatorTargetHead when a transformer aggregator was used during stage-1. Detect that case by
-                # checking for 'aggregator.' keys in the saved state dict and reconstruct the AggregatorTargetHead so it can be called with (anchor_batch, target_batch).
-                if any(k.startswith("aggregator.") for k in state_b_dict.keys()):
-                    run_logger.log("[cls] Detected aggregator-wrapped projection head for target dataset; reconstructing AggregatorTargetHead.")
-                    # Infer agg_dim from proj_target first linear weight if available
-                    if "proj_target.net.0.weight" in state_b_dict:
-                        agg_dim = int(state_b_dict["proj_target.net.0.weight"].size(1))
-                    else:
-                        # fallback: use last linear weight's output dim if present
-                        weight_keys = [k for k in state_b_dict.keys() if k.endswith(".weight")]
-                        last_w = state_b_dict[sorted(weight_keys)[-1]] if weight_keys else None
-                        agg_dim = int(last_w.size(0)) if last_w is not None and hasattr(last_w, "size") else cfg.projection_dim
-
-                    # infer whether positional encoding was used by comparing key_proj input dim
-                    key_proj = state_b_dict.get("aggregator.key_proj.weight")
-                    target_dim = None
-                    try:
-                        target_dim = int(target_stack_per_anchor[0].size(1)) if target_stack_per_anchor else None
-                    except Exception:
-                        target_dim = None
-                    anchor_dim = int(anchor_vecs[0].numel()) if anchor_vecs else agg_dim
-                    pos_enc = args.agg_trans_pos_enc
-
-                    # construct aggregator and proj_target with inferred sizes
-                    try:
-                        aggregator = CrossAttentionAggregator(
-                            anchor_dim=anchor_dim,
-                            # target_dim=(kv_dim - 2) if pos_enc and key_proj is not None else (kv_dim if key_proj is not None else target_dim or anchor_dim),
-                            target_dim=target_dim,
-                            agg_dim=agg_dim,
-                            num_layers=max(1, args.agg_trans_num_layers),
-                            num_heads=max(1, args.agg_trans_num_heads),
-                            dropout=float(getattr(cfg.dcca_training, "agg_dropout", 0.1)),
-                            use_positional_encoding=bool(pos_enc),
-                        )
-                    except Exception:
-                        # Fallback conservative construction
-                        aggregator = CrossAttentionAggregator(anchor_dim, target_dim or agg_dim, agg_dim, num_layers=max(1, args.agg_trans_num_layers), num_heads=max(1, args.agg_trans_num_heads), use_positional_encoding=bool(pos_enc))
-
-                    proj_target = ProjectionHead(agg_dim, agg_dim, num_layers=args.agg_trans_num_layers)
-                    target_head = AggregatorTargetHead(aggregator, proj_target, use_positional_encoding=bool(pos_enc))
-                    # load state (should contain keys prefixed with 'aggregator.' and 'proj_target.')
-                    try:
-                        target_head.load_state_dict(state_b_dict, strict=True)
-                    except Exception:
-                        # try non-strict load if strict fails
-                        target_head.load_state_dict(state_b_dict, strict=False)
-                    projector_b = target_head.to(device)
-                else:
-                    projector_b = _projection_head_from_state(state_b_dict).to(device)
+                
+                # Infer dimensions from data
+                anchor_dim = int(anchor_vecs[0].numel()) if anchor_vecs else cfg.projection_dim
+                try:
+                    target_dim = int(target_stack_per_anchor[0].size(1)) if target_stack_per_anchor else anchor_dim
+                except Exception:
+                    target_dim = anchor_dim
+                
+                # Prepare aggregator config if needed
+                aggregator_config = {
+                    'projection_dim': cfg.projection_dim,
+                    'num_layers': args.agg_trans_num_layers,
+                    'num_heads': args.agg_trans_num_heads,
+                    'dropout': float(getattr(cfg.dcca_training, "agg_dropout", 0.1)),
+                    'use_positional_encoding': bool(args.agg_trans_pos_enc),
+                }
+                
+                # Load projectors using the new helper function
+                projector_a, projector_b = _load_DCCA_projectors(
+                    dcca_path=weights_candidate,
+                    anchor_in_dim=anchor_dim,
+                    target_in_dim=target_dim,
+                    aggregator_config=aggregator_config,
+                    device=device,
+                )
             else:
                 projector_a = projector_a.to(device)
                 projector_b = projector_b.to(device)
@@ -743,28 +757,67 @@ def main() -> None:
                     summary.append("unknown")
             return summary
 
+        # Compute DCCA checkpoint hash for cache validation
+        weights_candidate = _resolve_dcca_weights_path(cfg, args.dcca_weights_path)
+        dcca_checkpoint_hash = _compute_dcca_checkpoint_hash(weights_candidate) if weights_candidate else "no_checkpoint"
+        
+        # Prepare aggregator config for cache validation
+        aggregator_config = {
+            'projection_dim': cfg.projection_dim,
+            'num_layers': args.agg_trans_num_layers,
+            'num_heads': args.agg_trans_num_heads,
+            'dropout': float(getattr(cfg.dcca_training, "agg_dropout", 0.1)),
+            'use_positional_encoding': bool(args.agg_trans_pos_enc),
+        } if use_transformer_agg else None
+        
+        force_recompute = bool(getattr(args, 'force_recompute_dcca', False))
+
         # TODO: Make it more memory efficient by not storing all datasets at once
         # TODO: Currently, overlap_mask is only used for anchor dataset; need updates to handle target dataset overlap_mask filtering
         # Get all the data ready
         for dataset_name, projector in projector_map.items():
-            run_logger.log(f"[cls] Preparing classifier samples for dataset {dataset_name}...")
             if projector is None:
                 run_logger.log(f"[cls] projector unavailable for dataset {dataset_name}; skipping.")
                 continue
-
-            sample_set = _apply_projector_based_PUNlabels(
-                workspace=workspace,
+            
+            # Try to load from cache first
+            cached_data = _load_dcca_projections(
+                output_dir=Path(cfg.output_dir),
                 dataset_name=dataset_name,
-                pn_lookup=pn_label_maps.get(dataset_name),
-                projector=projector,
-                batch_size=cfg.dcca_training.batch_size,
-                device=device,
-                run_logger=run_logger,
-                overlap_mask=overlap_mask_info,
-                apply_overlap_filter=False,
+                dcca_checkpoint_hash=dcca_checkpoint_hash,
+                aggregator_config=aggregator_config,
+                force_recompute=force_recompute,
             )
-
-            run_logger.log(f"[cls] Preparing classifier samples for dataset {dataset_name}... done")
+            
+            if cached_data is not None:
+                run_logger.log(f"[cls] Loaded cached DCCA projections for dataset {dataset_name}")
+                sample_set = cached_data
+            else:
+                run_logger.log(f"[cls] Computing DCCA projections for dataset {dataset_name}...")
+                sample_set = _apply_projector_based_PUNlabels(
+                    workspace=workspace,
+                    dataset_name=dataset_name,
+                    pn_lookup=pn_label_maps.get(dataset_name),
+                    projector=projector,
+                    batch_size=cfg.dcca_training.batch_size,
+                    device=device,
+                    run_logger=run_logger,
+                    overlap_mask=overlap_mask_info,
+                    apply_overlap_filter=False,
+                )
+                
+                # Save to cache for future runs
+                if sample_set:
+                    _save_dcca_projections(
+                        output_dir=Path(cfg.output_dir),
+                        dataset_name=dataset_name,
+                        sample_data=sample_set,
+                        dcca_checkpoint_hash=dcca_checkpoint_hash,
+                        aggregator_config=aggregator_config,
+                    )
+                    run_logger.log(f"[cls] Saved DCCA projections to cache for dataset {dataset_name}")
+                
+                run_logger.log(f"[cls] Computing DCCA projections for dataset {dataset_name}... done")
 
             if sample_set:
                 dcca_sets[dataset_name] = sample_set
@@ -772,11 +825,33 @@ def main() -> None:
 
             # Get overlap-region anchor, anchor (global, overlap) data ready
             if dataset_name == anchor_name and sample_set:
-                anchor_overlap_samples = _apply_projector_based_PUNlabels(
-                    workspace=workspace, dataset_name=dataset_name, pn_lookup=pn_label_maps.get(dataset_name),
-                    projector=projector, batch_size=cfg.dcca_training.batch_size, device=device, run_logger=run_logger,
-                    overlap_mask=overlap_mask_info, apply_overlap_filter=True,
+                # Try cache for overlap samples
+                cached_overlap = _load_dcca_projections(
+                    output_dir=Path(cfg.output_dir),
+                    dataset_name=f"{dataset_name}_overlap",
+                    dcca_checkpoint_hash=dcca_checkpoint_hash,
+                    aggregator_config=aggregator_config,
+                    force_recompute=force_recompute,
                 )
+                
+                if cached_overlap is not None:
+                    run_logger.log(f"[cls] Loaded cached overlap samples for {dataset_name}")
+                    anchor_overlap_samples = cached_overlap
+                else:
+                    anchor_overlap_samples = _apply_projector_based_PUNlabels(
+                        workspace=workspace, dataset_name=dataset_name, pn_lookup=pn_label_maps.get(dataset_name),
+                        projector=projector, batch_size=cfg.dcca_training.batch_size, device=device, run_logger=run_logger,
+                        overlap_mask=overlap_mask_info, apply_overlap_filter=True,
+                    )
+                    if anchor_overlap_samples:
+                        _save_dcca_projections(
+                            output_dir=Path(cfg.output_dir),
+                            dataset_name=f"{dataset_name}_overlap",
+                            sample_data=anchor_overlap_samples,
+                            dcca_checkpoint_hash=dcca_checkpoint_hash,
+                            aggregator_config=aggregator_config,
+                        )
+                
                 overlap_indices = set(anchor_overlap_samples.get("indices", [])) if anchor_overlap_samples else set()
                 if overlap_indices:
                     keep_mask = [idx not in overlap_indices for idx in sample_set.get("indices", [])]
@@ -791,11 +866,33 @@ def main() -> None:
                 run_logger.log( "[DEVVVVV] ")
                 run_logger.log(f"[DEVVVVV] The code currently assumes that the target dataset falls within the overlap region entirely.")   # YOU NEED THROUGH UPDATES FOR OVERLAP_MASK UPDATE IN integrate_stac.py
                 run_logger.log( "[DEVVVVV] ")
-                target_overlap_samples = _apply_projector_based_PUNlabels(
-                    workspace=workspace, dataset_name=dataset_name, pn_lookup=pn_label_maps.get(dataset_name),
-                    projector=projector, batch_size=cfg.dcca_training.batch_size, device=device, run_logger=run_logger,
-                    overlap_mask=None, apply_overlap_filter=False,
+                
+                # Try cache for target overlap samples
+                cached_target_overlap = _load_dcca_projections(
+                    output_dir=Path(cfg.output_dir),
+                    dataset_name=f"{dataset_name}_overlap",
+                    dcca_checkpoint_hash=dcca_checkpoint_hash,
+                    aggregator_config=aggregator_config,
+                    force_recompute=force_recompute,
                 )
+                
+                if cached_target_overlap is not None:
+                    run_logger.log(f"[cls] Loaded cached overlap samples for {dataset_name}")
+                    target_overlap_samples = cached_target_overlap
+                else:
+                    target_overlap_samples = _apply_projector_based_PUNlabels(
+                        workspace=workspace, dataset_name=dataset_name, pn_lookup=pn_label_maps.get(dataset_name),
+                        projector=projector, batch_size=cfg.dcca_training.batch_size, device=device, run_logger=run_logger,
+                        overlap_mask=None, apply_overlap_filter=False,
+                    )
+                    if target_overlap_samples:
+                        _save_dcca_projections(
+                            output_dir=Path(cfg.output_dir),
+                            dataset_name=f"{dataset_name}_overlap",
+                            sample_data=target_overlap_samples,
+                            dcca_checkpoint_hash=dcca_checkpoint_hash,
+                            aggregator_config=aggregator_config,
+                        )
 
         # Coordinates of positive samples for plotting
         temp_crd = anchor_non_overlap_samples.get("coords")  # Get coordinates
@@ -2706,6 +2803,7 @@ def _compute_overlap_debug(
 
 class _RunLogger:
     def __init__(self, cfg: AlignmentConfig):
+        self.cfg = cfg  # ✅ Store cfg for easy access
         base = cfg.output_dir if cfg.output_dir is not None else cfg.log_dir
         target_dir = _prepare_output_dir(base, "overlap_alignment_outputs")
         self.path: Optional[Path] = None

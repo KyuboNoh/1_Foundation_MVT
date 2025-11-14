@@ -47,9 +47,7 @@ def pu_select_negatives(
         cache_filename = f"{tag}.npz"
     else:
         # Generate hash from data parameters for unique cache key
-        data_hash = hashlib.md5(
-            f"{len(pos_idx)}_{len(unk_idx)}_{filter_top_pct}_{negatives_per_pos}".encode()
-        ).hexdigest()[:8]
+        data_hash = hashlib.md5(f"{len(pos_idx)}_{len(unk_idx)}_{filter_top_pct}_{negatives_per_pos}".encode()).hexdigest()[:8]
         cache_filename = f"auto_{data_hash}.npz"
     
     cache_path = os.path.join(cache_dir, cache_filename)

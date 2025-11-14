@@ -1270,23 +1270,40 @@ def _apply_projector_based_PUNlabels(
     if torch is None:
         raise RuntimeError("PyTorch is required to collect classifier samples.")
     
-    embeddings = np.stack([np.asarray(rec.embedding, dtype=np.float32) for rec in matched_records])
+    # ✅ MEMORY FIX: Process records in chunks to avoid loading entire dataset into memory
     projector = projector.to(device)
     projector.eval()
     
-    # Process in batches to avoid OOM
-    batch_size = 4096  # Adjust based on available memory
-    num_samples = embeddings.shape[0]
+    # Use the batch_size parameter passed from DCCA (now memory-efficient)
+    chunk_size = max(batch_size, 2048)  # Use larger chunks for better performance (minimum 2048)
+    num_samples = len(matched_records)
     projected_list = []
     
-    # run_logger.log(f"[cls] Processing {num_samples} samples for {dataset_name} in batches of {batch_size}")
+    num_chunks = (num_samples + chunk_size - 1) // chunk_size
+    run_logger.log(f"[cls] Processing {num_samples} samples for {dataset_name} in {num_chunks} chunks of {chunk_size}")
+    
+    # Memory monitoring helper
+    def _log_memory_status(stage: str, chunk_idx: int = None):
+        try:
+            import psutil, os
+            process = psutil.Process(os.getpid())
+            memory_mb = process.memory_info().rss / 1024 / 1024
+            chunk_info = f" chunk {chunk_idx}" if chunk_idx is not None else ""
+            run_logger.log(f"[cls-memory{chunk_info}] {stage}: {memory_mb:.1f}MB")
+        except:
+            pass
+    
+    # _log_memory_status("start")  # Commented out to reduce verbosity
     
     with torch.no_grad():
-        for start_idx in range(0, num_samples, batch_size):
-            end_idx = min(start_idx + batch_size, num_samples)
-            batch_embeddings = embeddings[start_idx:end_idx]
+        for start_idx in range(0, num_samples, chunk_size):
+            end_idx = min(start_idx + chunk_size, num_samples)
             
-            embed_tensor = torch.from_numpy(batch_embeddings).to(device)
+            # ✅ MEMORY FIX: Load only the current chunk into memory
+            chunk_records = matched_records[start_idx:end_idx]
+            chunk_embeddings = np.stack([np.asarray(rec.embedding, dtype=np.float32) for rec in chunk_records])
+            
+            embed_tensor = torch.from_numpy(chunk_embeddings).to(device)
             
             if hasattr(projector, 'aggregator'):
                 # For AggregatorTargetHead, use self-attention: each sample attends to itself
@@ -1298,15 +1315,30 @@ def _apply_projector_based_PUNlabels(
             
             projected_list.append(batch_projected)
             
-            # Clear GPU memory after each batch
-            del embed_tensor
+            # ✅ MEMORY FIX: Explicit cleanup after each chunk
+            del chunk_embeddings, embed_tensor, batch_projected
             if hasattr(projector, 'aggregator'):
                 del target_tensor
-            del batch_projected
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # ✅ MEMORY FIX: Force garbage collection every few chunks  
+            if start_idx % (chunk_size * 200) == 0:  # Much less frequent GC for better performance
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                _log_memory_status("after gc", start_idx // chunk_size)
     
     projected = torch.cat(projected_list, dim=0)
-    # run_logger.log(f"[cls] Projection complete for {dataset_name}: {projected.shape}")
+    # Clear intermediate lists to free memory
+    del projected_list
+    
+    # Final cleanup
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     # label_tensor = torch.tensor(labels, dtype=torch.float32)
     label_tensor = torch.tensor(labels, dtype=torch.int16)

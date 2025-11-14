@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import json
 import math
+import hashlib
+import importlib.util
+import sys
+import gzip
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -68,11 +72,101 @@ if torch is not None and nn is not None:
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             return self.net(x)
 
+    class CrossAttentionAggregator(nn.Module):
+        """Cross-attention aggregator for combining multiple target embeddings into a single representation."""
+        def __init__(
+            self,
+            anchor_dim: int,
+            target_dim: int,
+            agg_dim: int,
+            *,
+            num_layers: int = 2,
+            num_heads: int = 4,
+            dropout: float = 0.1,
+            use_positional_encoding: bool = False,
+        ) -> None:
+            super().__init__()
+            if agg_dim % num_heads != 0:
+                raise ValueError("Aggregator hidden dimension must be divisible by the number of heads.")
+            self.use_positional_encoding = bool(use_positional_encoding)
+            pos_dim = 2 if self.use_positional_encoding else 0
+            kv_dim = target_dim + pos_dim
+            self.query_proj = nn.Linear(anchor_dim, agg_dim)
+            self.key_proj = nn.Linear(kv_dim, agg_dim)
+            self.value_proj = nn.Linear(kv_dim, agg_dim)
+            self.layers = nn.ModuleList([
+                nn.MultiheadAttention(agg_dim, num_heads, dropout=dropout, batch_first=True)
+                for _ in range(max(1, num_layers))
+            ])
+            self.norms = nn.ModuleList([nn.LayerNorm(agg_dim) for _ in range(len(self.layers))])
+            self.dropout = nn.Dropout(dropout)
+            self.output_proj = nn.Linear(agg_dim, agg_dim)
+
+        def forward(
+            self,
+            anchor_batch: torch.Tensor,
+            target_batch: torch.Tensor,
+            *,
+            key_padding_mask: Optional[torch.Tensor] = None,
+            pos_encoding: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
+            if self.use_positional_encoding and pos_encoding is not None:
+                kv_input = torch.cat([target_batch, pos_encoding], dim=-1)
+            else:
+                kv_input = target_batch
+            query = self.query_proj(anchor_batch).unsqueeze(1)
+            keys = self.key_proj(kv_input)
+            values = self.value_proj(kv_input)
+            x = query
+            for attn_layer, norm in zip(self.layers, self.norms):
+                attn_out, _ = attn_layer(x, keys, values, key_padding_mask=key_padding_mask)
+                x = norm(x + self.dropout(attn_out))
+            fused = self.output_proj(x.squeeze(1))
+            return fused
+
+    class AggregatorTargetHead(nn.Module):
+        """Wraps a projection head with an aggregator for set-to-set pairing."""
+        def __init__(
+            self, 
+            aggregator: CrossAttentionAggregator, 
+            proj_target: nn.Module, 
+            *, 
+            use_positional_encoding: bool
+        ) -> None:
+            super().__init__()
+            self.aggregator = aggregator
+            self.proj_target = proj_target
+            self.use_positional_encoding = bool(use_positional_encoding)
+
+        def forward(
+            self,
+            anchor_batch: torch.Tensor,
+            target_batch: torch.Tensor,
+            *,
+            key_padding_mask: Optional[torch.Tensor] = None,
+            pos_encoding: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
+            fused = self.aggregator(
+                anchor_batch,
+                target_batch,
+                key_padding_mask=key_padding_mask,
+                pos_encoding=pos_encoding if self.aggregator.use_positional_encoding else None,
+            )
+            return self.proj_target(fused)
+
 else:
 
     class ProjectionHead:  # type: ignore[too-many-ancestors]
         def __init__(self, *args, **kwargs):
             raise RuntimeError("ProjectionHead requires PyTorch. Install torch before training.")
+
+    class CrossAttentionAggregator:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("CrossAttentionAggregator requires PyTorch. Install torch before training.")
+
+    class AggregatorTargetHead:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("AggregatorTargetHead requires PyTorch. Install torch before training.")
 
 
 def dcca_loss(
@@ -311,6 +405,154 @@ def _projection_head_from_state(state_dict: Dict[str, "torch.Tensor"]) -> "nn.Mo
     head = ProjectionHead(in_dim, out_dim, num_layers=num_layers)
     head.load_state_dict(state_dict, strict=True)
     return head
+
+
+def _load_DCCA_projectors(
+    dcca_path: Path,
+    anchor_in_dim: int,
+    target_in_dim: int,
+    aggregator_config: Optional[Dict[str, object]] = None,
+    device: Optional["torch.device"] = None,
+) -> Tuple["nn.Module", "nn.Module"]:
+    """
+    Load DCCA projection heads from a checkpoint file.
+    
+    Args:
+        dcca_path: Path to the DCCA checkpoint file
+        anchor_in_dim: Expected input dimension for anchor projection head
+        target_in_dim: Expected input dimension for target projection head
+        aggregator_config: Optional dict with aggregator parameters if checkpoint contains aggregator.
+            Required keys: 'projection_dim', 'num_layers', 'num_heads', 'use_positional_encoding'
+            Optional keys: 'dropout' (default: 0.1)
+        device: Device to load the projectors onto. If None, uses CPU.
+    
+    Returns:
+        Tuple of (projector_anchor, projector_target) modules.
+        If checkpoint contains aggregator, projector_target will be an AggregatorTargetHead,
+        otherwise a ProjectionHead.
+    
+    Raises:
+        FileNotFoundError: If dcca_path does not exist
+        RuntimeError: If PyTorch is not available
+        ValueError: If checkpoint format is invalid or dimensions don't match
+    """
+    if torch is None or nn is None:
+        raise RuntimeError("Loading DCCA projectors requires PyTorch. Install torch before calling this function.")
+    
+    if not dcca_path.exists():
+        raise FileNotFoundError(f"DCCA checkpoint not found: {dcca_path}")
+    
+    if device is None:
+        device = torch.device("cpu")
+    
+    # Load checkpoint and extract state dictionaries
+    checkpoint = torch.load(dcca_path, map_location="cpu")
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"Checkpoint {dcca_path} does not contain a valid dictionary payload.")
+    
+    state_a = checkpoint.get("projection_head_a")
+    state_b = checkpoint.get("projection_head_b")
+    
+    if state_a is None or state_b is None:
+        raise KeyError(f"Checkpoint {dcca_path} is missing DCCA projection head weights.")
+    
+    # Build anchor projection head
+    projector_anchor = _projection_head_from_state(state_a)
+    
+    # Validate anchor input dimension
+    actual_anchor_in = projector_anchor.net[0].in_features
+    if actual_anchor_in != anchor_in_dim:
+        raise ValueError(
+            f"Anchor projection head expects input dimension {actual_anchor_in}, "
+            f"but got {anchor_in_dim}"
+        )
+    
+    # Check if checkpoint contains aggregator
+    has_aggregator = any(k.startswith("aggregator.") for k in state_b.keys())
+    
+    if not has_aggregator:
+        # No aggregator: load as ProjectionHead
+        projector_target = _projection_head_from_state(state_b)
+        
+        # Validate target input dimension
+        actual_target_in = projector_target.net[0].in_features
+        if actual_target_in != target_in_dim:
+            raise ValueError(
+                f"Target projection head expects input dimension {actual_target_in}, "
+                f"but got {target_in_dim}"
+            )
+    else:
+        # Checkpoint contains aggregator: need to reconstruct AggregatorTargetHead
+        if aggregator_config is None:
+            raise ValueError(
+                "Checkpoint contains aggregator but aggregator_config was not provided. "
+                "Please provide aggregator configuration parameters."
+            )
+        
+        # Extract configuration
+        projection_dim = aggregator_config.get('projection_dim')
+        num_layers = aggregator_config.get('num_layers', 4)
+        num_heads = aggregator_config.get('num_heads', 4)
+        use_pos_enc = aggregator_config.get('use_positional_encoding', False)
+        dropout = aggregator_config.get('dropout', 0.1)
+        
+        if projection_dim is None:
+            raise ValueError("aggregator_config must include 'projection_dim'")
+        
+        # CrossAttentionAggregator and AggregatorTargetHead are now defined in this module
+        # Construct aggregator
+        try:
+            aggregator = CrossAttentionAggregator(
+                anchor_dim=anchor_in_dim,
+                target_dim=target_in_dim,
+                agg_dim=projection_dim,
+                num_layers=max(1, num_layers),
+                num_heads=max(1, num_heads),
+                dropout=float(dropout),
+                use_positional_encoding=bool(use_pos_enc),
+            )
+        except Exception:
+            # Fallback conservative construction
+            aggregator = CrossAttentionAggregator(
+                anchor_in_dim,
+                target_in_dim,
+                projection_dim,
+                num_layers=max(1, num_layers),
+                num_heads=max(1, num_heads),
+                use_positional_encoding=bool(use_pos_enc),
+            )
+        
+        # Extract proj_target and wrap in AggregatorTargetHead
+        proj_target_inner = _projection_head_from_state(state_b)
+        
+        # Validate target projection head input dimension
+        # When aggregator is present, the projection head takes aggregator output (projection_dim) as input
+        actual_target_in = proj_target_inner.net[0].in_features
+        if actual_target_in != projection_dim:
+            raise ValueError(
+                f"Target projection head expects input dimension {actual_target_in}, "
+                f"but aggregator_config specifies projection_dim={projection_dim}. "
+                f"These must match since the projection head receives aggregator output."
+            )
+        
+        projector_target = AggregatorTargetHead(
+            aggregator,
+            proj_target_inner,
+            use_positional_encoding=bool(use_pos_enc)
+        )
+        
+        # Load the full state dict into the wrapped head
+        try:
+            projector_target.load_state_dict(state_b, strict=True)
+        except Exception:
+            # Try non-strict load if strict fails
+            projector_target.load_state_dict(state_b, strict=False)
+    
+    # Move to device
+    projector_anchor = projector_anchor.to(device)
+    projector_target = projector_target.to(device)
+    
+    return projector_anchor, projector_target
 
 
 def _has_nonfinite_gradients(modules: Sequence[nn.Module]) -> bool:
@@ -1436,8 +1678,518 @@ def reembedding_DCCA(
         "row_cols_mask": [tuple(rc) if rc is not None else None for rc in record_rowcols],
     }
 
+
+def _compute_dcca_checkpoint_hash(dcca_path: Path) -> str:
+    """Compute SHA256 hash of DCCA checkpoint file for cache invalidation."""
+    if not dcca_path.exists():
+        return "no_checkpoint"
+    
+    hasher = hashlib.sha256()
+    with open(dcca_path, 'rb') as f:
+        # Read in chunks to handle large files
+        for chunk in iter(lambda: f.read(8192), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()[:16]  # Use first 16 chars for brevity
+
+
+def _save_dcca_projections(
+    output_dir: Path,
+    dataset_name: str,
+    sample_data: Dict[str, object],
+    dcca_checkpoint_hash: str,
+    aggregator_config: Optional[Dict[str, object]] = None,
+) -> None:
+    """
+    Save DCCA projection results to disk with gzip compression.
+    
+    Args:
+        output_dir: Base output directory
+        dataset_name: Name of the dataset (e.g., 'anchor', 'target', 'anchor_overlap')
+        sample_data: Dictionary containing 'features', 'labels', 'indices', 'coords', etc.
+        dcca_checkpoint_hash: Hash of DCCA checkpoint for cache validation
+        aggregator_config: Optional aggregator configuration dict
+    """
+    cache_dir = output_dir / "dcca_projections"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Convert embeddings to float16 to save space (50% reduction)
+    features = sample_data.get("features")
+    if isinstance(features, torch.Tensor):
+        features = features.half()  # float32 → float16
+    
+    # Prepare metadata for validation
+    metadata = {
+        "dcca_checkpoint_hash": dcca_checkpoint_hash,
+        "dataset_name": dataset_name,
+        "num_samples": len(sample_data.get("indices", [])),
+        "feature_shape": list(features.shape) if hasattr(features, "shape") else None,
+    }
+    
+    if aggregator_config is not None:
+        metadata["aggregator_config"] = aggregator_config
+    
+    # Prepare save data with compressed features
+    save_data = {
+        "metadata": metadata,
+        "sample_data": {
+            "features": features,
+            "labels": sample_data.get("labels"),
+            "indices": sample_data.get("indices"),
+            "coords": sample_data.get("coords"),
+            "dataset": sample_data.get("dataset"),
+            "metadata": sample_data.get("metadata"),
+            "row_cols": sample_data.get("row_cols"),
+            "mask_flags": sample_data.get("mask_flags"),
+            "row_cols_mask": sample_data.get("row_cols_mask"),
+        },
+    }
+    
+    # Save with gzip compression (60-70% additional reduction)
+    cache_file = cache_dir / f"{dataset_name}.pt.gz"
+    
+    with gzip.open(cache_file, 'wb', compresslevel=6) as f:
+        torch.save(save_data, f)
+
+
+def _load_dcca_projections(
+    output_dir: Path,
+    dataset_name: str,
+    dcca_checkpoint_hash: str,
+    aggregator_config: Optional[Dict[str, object]] = None,
+    force_recompute: bool = False,
+) -> Optional[Dict[str, object]]:
+    """
+    Load cached DCCA projection results from disk.
+    
+    Args:
+        output_dir: Base output directory
+        dataset_name: Name of the dataset
+        dcca_checkpoint_hash: Expected hash of DCCA checkpoint
+        aggregator_config: Expected aggregator configuration
+        force_recompute: If True, ignore cache and return None
+    
+    Returns:
+        Cached sample data dict if valid cache exists, None otherwise
+    """
+    if force_recompute:
+        return None
+    
+    cache_file = output_dir / "dcca_projections" / f"{dataset_name}.pt.gz"
+    
+    if not cache_file.exists():
+        return None
+    
+    try:
+        # Load compressed file
+        with gzip.open(cache_file, 'rb') as f:
+            saved_data = torch.load(f, map_location='cpu')
+        
+        metadata = saved_data.get("metadata", {})
+        
+        # Validate checkpoint hash
+        if metadata.get("dcca_checkpoint_hash") != dcca_checkpoint_hash:
+            return None
+        
+        # Validate aggregator config if provided
+        if aggregator_config is not None:
+            saved_config = metadata.get("aggregator_config")
+            if saved_config != aggregator_config:
+                return None
+        
+        # Get sample data and convert features back to float32
+        sample_data = saved_data.get("sample_data")
+        if sample_data and "features" in sample_data:
+            features = sample_data["features"]
+            if isinstance(features, torch.Tensor) and features.dtype == torch.float16:
+                sample_data["features"] = features.float()  # float16 → float32
+        
+        # Return the cached sample data
+        return sample_data
+    
+    except Exception as e:
+        # If loading fails for any reason, return None to trigger recomputation
+        print(f"[warn] Failed to load cache for {dataset_name}: {e}")
+        return None
+
+
+def _check_complete_dcca_cache(
+    output_dir: Path,
+    anchor_name: str,
+    target_name: str,
+    dcca_checkpoint_hash: str,
+    aggregator_config: Optional[Dict[str, object]] = None,
+    force_recompute: bool = False,
+) -> Tuple[
+    Optional[Dict[str, Dict[str, object]]],  # dcca_sets
+    Optional[Dict[str, object]],             # anchor_overlap_samples
+    Optional[Dict[str, object]],             # anchor_non_overlap_samples  
+    Optional[Dict[str, object]],             # target_overlap_samples
+]:
+    """
+    Check if ALL required DCCA embeddings exist in cache.
+    Returns complete set or all None if any are missing (all-or-nothing).
+    """
+    # Import here to avoid circular imports
+    from Common.Unifying.Labels_TwoDatasets import _subset_classifier_sample
+    if force_recompute:
+        return None, None, None, None
+    
+    # Required cache files
+    required_datasets = [
+        anchor_name,
+        target_name,
+        f"{anchor_name}_overlap",
+        f"{target_name}_overlap",
+    ]
+    
+    cached_data = {}
+    
+    # Check all required caches exist and are valid
+    for dataset_name in required_datasets:
+        cached = _load_dcca_projections(
+            output_dir=output_dir,
+            dataset_name=dataset_name,
+            dcca_checkpoint_hash=dcca_checkpoint_hash,
+            aggregator_config=aggregator_config,
+            force_recompute=False,
+        )
+        
+        if cached is None:
+            # Missing or invalid cache - return all None
+            return None, None, None, None
+        
+        cached_data[dataset_name] = cached
+    
+    # All caches valid - reconstruct the expected data structure
+    dcca_sets = {
+        anchor_name: cached_data[anchor_name],
+        target_name: cached_data[target_name],
+    }
+    
+    anchor_overlap_samples = cached_data[f"{anchor_name}_overlap"]
+    target_overlap_samples = cached_data[f"{target_name}_overlap"]
+    
+    # Reconstruct anchor_non_overlap_samples from overlap indices
+    anchor_all = cached_data[anchor_name]
+    anchor_overlap = cached_data[f"{anchor_name}_overlap"]
+    
+    overlap_indices = set(anchor_overlap.get("indices", []))
+    if overlap_indices and anchor_all:
+        keep_mask = [idx not in overlap_indices for idx in anchor_all.get("indices", [])]
+        anchor_non_overlap_samples = _subset_classifier_sample(anchor_all, keep_mask, subset_tag="non_overlap")
+    else:
+        anchor_non_overlap_samples = None
+    
+    return dcca_sets, anchor_overlap_samples, anchor_non_overlap_samples, target_overlap_samples
+
+
+def resolve_dcca_embeddings_and_projectors(
+    cfg,  # AlignmentConfig
+    args,  # argparse.Namespace
+    workspace,  # OverlapAlignmentWorkspace
+    anchor_name: str,
+    target_name: str,
+    anchor_vecs: List[torch.Tensor],
+    target_stack_per_anchor: List[torch.Tensor],
+    pair_metadata: List[Dict[str, object]],
+    device: torch.device,
+    run_logger,  # "_RunLogger"
+    use_transformer_agg: bool,
+    pn_label_maps: Dict[str, Optional[Dict[str, set]]],
+    overlap_mask_info: Dict[str, object],
+) -> Tuple[
+    torch.nn.Module,  # projector_a
+    torch.nn.Module,  # projector_b
+    Dict[str, Dict[str, object]],  # dcca_sets
+    Optional[Dict[str, object]],   # anchor_overlap_samples
+    Optional[Dict[str, object]],   # anchor_non_overlap_samples
+    Optional[Dict[str, object]],   # target_overlap_samples
+]:
+    """
+    Unified DCCA resolution with three-stage fallback:
+    1. Load cached embeddings (skip everything)
+    2. Load weights + compute embeddings (skip training)
+    3. Train new DCCA + compute embeddings (full pipeline)
+    
+    Returns projectors and all required embedding sets for classifier training.
+    """
+    
+    # Prepare cache parameters
+    weights_candidate = _resolve_dcca_weights_path(cfg, args.dcca_weights_path)
+    dcca_checkpoint_hash = _compute_dcca_checkpoint_hash(weights_candidate) if weights_candidate else "no_checkpoint"
+    
+    aggregator_config = {
+        'projection_dim': cfg.projection_dim,
+        'num_layers': args.agg_trans_num_layers,
+        'num_heads': args.agg_trans_num_heads,
+        'dropout': float(getattr(cfg.dcca_training, "agg_dropout", 0.1)),
+        'use_positional_encoding': bool(args.agg_trans_pos_enc),
+    } if use_transformer_agg else None
+    
+    force_recompute = bool(getattr(args, 'force_recompute_dcca', False))
+    
+    # Stage 1: Check for complete cached embeddings
+    run_logger.log("[DCCA] Stage 1: Checking for cached embeddings...")
+    dcca_sets, anchor_overlap, anchor_non_overlap, target_overlap = _check_complete_dcca_cache(
+        output_dir=Path(cfg.output_dir),
+        anchor_name=anchor_name,
+        target_name=target_name,
+        dcca_checkpoint_hash=dcca_checkpoint_hash,
+        aggregator_config=aggregator_config,
+        force_recompute=force_recompute,
+    )
+    
+    if dcca_sets is not None:
+        run_logger.log("[DCCA] ✅ Found complete cached embeddings, loading projectors from weights...")
+        
+        # Load projectors from weights
+        anchor_dim = int(anchor_vecs[0].numel()) if anchor_vecs else cfg.projection_dim
+        try:
+            target_dim = int(target_stack_per_anchor[0].size(1)) if target_stack_per_anchor else anchor_dim
+        except Exception:
+            target_dim = anchor_dim
+        
+        projector_a, projector_b = _load_DCCA_projectors(
+            dcca_path=weights_candidate,
+            anchor_in_dim=anchor_dim,
+            target_in_dim=target_dim,
+            aggregator_config=aggregator_config,
+            device=device,
+        )
+        
+        return projector_a, projector_b, dcca_sets, anchor_overlap, anchor_non_overlap, target_overlap
+    
+    # Stage 2: Check for weights, compute embeddings
+    run_logger.log("[DCCA] Stage 2: Checking for saved weights...")
+    
+    if weights_candidate and weights_candidate.exists():
+        run_logger.log(f"[DCCA] ✅ Found weights at {weights_candidate}, loading and computing embeddings...")
+        
+        # Load projectors from weights
+        anchor_dim = int(anchor_vecs[0].numel()) if anchor_vecs else cfg.projection_dim
+        try:
+            target_dim = int(target_stack_per_anchor[0].size(1)) if target_stack_per_anchor else anchor_dim
+        except Exception:
+            target_dim = anchor_dim
+        
+        projector_a, projector_b = _load_DCCA_projectors(
+            dcca_path=weights_candidate,
+            anchor_in_dim=anchor_dim,
+            target_in_dim=target_dim,
+            aggregator_config=aggregator_config,
+            device=device,
+        )
+        
+        # Compute and cache embeddings
+        dcca_sets, anchor_overlap, anchor_non_overlap, target_overlap = _compute_and_cache_dcca_embeddings(
+            cfg=cfg,
+            workspace=workspace,
+            projector_a=projector_a,
+            projector_b=projector_b,
+            anchor_name=anchor_name,
+            target_name=target_name,
+            pn_label_maps=pn_label_maps,
+            overlap_mask_info=overlap_mask_info,
+            dcca_checkpoint_hash=dcca_checkpoint_hash,
+            aggregator_config=aggregator_config,
+            device=device,
+            run_logger=run_logger,
+            batch_size=cfg.dcca_training.batch_size,
+        )
+        
+        return projector_a, projector_b, dcca_sets, anchor_overlap, anchor_non_overlap, target_overlap
+    
+    # Stage 3: Train from scratch
+    run_logger.log("[DCCA] Stage 3: No cached embeddings or weights found, training DCCA from scratch...")
+    
+    # Check if training is enabled
+    if not args.train_dcca:
+        raise RuntimeError(
+            "DCCA training is disabled (--no-train-dcca) but no cached embeddings or weights found. "
+            "Either enable training with --train-dcca or provide valid cached data."
+        )
+    
+    # This would need the full DCCA training implementation moved here
+    # For now, raise an error indicating this needs to be implemented
+    raise NotImplementedError(
+        "Stage 3 (train from scratch) not yet implemented. "
+        "Please ensure --read-dcca is enabled with valid weights, or implement the full training pipeline."
+    )
+
+
+def _compute_and_cache_dcca_embeddings(
+    cfg,  # AlignmentConfig
+    workspace,  # OverlapAlignmentWorkspace
+    projector_a: torch.nn.Module,
+    projector_b: torch.nn.Module,
+    anchor_name: str,
+    target_name: str,
+    pn_label_maps: Dict[str, Optional[Dict[str, set]]],
+    overlap_mask_info: Dict[str, object],
+    dcca_checkpoint_hash: str,
+    aggregator_config: Optional[Dict[str, object]],
+    device: torch.device,
+    run_logger,  # "_RunLogger"
+    batch_size: int = 256,
+) -> Tuple[
+    Dict[str, Dict[str, object]],  # dcca_sets
+    Optional[Dict[str, object]],   # anchor_overlap_samples
+    Optional[Dict[str, object]],   # anchor_non_overlap_samples
+    Optional[Dict[str, object]],   # target_overlap_samples
+]:
+    """
+    Compute DCCA projections for all datasets and cache them.
+    Handles both global and overlap-specific projections.
+    """
+    
+    # Import here to avoid circular imports
+    from Common.Unifying.Labels_TwoDatasets import _apply_projector_based_PUNlabels, _subset_classifier_sample
+    import gc
+    
+    projector_a.eval()
+    projector_b.eval()
+    projector_map = {anchor_name: projector_a, target_name: projector_b}
+    
+    dcca_sets = {}
+    anchor_overlap_samples = None
+    anchor_non_overlap_samples = None
+    target_overlap_samples = None
+    
+    # Use batch size from configuration
+    memory_efficient_batch_size = batch_size  # Use the full config batch size
+    run_logger.log(f"[DCCA] Using batch size: {memory_efficient_batch_size}")
+    
+    # Compute projections for each dataset
+    for dataset_name, projector in projector_map.items():
+        if projector is None:
+            run_logger.log(f"[DCCA] Projector unavailable for dataset {dataset_name}; skipping.")
+            continue
+        
+        # Try to load from cache first
+        cached_data = _load_dcca_projections(
+            output_dir=Path(cfg.output_dir),
+            dataset_name=dataset_name,
+            dcca_checkpoint_hash=dcca_checkpoint_hash,
+            aggregator_config=aggregator_config,
+            force_recompute=False,
+        )
+        
+        if cached_data is not None:
+            run_logger.log(f"[DCCA] Loaded cached projections for dataset {dataset_name}")
+            sample_set = cached_data
+        else:
+            run_logger.log(f"[DCCA] Computing projections for dataset {dataset_name}...")
+            sample_set = _apply_projector_based_PUNlabels(
+                workspace=workspace,
+                dataset_name=dataset_name,
+                pn_lookup=pn_label_maps.get(dataset_name),
+                projector=projector,
+                batch_size=memory_efficient_batch_size,
+                device=device,
+                run_logger=run_logger,
+                overlap_mask=overlap_mask_info,
+                apply_overlap_filter=False,
+            )
+            
+            # Save to cache for future runs
+            if sample_set:
+                _save_dcca_projections(
+                    output_dir=Path(cfg.output_dir),
+                    dataset_name=dataset_name,
+                    sample_data=sample_set,
+                    dcca_checkpoint_hash=dcca_checkpoint_hash,
+                    aggregator_config=aggregator_config,
+                )
+                run_logger.log(f"[DCCA] Saved projections to cache for dataset {dataset_name}")
+        
+        if sample_set:
+            dcca_sets[dataset_name] = sample_set
+        
+        # Compute overlap-specific samples
+        if dataset_name == anchor_name and sample_set:
+            # Try cache for overlap samples
+            cached_overlap = _load_dcca_projections(
+                output_dir=Path(cfg.output_dir),
+                dataset_name=f"{dataset_name}_overlap",
+                dcca_checkpoint_hash=dcca_checkpoint_hash,
+                aggregator_config=aggregator_config,
+                force_recompute=False,
+            )
+            
+            if cached_overlap is not None:
+                run_logger.log(f"[DCCA] Loaded cached overlap samples for {dataset_name}")
+                anchor_overlap_samples = cached_overlap
+            else:
+                anchor_overlap_samples = _apply_projector_based_PUNlabels(
+                    workspace=workspace, dataset_name=dataset_name, pn_lookup=pn_label_maps.get(dataset_name),
+                    projector=projector, batch_size=memory_efficient_batch_size, device=device, run_logger=run_logger,
+                    overlap_mask=overlap_mask_info, apply_overlap_filter=True,
+                )
+                if anchor_overlap_samples:
+                    _save_dcca_projections(
+                        output_dir=Path(cfg.output_dir),
+                        dataset_name=f"{dataset_name}_overlap",
+                        sample_data=anchor_overlap_samples,
+                        dcca_checkpoint_hash=dcca_checkpoint_hash,
+                        aggregator_config=aggregator_config,
+                    )
+            
+            # Compute non-overlap samples
+            overlap_indices = set(anchor_overlap_samples.get("indices", [])) if anchor_overlap_samples else set()
+            if overlap_indices:
+                keep_mask = [idx not in overlap_indices for idx in sample_set.get("indices", [])]
+                anchor_non_overlap_samples = _subset_classifier_sample(sample_set, keep_mask, subset_tag="non_overlap")
+        
+        # Target overlap samples
+        if dataset_name == target_name and sample_set:
+            # Try cache for target overlap samples
+            cached_target_overlap = _load_dcca_projections(
+                output_dir=Path(cfg.output_dir),
+                dataset_name=f"{dataset_name}_overlap",
+                dcca_checkpoint_hash=dcca_checkpoint_hash,
+                aggregator_config=aggregator_config,
+                force_recompute=False,
+            )
+            
+            if cached_target_overlap is not None:
+                run_logger.log(f"[DCCA] Loaded cached overlap samples for {dataset_name}")
+                target_overlap_samples = cached_target_overlap
+            else:
+                target_overlap_samples = _apply_projector_based_PUNlabels(
+                    workspace=workspace, dataset_name=dataset_name, pn_lookup=pn_label_maps.get(dataset_name),
+                    projector=projector, batch_size=memory_efficient_batch_size, device=device, run_logger=run_logger,
+                    overlap_mask=None, apply_overlap_filter=False,
+                )
+                if target_overlap_samples:
+                    _save_dcca_projections(
+                        output_dir=Path(cfg.output_dir),
+                        dataset_name=f"{dataset_name}_overlap",
+                        sample_data=target_overlap_samples,
+                        dcca_checkpoint_hash=dcca_checkpoint_hash,
+                        aggregator_config=aggregator_config,
+                    )
+        
+        # Force garbage collection after each dataset to free memory
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            run_logger.log(f"[DCCA] Cleared memory cache after processing {dataset_name}")
+    
+    # Final cleanup
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    run_logger.log("[DCCA] ✅ Completed computing and caching all DCCA projections with memory-efficient processing")
+    return dcca_sets, anchor_overlap_samples, anchor_non_overlap_samples, target_overlap_samples
+
+
 __all__ = [
     "ProjectionHead",
+    "CrossAttentionAggregator",
+    "AggregatorTargetHead",
     "dcca_loss",
     "_filter_singular_values",
     "_matrix_inverse_sqrt",
@@ -1446,6 +2198,7 @@ __all__ = [
     "_resolve_dcca_weights_path",
     "_load_pretrained_dcca_state",
     "_projection_head_from_state",
+    "_load_DCCA_projectors",
     "_has_nonfinite_gradients",
     "_canonical_metrics",
     "_project_in_batches",
@@ -1461,4 +2214,10 @@ __all__ = [
     "_evaluate_dcca",
     "_train_DCCA",
     "reembedding_DCCA",
+    "_compute_dcca_checkpoint_hash",
+    "_save_dcca_projections",
+    "_load_dcca_projections",
+    "_check_complete_dcca_cache",
+    "resolve_dcca_embeddings_and_projectors",
+    "_compute_and_cache_dcca_embeddings",
 ]

@@ -5,9 +5,11 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
+import math
 from sklearn.metrics import f1_score, matthews_corrcoef
 from torchmetrics.classification import BinaryAUROC, BinaryAveragePrecision
 from tqdm import tqdm
+import torch.nn.functional as F
 
 from Common.metrics_logger import DEFAULT_METRIC_ORDER, log_metrics, normalize_metrics
 from Common.data_utils import read_stack_patch
@@ -93,7 +95,6 @@ def _compute_metrics(targets: torch.Tensor, probs: torch.Tensor) -> Dict[str, fl
 
     return metrics
 
-
 def train_classifier(
     encoder,
     mlp,
@@ -104,6 +105,12 @@ def train_classifier(
     device: Optional[str] = None,
     return_history: bool = False,
     loss_weights: Optional[Dict[str, float]] = None,
+    verbose: bool = True,  # ✅ Control output verbosity
+    # ✅ NEW: Early stopping parameters
+    early_stopping: bool = True,
+    patience: int = 10,
+    min_delta: float = 1e-4,
+    restore_best_weights: bool = True,
 ):
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -120,11 +127,25 @@ def train_classifier(
     best = {"f1": -1, "state_dict": None}
     history = []
     
+    # ✅ Early stopping variables
+    best_val_loss = float('inf')
+    best_val_loss_state = None
+    patience_counter = 0
+    stopped_early = False
+    best_epoch = 0
+    
     for ep in range(1, epochs+1):
         mlp.train()
         running_loss = 0.0
         sample_count = 0
-        for x, y in tqdm(train_loader, desc=f"CLS epoch {ep}"):
+        
+        # ✅ Conditional progress bar
+        if verbose:
+            iterator = tqdm(train_loader, desc=f"CLS epoch {ep}")
+        else:
+            iterator = train_loader
+            
+        for x, y in iterator:
             x, y = x.to(device), y.float().to(device)
             with torch.no_grad():
                 if is_identity_encoder:
@@ -160,11 +181,35 @@ def train_classifier(
         if comparable_f1 > best["f1"]:
             best = {"f1": comparable_f1, "state_dict": mlp.state_dict()}
 
+        # ✅ Early stopping logic based on validation loss
+        if early_stopping and not math.isnan(val_loss):
+            if val_loss < best_val_loss - min_delta:
+                # Improvement found
+                best_val_loss = val_loss
+                best_val_loss_state = mlp.state_dict() if restore_best_weights else None
+                patience_counter = 0
+                best_epoch = ep
+                if verbose:
+                    print(f"    [Early Stop] New best val_loss: {val_loss:.6f} at epoch {ep}")
+            else:
+                # No improvement
+                patience_counter += 1
+                if verbose and patience_counter % 5 == 0:  # Log every 5 epochs without improvement
+                    print(f"    [Early Stop] No improvement for {patience_counter}/{patience} epochs")
+                
+                if patience_counter >= patience:
+                    stopped_early = True
+                    if verbose:
+                        print(f"    [Early Stop] Stopping early at epoch {ep} (best was epoch {best_epoch} with val_loss={best_val_loss:.6f})")
+                    break
+
         train_log = {"loss": float(avg_loss), **train_metrics}
         val_log = {"loss": float(val_loss), **val_metrics}
 
-        log_metrics("train", train_log, order=DEFAULT_METRIC_ORDER)
-        log_metrics("val", val_log, order=DEFAULT_METRIC_ORDER)
+        # ✅ Conditional metric logging
+        if verbose:
+            log_metrics("train", train_log, order=DEFAULT_METRIC_ORDER)
+            log_metrics("val", val_log, order=DEFAULT_METRIC_ORDER)
 
         history.append(
             {
@@ -173,13 +218,32 @@ def train_classifier(
                 "val": normalize_metrics(val_log),
                 "train_weighted_loss": float(weighted_loss.item()),
                 "val_weighted_loss": float(loss_weights.get("bce", 1.0) * val_loss) if not math.isnan(val_loss) else float("nan"),
+                # ✅ Add early stopping info to history
+                "early_stop_counter": int(patience_counter),
+                "best_val_loss": float(best_val_loss) if not math.isinf(best_val_loss) else float("nan"),
             }
         )
 
-    if best["state_dict"] is not None:
+    # ✅ Restore best weights if early stopping and restore_best_weights=True
+    if early_stopping and restore_best_weights and best_val_loss_state is not None:
+        mlp.load_state_dict(best_val_loss_state)
+        if verbose:
+            print(f"    [Early Stop] Restored weights from epoch {best_epoch} (val_loss={best_val_loss:.6f})")
+    elif best["state_dict"] is not None:
+        # Fallback to best F1 model if no early stopping
         mlp.load_state_dict(best["state_dict"])
+
+    # ✅ Add early stopping info to final result
     if return_history:
-        return mlp, history
+        # Add summary info to history
+        summary_info = {
+            "stopped_early": stopped_early,
+            "best_epoch": best_epoch,
+            "best_val_loss": float(best_val_loss) if not math.isinf(best_val_loss) else float("nan"),
+            "total_epochs_run": int(ep),
+            "patience_used": int(patience_counter),
+        }
+        return mlp, history, summary_info
     return mlp
 
 def eval_classifier(encoder, mlp, loader, device=None):

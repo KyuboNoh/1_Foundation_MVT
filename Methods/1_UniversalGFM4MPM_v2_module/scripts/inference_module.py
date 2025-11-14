@@ -18,35 +18,39 @@ from Common.cls.models.mlp_dropout import MLPDropout
 #####################################################################################   
 def run_inference_base(
     samples: Dict,
-    gA: nn.Module,
+    cls: nn.Module,
     device: torch.device,
     output_dir: Path,
     run_logger: Any,  # _RunLogger type
     passes: int = 10,
     pos_crd: Optional[List[Tuple[float, float]]] = None,
+    tag: Dict[str, Any] = None,
 ) -> Dict[str, object]:
-    """Run inference on overlap data using only the gA (anchor-only) model."""
+    """Run inference on overlap data using only the cls."""
     
    
     # Get corresponding metadata
     matched_coords = samples["coords"]
     features = samples["features"].float().to(device)
-    run_logger.log(f"[inference-gA] Processing {len(matched_coords)} anchor samples")
+    run_logger.log(f"[inference-cls] Processing {len(matched_coords)} anchor samples")
     
     # Prepare output directory
-    model_dir = output_dir / "gA"
+    if tag is not None:
+        model_dir = output_dir / f"{tag}"
+    else:
+        model_dir = output_dir / "Base"
     model_dir.mkdir(parents=True, exist_ok=True)
     
     # MC Dropout inference
-    gA.train()  # Enable dropout
+    cls.train()  # Enable dropout
     predictions_list = []
     
     # ✅ Check if model outputs probabilities or logits (To handle both PN and PU cases)
-    outputs_probs = isinstance(gA, MLPDropout)  # MLPDropout outputs probabilities directly
+    outputs_probs = isinstance(cls, MLPDropout)  # MLPDropout outputs probabilities directly
 
     with torch.no_grad():
         for _ in range(passes):
-            output = gA(features)
+            output = cls(features)
             
             if outputs_probs:
                 # ✅ Model already outputs probabilities, use directly
@@ -57,7 +61,7 @@ def run_inference_base(
             
             predictions_list.append(pred.cpu().numpy())
     
-    gA.eval()  # Disable dropout
+    cls.eval()  # Disable dropout
     
     # Compute statistics
     predictions_array = np.stack(predictions_list, axis=0)  # (passes, N)
@@ -72,7 +76,7 @@ def run_inference_base(
     # Create scatter plots
     _create_inference_plots(
         model_dir=model_dir,
-        model_name="gA",
+        model_name="base_cls",
         coords=matched_coords,
         mean_pred=mean_pred,
         std_pred=std_pred,
@@ -81,17 +85,17 @@ def run_inference_base(
 
     # Compute summary statistics
     summary = _compute_inference_summary(
-        model_name="gA",
+        model_name="base_cls",
         mean_pred=mean_pred,
         std_pred=std_pred,
-        labels=None,  # gA doesn't have labels available
+        labels=None, 
     )
     
     # Save summary
     with open(model_dir / "summary.json", 'w') as f:
         json.dump(summary, f, indent=2)
     
-    run_logger.log(f"[inference-gA] Saved results to {model_dir}")
+    run_logger.log(f"[inference-cls] Saved results to {model_dir}")
     
     return {
         "predictions_mean": mean_pred,
