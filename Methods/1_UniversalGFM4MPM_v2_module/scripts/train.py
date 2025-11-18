@@ -186,9 +186,27 @@ def parse_args() -> argparse.Namespace:
                        choices=["ward", "complete", "average", "single"],
                        help="Linkage criterion for hierarchical clustering")
 
-    parser.add_argument("--meta-evaluation", type=str, nargs="+", default=["PosDrop_Acc", "Focus"], help="Meta-evaluation metrics to compute (space-separated). Available: PosDrop_Acc, Focus")
+    parser.add_argument("--meta-evaluation", type=str, nargs="+", default=["PosDrop_Acc", "Focus", "topk", "pauc"], help="Meta-evaluation metrics to compute (space-separated). Available: PosDrop_Acc, Focus, topk, pauc")
     
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    
+    # ✅ TOPK PARAMETERS
+    parser.add_argument("--topk-k-ratio", type=float, nargs="+", 
+                       default=[0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 5.0, 10.0],
+                       help="K values as ratios of known positives for Top-K analysis")
+    
+    parser.add_argument("--topk-k-values", type=int, nargs="+", 
+                       default=[],
+                       help="Additional absolute K values for Top-K analysis (optional)")
+                       
+    parser.add_argument("--topk-area-percentages", type=float, nargs="+",
+                       default=[0.01, 0.02, 0.05, 0.1, 0.2],
+                       help="Area percentages for Top-K area-based analysis")
+    
+    # ✅ PAUC PARAMETERS  
+    parser.add_argument("--pauc-prior-variants", type=float, nargs="+",
+                       default=[0.01, 0.05, 0.1, 0.2, 0.3],
+                       help="Prior probability variants for Proxy AUC correction")
 
     return parser.parse_args()
 
@@ -334,24 +352,6 @@ def main() -> None:
     # overlap_info_pair_metadata_only = get_overlap_info_pair_metadata_only(cfg, args, device, run_logger)
 
 
-    ####################################### Train Classifier 1 on target_data (Original)  #######################################
-    method_name = "base"
-    data_name = target_name
-    encoder_name = "MAEViT"
-    data_use = get_original_dataset_for_training(cfg=cfg, dataset_name=data_name, run_logger=run_logger)
-
-    # Substitute labels
-    label_name = anchor_name
-    label_use = get_original_dataset_for_training(cfg=cfg, dataset_name=label_name, run_logger=run_logger)
-    data_use = _substitute_label_overlap_constrained(data=data_use,  label_source=label_use, overlap_info=overlap_info, run_logger=run_logger)
-    
-    action = None
-
-    tag = create_clean_tag(method_name, encoder_name, data_name)
-    train_and_save_result(tag, data_use, action, common, args, cfg, run_logger)
-
-    exit()
-
     ####################################### Train on target [z_b | u_b] #######################################
     method_name = "Method2_concat"
     data_name = target_name
@@ -368,6 +368,24 @@ def main() -> None:
     label_use = get_original_dataset_for_training(cfg=cfg, dataset_name=label_name, run_logger=run_logger)
     data_use = _substitute_label_overlap_constrained(data=data_use,  label_source=label_use, overlap_info=overlap_info, run_logger=run_logger)
 
+    action = None
+
+    tag = create_clean_tag(method_name, encoder_name, data_name)
+    train_and_save_result(tag, data_use, action, common, args, cfg, run_logger)
+
+    exit()
+
+    ####################################### Train Classifier 1 on target_data (Original)  #######################################
+    method_name = "base"
+    data_name = target_name
+    encoder_name = "MAEViT"
+    data_use = get_original_dataset_for_training(cfg=cfg, dataset_name=data_name, run_logger=run_logger)
+
+    # Substitute labels
+    label_name = anchor_name
+    label_use = get_original_dataset_for_training(cfg=cfg, dataset_name=label_name, run_logger=run_logger)
+    data_use = _substitute_label_overlap_constrained(data=data_use,  label_source=label_use, overlap_info=overlap_info, run_logger=run_logger)
+    
     action = None
 
     tag = create_clean_tag(method_name, encoder_name, data_name)
@@ -916,7 +934,11 @@ def train_and_save_result(
                         common=common,
                         data_use=data_use,
                         run_logger=run_logger,
-                        meta_evaluation_metrics=meta_evaluation_metrics
+                        meta_evaluation_metrics=meta_evaluation_metrics,
+                        pauc_prior_variants=args.pauc_prior_variants,
+                        topk_k_ratio=args.topk_k_ratio,
+                        topk_k_values=args.topk_k_values,
+                        topk_area_percentages=args.topk_area_percentages
                     )
                     
                     if cached_result is not None:
@@ -981,7 +1003,11 @@ def train_and_save_result(
                 action=action,
                 inference_fn=run_inference_base,
                 tag_main=tag,
-                meta_evaluation_metrics=meta_evaluation_metrics
+                meta_evaluation_metrics=meta_evaluation_metrics,
+                pauc_prior_variants=args.pauc_prior_variants,
+                topk_k_ratio=args.topk_k_ratio,
+                topk_k_values=args.topk_k_values,
+                topk_area_percentages=args.topk_area_percentages
             )
         elif not args.skip_training_if_cached:
             # Train all configurations (no caching)
@@ -997,7 +1023,11 @@ def train_and_save_result(
                 action=action,
                 inference_fn=run_inference_base,
                 tag_main=tag,
-                meta_evaluation_metrics=meta_evaluation_metrics
+                meta_evaluation_metrics=meta_evaluation_metrics,
+                pauc_prior_variants=args.pauc_prior_variants,
+                topk_k_ratio=args.topk_k_ratio,
+                topk_k_values=args.topk_k_values,
+                topk_area_percentages=args.topk_area_percentages
             )
         else:
             # All cached, no training needed
@@ -1069,7 +1099,11 @@ def train_and_save_result(
                 common=common,
                 data_use=data_use,
                 run_logger=run_logger,
-                meta_evaluation_metrics=meta_evaluation_metrics
+                meta_evaluation_metrics=meta_evaluation_metrics,
+                pauc_prior_variants=args.pauc_prior_variants,
+                topk_k_ratio=args.topk_k_ratio,
+                topk_k_values=args.topk_k_values,
+                topk_area_percentages=args.topk_area_percentages
             )
             
             # ✅ BACKWARD COMPATIBILITY: Try legacy format if new format fails
@@ -1082,7 +1116,11 @@ def train_and_save_result(
                         common=common,
                         data_use=data_use,
                         run_logger=run_logger,
-                        meta_evaluation_metrics=meta_evaluation_metrics
+                        meta_evaluation_metrics=meta_evaluation_metrics,
+                        pauc_prior_variants=args.pauc_prior_variants,
+                        topk_k_ratio=args.topk_k_ratio,
+                        topk_k_values=args.topk_k_values,
+                        topk_area_percentages=args.topk_area_percentages
                     )
                 except TypeError:
                     # Function doesn't support legacy drop_rate parameter

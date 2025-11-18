@@ -34,7 +34,7 @@ from Common.cls.sampling.likely_negatives import (
     pu_select_negatives_from_individual_distances,
 )
 
-# Default meta-evaluation metrics (can be overridden via command-line argument)
+# Default meta-evaluation metrics for positive evaluation (can be overridden via command-line argument)
 DEFAULT_META_EVALUATION = {"PosDrop_Acc", "Focus"}
 
 
@@ -1037,10 +1037,12 @@ def train_cls_1_PN_PosDrop(
     if run_logger is not None and verbose:
         run_logger.log(f"[cls-1-PN-PosDrop] Completed final 'no positive drop' training")
     
-    # Compute meta-evaluation metrics
+    # Compute meta-evaluation metrics (all metrics treated uniformly)
     meta_evaluation = {}
     
-    for metric in meta_evaluation_metrics:
+    # Handle traditional metrics (PosDrop_Acc, Focus)
+    traditional_metrics = [m for m in meta_evaluation_metrics if m in META_EVALUATION_FUNCTIONS]
+    for metric in traditional_metrics:
         metric_scores = []
 
         for iteration in range(num_iterations):
@@ -1078,6 +1080,49 @@ def train_cls_1_PN_PosDrop(
         if run_logger is not None:
             run_logger.log(f"[cls-1-PN-PosDrop] {metric}: mean={meta_evaluation[metric]['mean']:.4f}, std={meta_evaluation[metric]['std']:.4f}")
     
+    # Handle extended metrics (PAUC, TopK)
+    extended_metrics = [m for m in meta_evaluation_metrics if m not in META_EVALUATION_FUNCTIONS]
+    if extended_metrics:
+        # Prepare data for extended metrics computation
+        all_probabilities = []
+        all_labels = []
+        
+        for iteration in range(num_iterations):
+            iter_result = all_results[iteration]
+            pos_indices_this_iter = set(iter_result['pos_indices_this_iter'])
+            
+            predictions_mean = iter_result['inference_result']['predictions_mean']
+            if isinstance(predictions_mean, torch.Tensor):
+                predictions_mean = predictions_mean.cpu().numpy()
+            
+            # Create binary labels for this iteration (1 for known positives, 0 for unlabeled)
+            labels_this_iter = np.zeros(len(predictions_mean))
+            for idx in pos_indices_this_iter:
+                if idx < len(labels_this_iter):
+                    labels_this_iter[idx] = 1
+            
+            all_probabilities.append(predictions_mean)
+            all_labels.append(labels_this_iter)
+        
+        # Create mock args object for extended metrics
+        import argparse
+        mock_args = argparse.Namespace()
+        mock_args.meta_evaluation = extended_metrics
+        mock_args.pauc_prior_variants = pauc_prior_variants if pauc_prior_variants is not None else [0.01, 0.05, 0.1, 0.2, 0.3]
+        mock_args.topk_k_ratio = topk_k_ratio if topk_k_ratio is not None else [0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 5.0, 10.0]
+        mock_args.topk_k_values = topk_k_values if topk_k_values is not None else [10, 50, 100, 500, 1000]
+        mock_args.topk_area_percentages = topk_area_percentages if topk_area_percentages is not None else [0.1, 0.5, 1.0, 2.0, 5.0]
+        
+        extended_results = compute_extended_meta_evaluation_from_args(
+            mock_args, all_probabilities, all_labels, run_logger
+        )
+        
+        # Merge extended results into meta_evaluation
+        meta_evaluation.update(extended_results)
+        
+        if run_logger is not None:
+            run_logger.log(f"[cls-1-PN-PosDrop] Computed extended metrics: {list(extended_results.keys())}")
+    
     return meta_evaluation
 
 
@@ -1093,7 +1138,12 @@ def load_and_evaluate_existing_predictions(
     common: Dict[str, Any],
     data_use: Dict[str, Any],
     run_logger: Optional[Any] = None,
-    meta_evaluation_metrics: Optional[set] = None
+    meta_evaluation_metrics: Optional[set] = None,
+    # Extended metrics parameters
+    pauc_prior_variants: Optional[List[float]] = None,
+    topk_k_ratio: Optional[List[float]] = None,
+    topk_k_values: Optional[List[int]] = None,
+    topk_area_percentages: Optional[List[float]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Load existing predictions from disk and compute Meta_Evaluation metrics.
@@ -1230,10 +1280,12 @@ def load_and_evaluate_existing_predictions(
                 run_logger.log(f"[load_cached_predictions] ❌ Error loading {iter_dir}: {e}")
             return None
     
-    # Compute meta-evaluation metrics
+    # Compute meta-evaluation metrics (all metrics treated uniformly)
     meta_evaluation = {}
     
-    for metric in meta_evaluation_metrics:
+    # Handle traditional metrics (PosDrop_Acc, Focus)
+    traditional_metrics = [m for m in meta_evaluation_metrics if m in META_EVALUATION_FUNCTIONS]
+    for metric in traditional_metrics:
         metric_scores = []
         
         for iteration in range(num_iterations):
@@ -1264,6 +1316,45 @@ def load_and_evaluate_existing_predictions(
         if run_logger:
             run_logger.log(f"[load_cached_predictions] {metric}: mean={meta_evaluation[metric]['mean']:.4f}, std={meta_evaluation[metric]['std']:.4f}")
     
+    # Handle extended metrics (PAUC, TopK)
+    extended_metrics = [m for m in meta_evaluation_metrics if m not in META_EVALUATION_FUNCTIONS]
+    if extended_metrics:
+        # Prepare data for extended metrics computation
+        all_probabilities = []
+        all_labels = []
+        
+        for iteration in range(num_iterations):
+            pos_indices_this_iter = set(all_pos_indices_per_iter[iteration])
+            predictions_mean = all_predictions_mean[iteration]
+            
+            # Create binary labels for this iteration (1 for known positives, 0 for unlabeled)
+            labels_this_iter = np.zeros(len(predictions_mean))
+            for idx in pos_indices_this_iter:
+                if idx < len(labels_this_iter):
+                    labels_this_iter[idx] = 1
+            
+            all_probabilities.append(predictions_mean)
+            all_labels.append(labels_this_iter)
+        
+        # Create mock args object for extended metrics
+        import argparse
+        mock_args = argparse.Namespace()
+        mock_args.meta_evaluation = extended_metrics
+        mock_args.pauc_prior_variants = pauc_prior_variants if pauc_prior_variants is not None else [0.01, 0.05, 0.1, 0.2, 0.3]
+        mock_args.topk_k_ratio = topk_k_ratio if topk_k_ratio is not None else [0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 5.0, 10.0]
+        mock_args.topk_k_values = topk_k_values if topk_k_values is not None else [10, 50, 100, 500, 1000]
+        mock_args.topk_area_percentages = topk_area_percentages if topk_area_percentages is not None else [0.1, 0.5, 1.0, 2.0, 5.0]
+        
+        extended_results = compute_extended_meta_evaluation_from_args(
+            mock_args, all_probabilities, all_labels, run_logger
+        )
+        
+        # Merge extended results into meta_evaluation
+        meta_evaluation.update(extended_results)
+        
+        if run_logger:
+            run_logger.log(f"[load_cached_predictions] Computed extended metrics: {list(extended_results.keys())}")
+    
     return meta_evaluation
 
 
@@ -1286,6 +1377,11 @@ def train_cls_1_PN_PosDrop_MultiClustering(
     tag_main: Optional[str] = None,
     use_individual_distances: bool = True,
     meta_evaluation_metrics: Optional[set] = None,
+    # Extended metrics parameters
+    pauc_prior_variants: Optional[List[float]] = None,
+    topk_k_ratio: Optional[List[float]] = None,
+    topk_k_values: Optional[List[int]] = None,
+    topk_area_percentages: Optional[List[float]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Train PN classifiers with multiple clustering methods and n_clusters configurations.
@@ -1427,6 +1523,305 @@ def save_meta_evaluation_results(
         run_logger.log(f"[save_meta_evaluation] Saved Meta_Evaluation results to {output_path}")
 
 
+def compute_proxy_auc_variants(probs_all, y_true, prior_variants, run_logger=None):
+    """
+    Compute Proxy AUC (PAUC) with multiple prior assumptions for PU learning sensitivity analysis.
+    
+    Args:
+        probs_all: Array of all probabilities/predictions
+        y_true: True binary labels (1 for positives, 0 for unlabeled)
+        prior_variants: List of prior probabilities (π values) to test
+        run_logger: Optional logger for tracking progress
+    
+    Returns:
+        dict: Results for each prior variant with AUC scores
+    """
+    from sklearn.metrics import roc_auc_score
+    import numpy as np
+    
+    if run_logger:
+        run_logger.log(f"[compute_proxy_auc_variants] Computing PAUC for {len(prior_variants)} prior variants")
+    
+    results = {}
+    positive_mask = y_true == 1
+    n_positives = positive_mask.sum()
+    n_total = len(y_true)
+    
+    if n_positives == 0:
+        if run_logger:
+            run_logger.log("[compute_proxy_auc_variants] Warning: No positive samples found")
+        return {f"prior_{prior:.3f}": 0.5 for prior in prior_variants}
+    
+    for prior in prior_variants:
+        try:
+            # Proxy AUC: Correct predictions using estimated class prior
+            # For PU learning: P(s=1|y=1) = 1, P(s=1|y=0) = π/(1-π) * P(y=1|x)
+            corrected_probs = probs_all.copy()
+            
+            # Apply prior correction for unlabeled samples
+            unlabeled_mask = ~positive_mask
+            if unlabeled_mask.sum() > 0:
+                # Estimate true positive probability given prior assumption
+                corrected_probs[unlabeled_mask] = corrected_probs[unlabeled_mask] * prior / (
+                    corrected_probs[unlabeled_mask] * prior + (1 - corrected_probs[unlabeled_mask]) * (1 - prior)
+                )
+            
+            # Compute AUC with corrected probabilities
+            if len(np.unique(y_true)) > 1:
+                auc_score = roc_auc_score(y_true, corrected_probs)
+            else:
+                auc_score = 0.5
+                
+            results[f"prior_{prior:.3f}"] = float(auc_score)
+            
+            if run_logger:
+                run_logger.log(f"[compute_proxy_auc_variants] Prior π={prior:.3f}: PAUC={auc_score:.4f}")
+                
+        except Exception as e:
+            if run_logger:
+                run_logger.log(f"[compute_proxy_auc_variants] Error with prior π={prior:.3f}: {e}")
+            results[f"prior_{prior:.3f}"] = 0.5
+    
+    return results
+
+
+def compute_topk_positive_capture_with_ratios(probs_all, y_true, k_ratios, k_values, area_percentages, run_logger=None):
+    """
+    Compute Top-K Positive Capture with ratio-based K values and area percentages.
+    
+    Args:
+        probs_all: Array of all probabilities/predictions
+        y_true: True binary labels (1 for positives, 0 for unlabeled)
+        k_ratios: List of K ratios relative to number of known positives
+        k_values: List of absolute K values to test
+        area_percentages: List of area percentages for analysis
+        run_logger: Optional logger for tracking progress
+    
+    Returns:
+        dict: Results for different K specifications and area analyses
+    """
+    import numpy as np
+    
+    if run_logger:
+        run_logger.log(f"[compute_topk_positive_capture] Computing TopK with {len(k_ratios)} ratios, {len(k_values)} absolute K, {len(area_percentages)} area percentages")
+    
+    results = {}
+    positive_mask = y_true == 1
+    n_positives = positive_mask.sum()
+    n_total = len(y_true)
+    
+    if n_positives == 0:
+        if run_logger:
+            run_logger.log("[compute_topk_positive_capture] Warning: No positive samples found")
+        return {"no_positives": True}
+    
+    # Sort indices by probability (descending)
+    sorted_indices = np.argsort(probs_all)[::-1]
+    sorted_labels = y_true[sorted_indices]
+    sorted_probs = probs_all[sorted_indices]
+    
+    # Ratio-based K values
+    ratio_results = {}
+    for ratio in k_ratios:
+        k_effective = max(1, int(ratio * n_positives))  # At least 1
+        k_effective = min(k_effective, n_total)  # At most total samples
+        
+        # Count positives in top K
+        positives_in_topk = sorted_labels[:k_effective].sum()
+        capture_rate = positives_in_topk / n_positives if n_positives > 0 else 0.0
+        precision = positives_in_topk / k_effective if k_effective > 0 else 0.0
+        
+        ratio_results[f"ratio_{ratio:.2f}"] = {
+            'k_effective': int(k_effective),
+            'positives_captured': int(positives_in_topk),
+            'capture_rate': float(capture_rate),
+            'precision': float(precision),
+            'area_fraction': k_effective / n_total
+        }
+        
+        if run_logger:
+            run_logger.log(f"[compute_topk_positive_capture] Ratio {ratio:.2f}: K={k_effective}, captured={positives_in_topk}/{n_positives} ({capture_rate:.4f})")
+    
+    results['ratios'] = ratio_results
+    
+    # Absolute K values
+    absolute_results = {}
+    for k in k_values:
+        k_effective = min(k, n_total)
+        
+        positives_in_topk = sorted_labels[:k_effective].sum()
+        capture_rate = positives_in_topk / n_positives if n_positives > 0 else 0.0
+        precision = positives_in_topk / k_effective if k_effective > 0 else 0.0
+        
+        absolute_results[f"k_{k}"] = {
+            'k_effective': int(k_effective),
+            'positives_captured': int(positives_in_topk),
+            'capture_rate': float(capture_rate),
+            'precision': float(precision),
+            'area_fraction': k_effective / n_total
+        }
+        
+        if run_logger:
+            run_logger.log(f"[compute_topk_positive_capture] Absolute K={k}: captured={positives_in_topk}/{n_positives} ({capture_rate:.4f})")
+    
+    results['absolute'] = absolute_results
+    
+    # Area percentage analysis
+    area_results = {}
+    for area_pct in area_percentages:
+        k_area = max(1, int(area_pct * n_total / 100))  # Convert percentage to count
+        k_area = min(k_area, n_total)
+        
+        positives_in_area = sorted_labels[:k_area].sum()
+        capture_rate = positives_in_area / n_positives if n_positives > 0 else 0.0
+        precision = positives_in_area / k_area if k_area > 0 else 0.0
+        
+        area_results[f"area_{area_pct:.1f}pct"] = {
+            'k_effective': int(k_area),
+            'positives_captured': int(positives_in_area),
+            'capture_rate': float(capture_rate),
+            'precision': float(precision),
+            'area_fraction': k_area / n_total
+        }
+        
+        if run_logger:
+            run_logger.log(f"[compute_topk_positive_capture] Area {area_pct:.1f}%: K={k_area}, captured={positives_in_area}/{n_positives} ({capture_rate:.4f})")
+    
+    results['area_percentages'] = area_results
+    
+    # Summary statistics
+    results['summary'] = {
+        'total_positives': int(n_positives),
+        'total_samples': int(n_total),
+        'positive_rate': float(n_positives / n_total),
+        'max_prob': float(sorted_probs[0]) if len(sorted_probs) > 0 else 0.0,
+        'min_prob': float(sorted_probs[-1]) if len(sorted_probs) > 0 else 0.0
+    }
+    
+    return results
+
+
+def compute_extended_meta_evaluation_from_args(args, all_probabilities, all_labels, run_logger=None):
+    """
+    Compute extended meta-evaluation metrics based on command-line arguments.
+    
+    Args:
+        args: Parsed command-line arguments with meta-evaluation parameters
+        all_probabilities: List of probability arrays from different clustering configurations
+        all_labels: List of label arrays from different clustering configurations
+        run_logger: Optional logger for tracking progress
+    
+    Returns:
+        dict: Extended meta-evaluation results including PAUC and TopK metrics
+    """
+    import numpy as np
+    
+    if run_logger:
+        run_logger.log(f"[compute_extended_meta_evaluation] Computing extended metrics for {len(all_probabilities)} configurations")
+    
+    extended_results = {}
+    
+    # Check if extended metrics are requested
+    meta_eval_metrics = getattr(args, 'meta_evaluation', [])
+    if not isinstance(meta_eval_metrics, list):
+        meta_eval_metrics = [meta_eval_metrics] if meta_eval_metrics else []
+    
+    # Compute Proxy AUC variants if requested
+    if 'pauc' in meta_eval_metrics:
+        prior_variants = getattr(args, 'pauc_prior_variants', [0.01, 0.05, 0.1, 0.2, 0.3])
+        
+        pauc_results = []
+        for i, (probs, labels) in enumerate(zip(all_probabilities, all_labels)):
+            config_pauc = compute_proxy_auc_variants(probs, labels, prior_variants, run_logger)
+            pauc_results.append(config_pauc)
+            
+            if run_logger:
+                run_logger.log(f"[compute_extended_meta_evaluation] Config {i+1}: PAUC computed for {len(prior_variants)} priors")
+        
+        # Aggregate PAUC results across configurations
+        pauc_aggregated = {}
+        for prior_key in pauc_results[0].keys():
+            prior_scores = [result[prior_key] for result in pauc_results]
+            pauc_aggregated[prior_key] = {
+                'scores': prior_scores,
+                'mean': float(np.mean(prior_scores)),
+                'std': float(np.std(prior_scores))
+            }
+        
+        extended_results['pauc'] = pauc_aggregated
+        
+        if run_logger:
+            run_logger.log(f"[compute_extended_meta_evaluation] PAUC aggregated across {len(pauc_results)} configurations")
+    
+    # Compute Top-K Positive Capture if requested
+    if 'topk' in meta_eval_metrics:
+        k_ratios = getattr(args, 'topk_k_ratio', [0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 5.0, 10.0])
+        k_values = getattr(args, 'topk_k_values', [10, 50, 100, 500, 1000])
+        area_percentages = getattr(args, 'topk_area_percentages', [0.1, 0.5, 1.0, 2.0, 5.0])
+        
+        topk_results = []
+        for i, (probs, labels) in enumerate(zip(all_probabilities, all_labels)):
+            config_topk = compute_topk_positive_capture_with_ratios(
+                probs, labels, k_ratios, k_values, area_percentages, run_logger
+            )
+            topk_results.append(config_topk)
+            
+            if run_logger:
+                run_logger.log(f"[compute_extended_meta_evaluation] Config {i+1}: TopK computed for {len(k_ratios)} ratios")
+        
+        # Aggregate TopK results across configurations
+        topk_aggregated = {'ratios': {}, 'absolute': {}, 'area_percentages': {}, 'summary': {}}
+        
+        # Aggregate ratio-based results
+        if 'ratios' in topk_results[0] and topk_results[0]['ratios']:
+            for ratio_key in topk_results[0]['ratios'].keys():
+                ratio_data = [result['ratios'][ratio_key] for result in topk_results if 'ratios' in result and ratio_key in result['ratios']]
+                if ratio_data:
+                    topk_aggregated['ratios'][ratio_key] = {
+                        'capture_rates': [d['capture_rate'] for d in ratio_data],
+                        'precisions': [d['precision'] for d in ratio_data],
+                        'mean_capture_rate': float(np.mean([d['capture_rate'] for d in ratio_data])),
+                        'std_capture_rate': float(np.std([d['capture_rate'] for d in ratio_data])),
+                        'mean_precision': float(np.mean([d['precision'] for d in ratio_data])),
+                        'std_precision': float(np.std([d['precision'] for d in ratio_data]))
+                    }
+        
+        # Aggregate absolute K results
+        if 'absolute' in topk_results[0] and topk_results[0]['absolute']:
+            for k_key in topk_results[0]['absolute'].keys():
+                k_data = [result['absolute'][k_key] for result in topk_results if 'absolute' in result and k_key in result['absolute']]
+                if k_data:
+                    topk_aggregated['absolute'][k_key] = {
+                        'capture_rates': [d['capture_rate'] for d in k_data],
+                        'precisions': [d['precision'] for d in k_data],
+                        'mean_capture_rate': float(np.mean([d['capture_rate'] for d in k_data])),
+                        'std_capture_rate': float(np.std([d['capture_rate'] for d in k_data])),
+                        'mean_precision': float(np.mean([d['precision'] for d in k_data])),
+                        'std_precision': float(np.std([d['precision'] for d in k_data]))
+                    }
+        
+        # Aggregate area percentage results
+        if 'area_percentages' in topk_results[0] and topk_results[0]['area_percentages']:
+            for area_key in topk_results[0]['area_percentages'].keys():
+                area_data = [result['area_percentages'][area_key] for result in topk_results if 'area_percentages' in result and area_key in result['area_percentages']]
+                if area_data:
+                    topk_aggregated['area_percentages'][area_key] = {
+                        'capture_rates': [d['capture_rate'] for d in area_data],
+                        'precisions': [d['precision'] for d in area_data],
+                        'mean_capture_rate': float(np.mean([d['capture_rate'] for d in area_data])),
+                        'std_capture_rate': float(np.std([d['capture_rate'] for d in area_data])),
+                        'mean_precision': float(np.mean([d['precision'] for d in area_data])),
+                        'std_precision': float(np.std([d['precision'] for d in area_data]))
+                    }
+        
+        extended_results['topk'] = topk_aggregated
+        
+        if run_logger:
+            run_logger.log(f"[compute_extended_meta_evaluation] TopK aggregated across {len(topk_results)} configurations")
+    
+    return extended_results
+
+
 # ============================================================================
 # Export Functions for External Use
 # ============================================================================
@@ -1438,5 +1833,8 @@ __all__ = [
     'save_meta_evaluation_results',
     'create_pos_drop_schedule_unified',
     'compute_meta_evaluation_metric',
+    'compute_proxy_auc_variants',
+    'compute_topk_positive_capture_with_ratios',
+    'compute_extended_meta_evaluation_from_args',
     'DEFAULT_META_EVALUATION'
 ]
