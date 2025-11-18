@@ -169,7 +169,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mlp-dropout-passes", type=int, default=5, help="Number of Monte Carlo dropout passes for uncertainty estimation in classifier inference.", )
 
     parser.add_argument("--read-inference", action=argparse.BooleanOptionalAction, default=False, help="Read inference on aligned datasets after training (default: false).",)
-    parser.add_argument("--force-recompute-dcca", action="store_true", help="Force recomputation of DCCA projections even if cached results exist.",)
 
     return parser.parse_args()
 
@@ -1131,7 +1130,7 @@ def main() -> None:
             gA=gA,
             device=device,
             cfg=cfg,
-            output_dir=Path(cfg.output_dir) / "cls_1_inference_results" / "All_Overlap",
+            output_dir=Path(cfg.output_dir) / "cls_1_training_results" / "All_Overlap",
             run_logger=run_logger,
             passes=cfg.cls_training.mc_dropout_passes,
             pos_crd = pos_crd_anchor_overlap_plot
@@ -1142,7 +1141,7 @@ def main() -> None:
             gA=gA,
             device=device,
             cfg=cfg,
-            output_dir=Path(cfg.output_dir) / "cls_1_inference_results" / "All",
+            output_dir=Path(cfg.output_dir) / "cls_1_training_results" / "All",
             run_logger=run_logger,
             passes=cfg.cls_training.mc_dropout_passes,
             pos_crd = pos_crd_plot
@@ -1296,7 +1295,7 @@ def main() -> None:
 
     if args.read_inference:
         # Read gA inference results
-        output_dir = Path(cfg.output_dir) / "cls_1_inference_results" / "Non_Overlap"
+        output_dir = Path(cfg.output_dir) / "cls_1_training_results" / "Non_Overlap"
         inference_results["gA_Non_Overlap"] = _read_inference(
             cfg=cfg,
             output_dir=output_dir,

@@ -1916,6 +1916,8 @@ def resolve_dcca_embeddings_and_projectors(
     
     # Prepare cache parameters
     weights_candidate = _resolve_dcca_weights_path(cfg, args.dcca_weights_path)
+
+    print(args.dcca_weights_path, weights_candidate)
     dcca_checkpoint_hash = _compute_dcca_checkpoint_hash(weights_candidate) if weights_candidate else "no_checkpoint"
     
     aggregator_config = {

@@ -25,14 +25,22 @@ def run_inference_base(
     passes: int = 10,
     pos_crd: Optional[List[Tuple[float, float]]] = None,
     tag: Dict[str, Any] = None,
+    save_coordinates: bool = True,  # ✅ NEW: Control coordinate saving
 ) -> Dict[str, object]:
     """Run inference on overlap data using only the cls."""
     
    
     # Get corresponding metadata
     matched_coords = samples["coords"]
-    features = samples["features"].float().to(device)
-    run_logger.log(f"[inference-cls] Processing {len(matched_coords)} anchor samples")
+    
+    # Handle both numpy arrays and tensors for features
+    features_raw = samples["features"]
+    if isinstance(features_raw, np.ndarray):
+        features = torch.from_numpy(features_raw).float().to(device)
+    else:
+        features = features_raw.float().to(device)
+    
+    run_logger.log(f"[cls-inference] Processing {len(matched_coords)} anchor samples")
     
     # Prepare output directory
     if tag is not None:
@@ -71,7 +79,13 @@ def run_inference_base(
     # Save raw predictions
     np.save(model_dir / "predictions_mean.npy", mean_pred)
     np.save(model_dir / "predictions_std.npy", std_pred)
-    np.save(model_dir / "coordinates.npy", np.array(matched_coords))
+    
+    # ✅ MODIFIED: Only save coordinates when requested (final prediction)
+    if save_coordinates:
+        np.save(model_dir / "coordinates.npy", np.array(matched_coords))
+        run_logger.log(f"[cls-inference] Saved coordinates.npy for {len(matched_coords)} samples")
+    else:
+        run_logger.log(f"[cls-inference] Skipped saving coordinates.npy (iteration training)")
     
     # Create scatter plots
     _create_inference_plots(
@@ -95,7 +109,7 @@ def run_inference_base(
     with open(model_dir / "summary.json", 'w') as f:
         json.dump(summary, f, indent=2)
     
-    run_logger.log(f"[inference-cls] Saved results to {model_dir}")
+    run_logger.log(f"[cls-inference] Saved results to {model_dir}")
     
     return {
         "predictions_mean": mean_pred,
