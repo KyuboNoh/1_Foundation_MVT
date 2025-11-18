@@ -705,6 +705,7 @@ def create_pos_drop_schedule_unified(
     if method == "random":
         return create_pos_drop_schedule_random(
             all_pos_idx=all_pos_idx,
+            features=features,
             meta_evaluation_n_clusters=meta_evaluation_n_clusters,
             seed=seed,
             min_training_size=min_training_size

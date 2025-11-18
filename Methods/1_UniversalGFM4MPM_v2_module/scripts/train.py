@@ -349,6 +349,7 @@ def main() -> None:
 
     tag = create_clean_tag(method_name, encoder_name, data_name)
     train_and_save_result(tag, data_use, action, common, args, cfg, run_logger)
+
     exit()
 
     ####################################### Train on target [z_b | u_b] #######################################
@@ -925,22 +926,23 @@ def train_and_save_result(
                         missing_configs.append({'method': method, 'n_clusters': n_clusters, 'name': config_name})
                         run_logger.log(f"[train_and_save_result] ❌ No cached predictions for {config_name}")
             
-            # If all configurations are cached, skip training entirely
+            # Handle cached results individually - save them immediately  
             total_configs = len(args.clustering_methods) * len(args.meta_evaluation_n_clusters)
+            for config_name, result in cached_results.items():
+                method_tag = f"{tag}_{config_name}"
+                train_cls_PN_base.save_meta_evaluation_results(
+                    meta_evaluation=result,
+                    tag_main=method_tag,
+                    common=common,
+                    run_logger=run_logger
+                )
+                run_logger.log(f"[train_and_save_result] ✅ CACHED: {config_name} - saved existing predictions")
+            
+            # If all configurations are cached, skip training entirely
             if len(cached_results) == total_configs:
-                run_logger.log(f"[train_and_save_result] ✅ All {total_configs} configurations have cached results, skipping training")
+                run_logger.log(f"[train_and_save_result] ✅ All {total_configs} configurations cached, no training needed")
                 
-                # Save cached results
-                for config_name, result in cached_results.items():
-                    method_tag = f"{tag}_{config_name}"
-                    train_cls_PN_base.save_meta_evaluation_results(
-                        meta_evaluation=result,
-                        tag_main=method_tag,
-                        common=common,
-                        run_logger=run_logger
-                    )
-                
-                # Log summary
+                # Log summary of cached results
                 run_logger.log(f"[train_and_save_result] ===== CACHED MULTI-CLUSTERING RESULTS =====")
                 for config_name, result in cached_results.items():
                     for metric, data in result.items():
@@ -949,27 +951,67 @@ def train_and_save_result(
                 run_logger.log(f"[train_and_save_result] ===== END CACHED RESULTS =====")
                 return
             
-            elif len(missing_configs) < total_configs:
-                run_logger.log(f"[train_and_save_result] Found {len(cached_results)} cached, training {len(missing_configs)} missing configurations")
+            # Selective training: only train missing configurations
+            run_logger.log(f"[train_and_save_result] CACHE SUMMARY: {len(cached_results)} cached, {len(missing_configs)} to train (total: {total_configs})")
+            
+            # Filter methods and clusters to only include missing ones
+            methods_to_train = list(set(config['method'] for config in missing_configs))
+            clusters_to_train = list(set(config['n_clusters'] for config in missing_configs))
+            
+            run_logger.log(f"[train_and_save_result] Methods to train: {methods_to_train}")
+            run_logger.log(f"[train_and_save_result] Clusters to train: {clusters_to_train}")
+            
+        else:
+            # No caching - train everything
+            methods_to_train = args.clustering_methods
+            clusters_to_train = args.meta_evaluation_n_clusters
+            run_logger.log(f"[train_and_save_result] No caching - training all configurations")
         
-        # Execute multi-clustering training (full or partial)
-        all_results = train_cls_PN_base.train_cls_1_PN_PosDrop_MultiClustering(
-            clustering_methods=args.clustering_methods,
-            meta_evaluation_n_clusters_list=args.meta_evaluation_n_clusters,
-            linkage=args.hierarchical_linkage,
-            seed=seed,
-            common={**common, 'verbose': False},
-            data_use=data_use,
-            filter_top_pct=args.filter_top_pct,
-            negs_per_pos=args.negs_per_pos,
-            action=action,
-            inference_fn=run_inference_base,
-            tag_main=tag,
-            meta_evaluation_metrics=meta_evaluation_metrics
-        )
+        # Execute multi-clustering training (only for missing configurations if caching enabled)
+        if args.skip_training_if_cached and 'methods_to_train' in locals() and len(missing_configs) > 0:
+            training_results = train_cls_PN_base.train_cls_1_PN_PosDrop_MultiClustering(
+                clustering_methods=methods_to_train,
+                meta_evaluation_n_clusters_list=clusters_to_train,
+                linkage=args.hierarchical_linkage,
+                seed=seed,
+                common={**common, 'verbose': False},
+                data_use=data_use,
+                filter_top_pct=args.filter_top_pct,
+                negs_per_pos=args.negs_per_pos,
+                action=action,
+                inference_fn=run_inference_base,
+                tag_main=tag,
+                meta_evaluation_metrics=meta_evaluation_metrics
+            )
+        elif not args.skip_training_if_cached:
+            # Train all configurations (no caching)
+            training_results = train_cls_PN_base.train_cls_1_PN_PosDrop_MultiClustering(
+                clustering_methods=args.clustering_methods,
+                meta_evaluation_n_clusters_list=args.meta_evaluation_n_clusters,
+                linkage=args.hierarchical_linkage,
+                seed=seed,
+                common={**common, 'verbose': False},
+                data_use=data_use,
+                filter_top_pct=args.filter_top_pct,
+                negs_per_pos=args.negs_per_pos,
+                action=action,
+                inference_fn=run_inference_base,
+                tag_main=tag,
+                meta_evaluation_metrics=meta_evaluation_metrics
+            )
+        else:
+            # All cached, no training needed
+            training_results = {}
         
-        # Save results for each method-cluster combination
-        for method_cluster_key, result in all_results.items():
+        # Combine cached and training results for final summary
+        if args.skip_training_if_cached and 'cached_results' in locals():
+            all_results = {**cached_results, **training_results}
+            run_logger.log(f"[train_and_save_result] Combined {len(cached_results)} cached + {len(training_results)} trained = {len(all_results)} total results")
+        else:
+            all_results = training_results
+        
+        # Save newly trained results (cached results already saved above)
+        for method_cluster_key, result in training_results.items():
             if "error" not in result:
                 method_tag = f"{tag}_{method_cluster_key}"
                 
@@ -988,17 +1030,19 @@ def train_and_save_result(
                     output_dir=Path(cfg.output_dir) / method_tag,
                     run_logger=run_logger
                 )
-                run_logger.log(f"[train_and_save_result] Completed training for {method_tag}")
+                run_logger.log(f"[train_and_save_result] ✅ TRAINED: {method_cluster_key}")
             else:
-                run_logger.log(f"[train_and_save_result] ERROR in {method_cluster_key}: {result['error']}")
+                run_logger.log(f"[train_and_save_result] ❌ ERROR in {method_cluster_key}: {result['error']}")
         
-        # Log comparison summary
-        run_logger.log(f"[train_and_save_result] ===== MULTI-CLUSTERING SUMMARY for {tag} =====")
+        # Final comprehensive summary showing both cached and trained results
+        run_logger.log(f"[train_and_save_result] ===== COMPLETE MULTI-CLUSTERING SUMMARY for {tag} =====")
         for method_cluster_key, result in all_results.items():
             if "error" not in result:
+                # Determine if this result was cached or trained
+                status = "CACHED" if (args.skip_training_if_cached and 'cached_results' in locals() and method_cluster_key in cached_results) else "TRAINED"
                 for metric, data in result.items():
                     if isinstance(data, dict) and 'mean' in data:
-                        run_logger.log(f"[train_and_save_result] {method_cluster_key} {metric}: {data['mean']:.4f} ± {data['std']:.4f}")
+                        run_logger.log(f"[train_and_save_result] {method_cluster_key} ({status}): {metric}={data['mean']:.4f} ± {data['std']:.4f}")
         run_logger.log(f"[train_and_save_result] ===== END SUMMARY =====")
     
     else:
