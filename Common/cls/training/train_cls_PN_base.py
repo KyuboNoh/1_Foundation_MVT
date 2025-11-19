@@ -13,7 +13,8 @@ import json
 import math
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any, Callable
+from typing import Dict, List, Optional, Tuple, Any, Callable, Set
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
@@ -34,9 +35,40 @@ from Common.cls.sampling.likely_negatives import (
     pu_select_negatives_from_individual_distances,
 )
 
-# Default meta-evaluation metrics for positive evaluation (can be overridden via command-line argument)
-DEFAULT_META_EVALUATION = {"PosDrop_Acc", "Focus"}
+# All metrics are now treated equally - no default registry
+POSITIVE_ITERATION_METRICS = {"PosDrop_Acc", "Focus"}
+NEGATIVE_META_EVALUATION = {"pu_fpr", "background_rejection", "pu_npv", "pu_fdr", "pu_tpr"}
+EXTENDED_META_METRICS = {"pauc", "topk"} | NEGATIVE_META_EVALUATION
 
+
+@dataclass
+class MetaEvaluationConfig:
+    metrics: Set[str] = field(default_factory=lambda: {"PosDrop_Acc", "Focus", "pauc", "topk"})
+    pauc_prior_variants: List[float] = field(default_factory=lambda: [0.01, 0.05, 0.1, 0.2, 0.3])
+    topk_k_ratio: List[float] = field(default_factory=lambda: [0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 5.0, 10.0])
+    topk_k_values: List[int] = field(default_factory=list)
+    topk_area_percentages: List[float] = field(default_factory=lambda: [0.1, 0.5, 1.0, 2.0, 5.0])
+    pu_prior_range: List[float] = field(default_factory=lambda: [0.05, 0.25])
+    pu_metric_thresholds: List[float] = field(default_factory=list)
+    pu_metric_threshold_count: int = 25
+
+    @classmethod
+    def from_args(cls, args: Any) -> "MetaEvaluationConfig":
+        metrics = set(getattr(args, "meta_evaluation", [])) if getattr(args, "meta_evaluation", None) else {"PosDrop_Acc", "Focus", "pauc", "topk"}
+        return cls(
+            metrics=metrics,
+            pauc_prior_variants=list(getattr(args, "pauc_prior_variants", [0.01, 0.05, 0.1, 0.2, 0.3])),
+            topk_k_ratio=list(getattr(args, "topk_k_ratio", [0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 5.0, 10.0])),
+            topk_k_values=list(getattr(args, "topk_k_values", [])),
+            topk_area_percentages=list(getattr(args, "topk_area_percentages", [0.1, 0.5, 1.0, 2.0, 5.0])),
+            pu_prior_range=list(getattr(args, "pu_prior_range", [0.05, 0.25])),
+            pu_metric_thresholds=list(getattr(args, "pu_metric_thresholds", [])),
+            pu_metric_threshold_count=int(getattr(args, "pu_metric_threshold_count", 25)),
+        )
+
+
+
+# Meta-evaluation functions are now called directly - no registry needed
 
 # ============================================================================
 # Meta-Evaluation Metric Functions
@@ -91,12 +123,6 @@ def compute_focus(
     return float(focus_score)
 
 
-# Registry of meta-evaluation functions
-META_EVALUATION_FUNCTIONS: Dict[str, Callable] = {
-    "PosDrop_Acc": compute_posdrop_acc,
-    "Focus": compute_focus,
-}
-
 
 def compute_meta_evaluation_metric(
     *,
@@ -122,25 +148,18 @@ def compute_meta_evaluation_metric(
     Raises:
         ValueError: If metric_name is not recognized
     """
-    if metric_name not in META_EVALUATION_FUNCTIONS:
-        raise ValueError(f"Unknown meta-evaluation metric: {metric_name}. Available: {list(META_EVALUATION_FUNCTIONS.keys())}")
-    
-    metric_fn = META_EVALUATION_FUNCTIONS[metric_name]
-    
-    # Build kwargs based on metric requirements
-    kwargs = {"predictions_mean": predictions_mean}
-    
     if metric_name == "PosDrop_Acc":
         if all_pos_idx is None or pos_indices_this_iter is None:
             raise ValueError(f"Metric '{metric_name}' requires all_pos_idx and pos_indices_this_iter")
-        kwargs["all_pos_idx"] = all_pos_idx
-        kwargs["pos_indices_this_iter"] = pos_indices_this_iter
-    
-    # Add predictions_std if provided and metric supports it
-    if predictions_std is not None and "predictions_std" in metric_fn.__code__.co_varnames:
-        kwargs["predictions_std"] = predictions_std
-    
-    return metric_fn(**kwargs)
+        return compute_posdrop_acc(
+            predictions_mean=predictions_mean,
+            all_pos_idx=all_pos_idx,
+            pos_indices_this_iter=pos_indices_this_iter
+        )
+    elif metric_name == "Focus":
+        return compute_focus(predictions_mean=predictions_mean)
+    else:
+        raise ValueError(f"Unknown meta-evaluation metric: {metric_name}. Available: ['PosDrop_Acc', 'Focus']")
 
 
 # ============================================================================
@@ -752,7 +771,8 @@ def train_cls_1_PN_PosDrop(
     inference_fn: Optional[callable] = None,
     tag_main: Optional[str] = None,
     use_individual_distances: bool = True,
-    meta_evaluation_metrics: Optional[set] = None,
+    run_meta_evaluation: bool = True,
+    meta_eval_config: Optional[MetaEvaluationConfig] = None,
 ) -> Dict[str, Any]:
     """
     Train a PN classifier with positive dropout using clustering and compute meta-evaluation metrics.
@@ -769,8 +789,9 @@ def train_cls_1_PN_PosDrop(
         inference_fn: Optional inference function to run after training
         tag_main: Main tag for caching and naming
         use_individual_distances: Use individual distance files instead of full matrix (memory-safe)
-        meta_evaluation_metrics: Set of metric names to compute (default: PosDrop_Acc, Focus)
-    
+        run_meta_evaluation: Whether to run meta-evaluation loops
+        meta_eval_config: Meta-evaluation configuration (metrics + parameters)
+
     Returns:
         Dictionary containing meta-evaluation results
     """
@@ -784,9 +805,9 @@ def train_cls_1_PN_PosDrop(
     run_logger = common.get('run_logger', None)
     verbose = common.get('verbose', True)
     
-    # Use provided metrics or default
-    if meta_evaluation_metrics is None:
-        meta_evaluation_metrics = DEFAULT_META_EVALUATION
+    if meta_eval_config is None:
+        meta_eval_config = MetaEvaluationConfig()
+    meta_evaluation_metrics = set(meta_eval_config.metrics)
     
     if run_logger is not None:
         run_logger.log(f"[cls-1-PN-PosDrop] Meta_evaluation_n_clusters: {meta_evaluation_n_clusters}")
@@ -1037,12 +1058,23 @@ def train_cls_1_PN_PosDrop(
     if run_logger is not None and verbose:
         run_logger.log(f"[cls-1-PN-PosDrop] Completed final 'no positive drop' training")
     
+    if not run_meta_evaluation:
+        if run_logger is not None:
+            run_logger.log("[cls-1-PN-PosDrop] Meta evaluation disabled; returning empty summary")
+        return {}
+
+    if not run_meta_evaluation:
+        if run_logger:
+            run_logger.log("[load_cached_predictions] Meta evaluation disabled; returning empty summary")
+        return {}
+
     # Compute meta-evaluation metrics (all metrics treated uniformly)
     meta_evaluation = {}
     
-    # Handle traditional metrics (PosDrop_Acc, Focus)
-    traditional_metrics = [m for m in meta_evaluation_metrics if m in META_EVALUATION_FUNCTIONS]
-    for metric in traditional_metrics:
+    # Handle per-iteration metrics (PosDrop_Acc, Focus)
+    per_iteration_metrics = POSITIVE_ITERATION_METRICS
+    iteration_based = [m for m in meta_evaluation_metrics if m in per_iteration_metrics]
+    for metric in iteration_based:
         metric_scores = []
 
         for iteration in range(num_iterations):
@@ -1080,9 +1112,10 @@ def train_cls_1_PN_PosDrop(
         if run_logger is not None:
             run_logger.log(f"[cls-1-PN-PosDrop] {metric}: mean={meta_evaluation[metric]['mean']:.4f}, std={meta_evaluation[metric]['std']:.4f}")
     
-    # Handle extended metrics (PAUC, TopK)
-    extended_metrics = [m for m in meta_evaluation_metrics if m not in META_EVALUATION_FUNCTIONS]
-    if extended_metrics:
+    # Handle cross-iteration metrics (PAUC, TopK)
+    cross_iteration_metrics = EXTENDED_META_METRICS
+    cross_based = [m for m in meta_evaluation_metrics if m in cross_iteration_metrics]
+    if cross_based:
         # Prepare data for extended metrics computation
         all_probabilities = []
         all_labels = []
@@ -1104,24 +1137,19 @@ def train_cls_1_PN_PosDrop(
             all_probabilities.append(predictions_mean)
             all_labels.append(labels_this_iter)
         
-        # Create mock args object for extended metrics
-        import argparse
-        mock_args = argparse.Namespace()
-        mock_args.meta_evaluation = extended_metrics
-        mock_args.pauc_prior_variants = pauc_prior_variants if pauc_prior_variants is not None else [0.01, 0.05, 0.1, 0.2, 0.3]
-        mock_args.topk_k_ratio = topk_k_ratio if topk_k_ratio is not None else [0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 5.0, 10.0]
-        mock_args.topk_k_values = topk_k_values if topk_k_values is not None else [10, 50, 100, 500, 1000]
-        mock_args.topk_area_percentages = topk_area_percentages if topk_area_percentages is not None else [0.1, 0.5, 1.0, 2.0, 5.0]
-        
-        extended_results = compute_extended_meta_evaluation_from_args(
-            mock_args, all_probabilities, all_labels, run_logger
+        extended_results = compute_extended_meta_evaluation(
+            meta_eval_config=meta_eval_config,
+            requested_metrics=cross_based,
+            all_probabilities=all_probabilities,
+            all_labels=all_labels,
+            run_logger=run_logger,
         )
         
-        # Merge extended results into meta_evaluation
+        # Merge cross-iteration results into meta_evaluation
         meta_evaluation.update(extended_results)
         
         if run_logger is not None:
-            run_logger.log(f"[cls-1-PN-PosDrop] Computed extended metrics: {list(extended_results.keys())}")
+            run_logger.log(f"[cls-1-PN-PosDrop] Computed cross-iteration metrics: {list(extended_results.keys())}")
     
     return meta_evaluation
 
@@ -1133,17 +1161,14 @@ def train_cls_1_PN_PosDrop(
 def load_and_evaluate_existing_predictions(
     *,
     tag_main: str,
-    meta_evaluation_n_clusters: int,  # ✅ CHANGED: from drop_rate to n_clusters
+    meta_evaluation_n_clusters: Optional[int] = None,  # ✅ CHANGED: from drop_rate to n_clusters
     clustering_method: str = "random", # ✅ NEW: clustering method
     common: Dict[str, Any],
     data_use: Dict[str, Any],
     run_logger: Optional[Any] = None,
-    meta_evaluation_metrics: Optional[set] = None,
-    # Extended metrics parameters
-    pauc_prior_variants: Optional[List[float]] = None,
-    topk_k_ratio: Optional[List[float]] = None,
-    topk_k_values: Optional[List[int]] = None,
-    topk_area_percentages: Optional[List[float]] = None,
+    run_meta_evaluation: bool = True,
+    meta_eval_config: Optional[MetaEvaluationConfig] = None,
+    drop_rate: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Load existing predictions from disk and compute Meta_Evaluation metrics.
@@ -1151,24 +1176,31 @@ def load_and_evaluate_existing_predictions(
     Args:
         tag_main: Tag identifier for the experiment
         meta_evaluation_n_clusters: Number of clusters/iterations (2, 3, 4, 6, 8, 10)
+        drop_rate: Legacy positive-drop rate (used if n_clusters omitted)
         clustering_method: Clustering method used ('random', 'kmeans', 'hierarchical')
         common: Dictionary containing cfg, device, run_logger, etc.
         data_use: Dictionary containing 'features', 'labels', 'coords' keys
         run_logger: Optional logger for status messages
-        meta_evaluation_metrics: Set of metric names to compute (default: PosDrop_Acc, Focus)
+        run_meta_evaluation: Whether to compute meta-evaluation metrics
+        meta_eval_config: Meta-evaluation configuration bundle
     
     Returns:
         Dictionary containing meta_evaluation metrics, or None if predictions not found
     """
     cfg = common['cfg']
     
+    if meta_evaluation_n_clusters is None:
+        if drop_rate is not None and drop_rate > 0:
+            meta_evaluation_n_clusters = int(round(1.0 / drop_rate))
+        else:
+            raise ValueError("meta_evaluation_n_clusters must be provided when drop_rate is absent.")
     expected_num_iterations = meta_evaluation_n_clusters
     
     base_output_dir = Path(cfg.output_dir) / "cls_1_training_results" / "All" / tag_main
     
-    # Use provided metrics or default
-    if meta_evaluation_metrics is None:
-        meta_evaluation_metrics = DEFAULT_META_EVALUATION
+    if meta_eval_config is None:
+        meta_eval_config = MetaEvaluationConfig()
+    meta_evaluation_metrics = set(meta_eval_config.metrics)
     
     if run_logger:
         run_logger.log(f"[load_cached_predictions] Searching in: {base_output_dir}")
@@ -1283,9 +1315,10 @@ def load_and_evaluate_existing_predictions(
     # Compute meta-evaluation metrics (all metrics treated uniformly)
     meta_evaluation = {}
     
-    # Handle traditional metrics (PosDrop_Acc, Focus)
-    traditional_metrics = [m for m in meta_evaluation_metrics if m in META_EVALUATION_FUNCTIONS]
-    for metric in traditional_metrics:
+    # Handle per-iteration metrics (PosDrop_Acc, Focus)
+    per_iteration_metrics = POSITIVE_ITERATION_METRICS
+    iteration_based = [m for m in meta_evaluation_metrics if m in per_iteration_metrics]
+    for metric in iteration_based:
         metric_scores = []
         
         for iteration in range(num_iterations):
@@ -1316,9 +1349,10 @@ def load_and_evaluate_existing_predictions(
         if run_logger:
             run_logger.log(f"[load_cached_predictions] {metric}: mean={meta_evaluation[metric]['mean']:.4f}, std={meta_evaluation[metric]['std']:.4f}")
     
-    # Handle extended metrics (PAUC, TopK)
-    extended_metrics = [m for m in meta_evaluation_metrics if m not in META_EVALUATION_FUNCTIONS]
-    if extended_metrics:
+    # Handle cross-iteration metrics (PAUC, TopK)
+    cross_iteration_metrics = EXTENDED_META_METRICS
+    cross_based = [m for m in meta_evaluation_metrics if m in cross_iteration_metrics]
+    if cross_based:
         # Prepare data for extended metrics computation
         all_probabilities = []
         all_labels = []
@@ -1336,24 +1370,19 @@ def load_and_evaluate_existing_predictions(
             all_probabilities.append(predictions_mean)
             all_labels.append(labels_this_iter)
         
-        # Create mock args object for extended metrics
-        import argparse
-        mock_args = argparse.Namespace()
-        mock_args.meta_evaluation = extended_metrics
-        mock_args.pauc_prior_variants = pauc_prior_variants if pauc_prior_variants is not None else [0.01, 0.05, 0.1, 0.2, 0.3]
-        mock_args.topk_k_ratio = topk_k_ratio if topk_k_ratio is not None else [0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 5.0, 10.0]
-        mock_args.topk_k_values = topk_k_values if topk_k_values is not None else [10, 50, 100, 500, 1000]
-        mock_args.topk_area_percentages = topk_area_percentages if topk_area_percentages is not None else [0.1, 0.5, 1.0, 2.0, 5.0]
-        
-        extended_results = compute_extended_meta_evaluation_from_args(
-            mock_args, all_probabilities, all_labels, run_logger
+        extended_results = compute_extended_meta_evaluation(
+            meta_eval_config=meta_eval_config,
+            requested_metrics=cross_based,
+            all_probabilities=all_probabilities,
+            all_labels=all_labels,
+            run_logger=run_logger,
         )
         
-        # Merge extended results into meta_evaluation
+        # Merge cross-iteration results into meta_evaluation
         meta_evaluation.update(extended_results)
         
         if run_logger:
-            run_logger.log(f"[load_cached_predictions] Computed extended metrics: {list(extended_results.keys())}")
+            run_logger.log(f"[load_cached_predictions] Computed cross-iteration metrics: {list(extended_results.keys())}")
     
     return meta_evaluation
 
@@ -1382,6 +1411,8 @@ def train_cls_1_PN_PosDrop_MultiClustering(
     topk_k_ratio: Optional[List[float]] = None,
     topk_k_values: Optional[List[int]] = None,
     topk_area_percentages: Optional[List[float]] = None,
+    run_meta_evaluation: bool = True,
+    meta_eval_config: Optional[MetaEvaluationConfig] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Train PN classifiers with multiple clustering methods and n_clusters configurations.
@@ -1399,6 +1430,7 @@ def train_cls_1_PN_PosDrop_MultiClustering(
         tag_main: Main tag for caching and naming
         use_individual_distances: Use individual distance files instead of full matrix (memory-safe)
         meta_evaluation_metrics: Set of metric names to compute (default: PosDrop_Acc, Focus)
+        run_meta_evaluation / meta_eval_config: Control and configure meta evaluation
     
     Returns:
         Dictionary mapping config names to meta-evaluation results
@@ -1408,7 +1440,7 @@ def train_cls_1_PN_PosDrop_MultiClustering(
     verbose = common.get('verbose', True)
     
     if meta_evaluation_metrics is None:
-        meta_evaluation_metrics = DEFAULT_META_EVALUATION
+        meta_evaluation_metrics = {"PosDrop_Acc", "Focus", "pauc", "topk"}
     
     # Generate all configurations to test
     all_configs = []
@@ -1451,7 +1483,8 @@ def train_cls_1_PN_PosDrop_MultiClustering(
                 inference_fn=inference_fn,
                 tag_main=tag_main,
                 use_individual_distances=use_individual_distances,
-                meta_evaluation_metrics=meta_evaluation_metrics
+                run_meta_evaluation=run_meta_evaluation,
+                meta_eval_config=meta_eval_config,
             )
             
             all_results[config_name] = result
@@ -1484,6 +1517,28 @@ def train_cls_1_PN_PosDrop_MultiClustering(
     
     return all_results
 
+def _convert_to_serializable(obj):
+    """Recursively convert numpy types and other non-serializable types to JSON-serializable types"""
+    import numpy as np
+    
+    if isinstance(obj, dict):
+        return {key: _convert_to_serializable(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [_convert_to_serializable(item) for item in obj]
+    elif isinstance(obj, (np.ndarray, np.generic)):
+        if obj.ndim == 0:  # scalar
+            return float(obj)
+        else:
+            return obj.tolist()
+    elif isinstance(obj, (np.integer, int)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, float)):
+        return float(obj)
+    elif obj is None:
+        return None
+    else:
+        return obj
+
 
 def save_meta_evaluation_results(
     *,
@@ -1501,20 +1556,37 @@ def save_meta_evaluation_results(
         common: Dictionary containing cfg
         run_logger: Optional logger for status messages
     """
+    import json
+    from pathlib import Path
+    import numpy as np
+    
     cfg = common['cfg']
     output_dir = Path(cfg.output_dir) / "cls_1_training_results/meta_evaluation_results"
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    output_path = output_dir / f"{tag_main}_meta_evaluation.json"
+    output_path = output_dir / f"{tag_main}_meta_eval.json"
     
     # Convert numpy types to native Python types for JSON serialization
     serializable_meta = {}
     for metric_name, metric_data in meta_evaluation.items():
-        serializable_meta[metric_name] = {
-            'scores': [float(s) for s in metric_data['scores']],
-            'mean': float(metric_data['mean']),
-            'std': float(metric_data['std'])
-        }
+        if isinstance(metric_data, dict):
+            # Handle simple metric structure (PosDrop_Acc, Focus)
+            if 'scores' in metric_data and 'mean' in metric_data and 'std' in metric_data:
+                serializable_meta[metric_name] = {
+                    'scores': [float(s) for s in metric_data['scores']],
+                    'mean': float(metric_data['mean']),
+                    'std': float(metric_data['std']),
+                    'scores_info': {
+                        'count': len(metric_data.get('scores', [])),
+                        'description': "Per-iteration metric values (one entry per positive-drop fold)."
+                    }
+                }
+            else:
+                # Handle complex nested structures (pauc, topk) - serialize as-is with type conversion
+                serializable_meta[metric_name] = _convert_to_serializable(metric_data)
+        else:
+            # Handle scalar values
+            serializable_meta[metric_name] = float(metric_data) if metric_data is not None else None
     
     with open(output_path, 'w') as f:
         json.dump(serializable_meta, f, indent=2)
@@ -1539,9 +1611,7 @@ def compute_proxy_auc_variants(probs_all, y_true, prior_variants, run_logger=Non
     from sklearn.metrics import roc_auc_score
     import numpy as np
     
-    if run_logger:
-        run_logger.log(f"[compute_proxy_auc_variants] Computing PAUC for {len(prior_variants)} prior variants")
-    
+   
     results = {}
     positive_mask = y_true == 1
     n_positives = positive_mask.sum()
@@ -1574,14 +1644,13 @@ def compute_proxy_auc_variants(probs_all, y_true, prior_variants, run_logger=Non
                 
             results[f"prior_{prior:.3f}"] = float(auc_score)
             
-            if run_logger:
-                run_logger.log(f"[compute_proxy_auc_variants] Prior π={prior:.3f}: PAUC={auc_score:.4f}")
-                
         except Exception as e:
             if run_logger:
                 run_logger.log(f"[compute_proxy_auc_variants] Error with prior π={prior:.3f}: {e}")
             results[f"prior_{prior:.3f}"] = 0.5
     
+    if run_logger:
+        run_logger.log(f"[compute_proxy_auc_variants] Completed PAUC for {len(prior_variants)} priors")
     return results
 
 
@@ -1602,9 +1671,7 @@ def compute_topk_positive_capture_with_ratios(probs_all, y_true, k_ratios, k_val
     """
     import numpy as np
     
-    if run_logger:
-        run_logger.log(f"[compute_topk_positive_capture] Computing TopK with {len(k_ratios)} ratios, {len(k_values)} absolute K, {len(area_percentages)} area percentages")
-    
+   
     results = {}
     positive_mask = y_true == 1
     n_positives = positive_mask.sum()
@@ -1620,9 +1687,11 @@ def compute_topk_positive_capture_with_ratios(probs_all, y_true, k_ratios, k_val
     sorted_labels = y_true[sorted_indices]
     sorted_probs = probs_all[sorted_indices]
     
-    # Ratio-based K values
+    ratio_summaries = []
     ratio_results = {}
     for ratio in k_ratios:
+        if ratio <= 0:
+            continue
         k_effective = max(1, int(ratio * n_positives))  # At least 1
         k_effective = min(k_effective, n_total)  # At most total samples
         
@@ -1638,13 +1707,13 @@ def compute_topk_positive_capture_with_ratios(probs_all, y_true, k_ratios, k_val
             'precision': float(precision),
             'area_fraction': k_effective / n_total
         }
-        
-        if run_logger:
-            run_logger.log(f"[compute_topk_positive_capture] Ratio {ratio:.2f}: K={k_effective}, captured={positives_in_topk}/{n_positives} ({capture_rate:.4f})")
+        ratio_summaries.append({'ratio': ratio, 'capture': capture_rate, 'precision': precision})
     
     results['ratios'] = ratio_results
+    # Keep verbose summary suppressed to avoid log spam
     
     # Absolute K values
+    absolute_summaries = []
     absolute_results = {}
     for k in k_values:
         k_effective = min(k, n_total)
@@ -1660,13 +1729,13 @@ def compute_topk_positive_capture_with_ratios(probs_all, y_true, k_ratios, k_val
             'precision': float(precision),
             'area_fraction': k_effective / n_total
         }
-        
-        if run_logger:
-            run_logger.log(f"[compute_topk_positive_capture] Absolute K={k}: captured={positives_in_topk}/{n_positives} ({capture_rate:.4f})")
+        absolute_summaries.append({'k': k, 'capture': capture_rate})
     
     results['absolute'] = absolute_results
+    # Logging muted for absolute sweep
     
     # Area percentage analysis
+    area_summaries = []
     area_results = {}
     for area_pct in area_percentages:
         k_area = max(1, int(area_pct * n_total / 100))  # Convert percentage to count
@@ -1683,11 +1752,10 @@ def compute_topk_positive_capture_with_ratios(probs_all, y_true, k_ratios, k_val
             'precision': float(precision),
             'area_fraction': k_area / n_total
         }
-        
-        if run_logger:
-            run_logger.log(f"[compute_topk_positive_capture] Area {area_pct:.1f}%: K={k_area}, captured={positives_in_area}/{n_positives} ({capture_rate:.4f})")
+        area_summaries.append({'area': area_pct, 'capture': capture_rate})
     
     results['area_percentages'] = area_results
+    # Logging muted for area sweep
     
     # Summary statistics
     results['summary'] = {
@@ -1701,42 +1769,141 @@ def compute_topk_positive_capture_with_ratios(probs_all, y_true, k_ratios, k_val
     return results
 
 
-def compute_extended_meta_evaluation_from_args(args, all_probabilities, all_labels, run_logger=None):
+def compute_pu_negative_metrics(
+    probs_all: np.ndarray,
+    labels: np.ndarray,
+    thresholds: np.ndarray,
+    pi_values: List[float],
+    run_logger=None,
+) -> Optional[Dict[str, Any]]:
+    """Compute PU-based negative metrics (FPR, NPV, specificity, FDR, background rejection)."""
+    probs = np.asarray(probs_all, dtype=float)
+    labels = np.asarray(labels)
+    pos_mask = labels == 1
+    unl_mask = ~pos_mask
+    n_pos = int(pos_mask.sum())
+    n_unl = int(unl_mask.sum())
+    if n_pos == 0 or n_unl == 0:
+        if run_logger:
+            run_logger.log("[compute_pu_negative_metrics] Skipping due to insufficient positives/unlabeled")
+        return None
+    
+    thresholds = np.asarray(thresholds, dtype=float)
+    if thresholds.size == 0:
+        thresholds = np.array([0.5], dtype=float)
+    thresholds = np.unique(thresholds)
+    
+    pos_sorted = np.sort(probs[pos_mask])
+    unl_sorted = np.sort(probs[unl_mask])
+    
+    pos_left = np.searchsorted(pos_sorted, thresholds, side="left")
+    unl_left = np.searchsorted(unl_sorted, thresholds, side="left")
+    
+    tpr = (n_pos - pos_left) / max(n_pos, 1)
+    mix_mass = (n_unl - unl_left) / max(n_unl, 1)
+    br = unl_left / max(n_unl, 1)
+    pos_less = pos_left / max(n_pos, 1)
+    
+    cleaned_pi = [pi for pi in pi_values if 0.0 < pi < 1.0]
+    if not cleaned_pi:
+        cleaned_pi = [0.05, 0.25]
+    
+    eps = 1e-8
+    fpr_bounds = {}
+    npv_bounds = {}
+    spec_bounds = {}
+    fdr_bounds = {}
+    for pi in cleaned_pi:
+        denom = max(1.0 - pi, eps)
+        fpr = np.clip((mix_mass - pi * tpr) / denom, 0.0, 1.0)
+        specificity = np.clip(1.0 - fpr, 0.0, 1.0)
+        npv = np.clip((br - pi * pos_less) / denom, 0.0, 1.0)
+        fdr = np.clip(((1 - pi) * fpr) / (pi * tpr + (1 - pi) * fpr + eps), 0.0, 1.0)
+        
+        fpr_bounds[pi] = fpr
+        npv_bounds[pi] = npv
+        spec_bounds[pi] = specificity
+        fdr_bounds[pi] = fdr
+    
+    return {
+        "thresholds": thresholds.tolist(),
+        "tpr": tpr.tolist(),
+        "background_rejection": br.tolist(),
+        "fpr_bounds": fpr_bounds,
+        "npv_bounds": npv_bounds,
+        "specificity_bounds": spec_bounds,
+        "fdr_bounds": fdr_bounds,
+    }
+
+
+def _aggregate_pi_metric(results: List[Dict[str, Any]], key: str, pi_values: List[float]) -> Dict[str, Any]:
+    """Aggregate per-threshold metrics that depend on class prior."""
+    if not results:
+        return {}
+    thresholds = results[0]["thresholds"]
+    aggregated = []
+    for pi in pi_values:
+        stacks = [res[key][pi] for res in results if pi in res[key]]
+        if not stacks:
+            continue
+        arr = np.stack(stacks)
+        aggregated.append({
+            "pi": float(pi),
+            "mean": arr.mean(axis=0).tolist(),
+            "std": arr.std(axis=0).tolist(),
+        })
+    return {"thresholds": thresholds, "pi_stats": aggregated}
+
+
+def _aggregate_simple_metric(results: List[Dict[str, Any]], key: str) -> Dict[str, Any]:
+    """Aggregate per-threshold metrics without prior dependence."""
+    if not results:
+        return {}
+    thresholds = results[0]["thresholds"]
+    arr = np.stack([np.asarray(res[key], dtype=float) for res in results])
+    return {
+        "thresholds": thresholds,
+        "mean": arr.mean(axis=0).tolist(),
+        "std": arr.std(axis=0).tolist(),
+    }
+
+
+def compute_extended_meta_evaluation(
+    *,
+    meta_eval_config: MetaEvaluationConfig,
+    requested_metrics: Optional[List[str]],
+    all_probabilities,
+    all_labels,
+    run_logger=None,
+):
     """
-    Compute extended meta-evaluation metrics based on command-line arguments.
+    Compute extended meta-evaluation metrics based on a config bundle.
     
     Args:
-        args: Parsed command-line arguments with meta-evaluation parameters
+        meta_eval_config: MetaEvaluationConfig containing parameter defaults
+        requested_metrics: Subset of metrics to compute
         all_probabilities: List of probability arrays from different clustering configurations
         all_labels: List of label arrays from different clustering configurations
         run_logger: Optional logger for tracking progress
     
     Returns:
-        dict: Extended meta-evaluation results including PAUC and TopK metrics
+        dict: Extended meta-evaluation results including PAUC, TopK, and PU metrics
     """
     import numpy as np
-    
-    if run_logger:
-        run_logger.log(f"[compute_extended_meta_evaluation] Computing extended metrics for {len(all_probabilities)} configurations")
     
     extended_results = {}
     
     # Check if extended metrics are requested
-    meta_eval_metrics = getattr(args, 'meta_evaluation', [])
-    if not isinstance(meta_eval_metrics, list):
-        meta_eval_metrics = [meta_eval_metrics] if meta_eval_metrics else []
+    meta_eval_metrics = set(requested_metrics or [])
     
     # Compute Proxy AUC variants if requested
     if 'pauc' in meta_eval_metrics:
-        prior_variants = getattr(args, 'pauc_prior_variants', [0.01, 0.05, 0.1, 0.2, 0.3])
+        prior_variants = meta_eval_config.pauc_prior_variants or [0.01, 0.05, 0.1, 0.2, 0.3]
         
         pauc_results = []
         for i, (probs, labels) in enumerate(zip(all_probabilities, all_labels)):
             config_pauc = compute_proxy_auc_variants(probs, labels, prior_variants, run_logger)
             pauc_results.append(config_pauc)
-            
-            if run_logger:
-                run_logger.log(f"[compute_extended_meta_evaluation] Config {i+1}: PAUC computed for {len(prior_variants)} priors")
         
         # Aggregate PAUC results across configurations
         pauc_aggregated = {}
@@ -1755,9 +1922,9 @@ def compute_extended_meta_evaluation_from_args(args, all_probabilities, all_labe
     
     # Compute Top-K Positive Capture if requested
     if 'topk' in meta_eval_metrics:
-        k_ratios = getattr(args, 'topk_k_ratio', [0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 5.0, 10.0])
-        k_values = getattr(args, 'topk_k_values', [10, 50, 100, 500, 1000])
-        area_percentages = getattr(args, 'topk_area_percentages', [0.1, 0.5, 1.0, 2.0, 5.0])
+        k_ratios = meta_eval_config.topk_k_ratio or [0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 5.0, 10.0]
+        k_values = meta_eval_config.topk_k_values or [10, 50, 100, 500, 1000]
+        area_percentages = meta_eval_config.topk_area_percentages or [0.1, 0.5, 1.0, 2.0, 5.0]
         
         topk_results = []
         for i, (probs, labels) in enumerate(zip(all_probabilities, all_labels)):
@@ -1765,9 +1932,6 @@ def compute_extended_meta_evaluation_from_args(args, all_probabilities, all_labe
                 probs, labels, k_ratios, k_values, area_percentages, run_logger
             )
             topk_results.append(config_topk)
-            
-            if run_logger:
-                run_logger.log(f"[compute_extended_meta_evaluation] Config {i+1}: TopK computed for {len(k_ratios)} ratios")
         
         # Aggregate TopK results across configurations
         topk_aggregated = {'ratios': {}, 'absolute': {}, 'area_percentages': {}, 'summary': {}}
@@ -1819,6 +1983,47 @@ def compute_extended_meta_evaluation_from_args(args, all_probabilities, all_labe
         if run_logger:
             run_logger.log(f"[compute_extended_meta_evaluation] TopK aggregated across {len(topk_results)} configurations")
     
+    # PU-based negative metrics (FPR, background rejection, NPV, FDR)
+    requested_neg_metrics = [m for m in meta_eval_metrics if m in NEGATIVE_META_EVALUATION]
+    if requested_neg_metrics:
+        pi_range = meta_eval_config.pu_prior_range or [0.05, 0.25]
+        pi_values = sorted({float(pi) for pi in pi_range})
+        
+        thresholds = meta_eval_config.pu_metric_thresholds
+        if thresholds:
+            thresholds = np.array(sorted({float(t) for t in thresholds}))
+        else:
+            threshold_count = max(5, int(meta_eval_config.pu_metric_threshold_count))
+            combined_probs = np.concatenate([np.asarray(p) for p in all_probabilities]) if all_probabilities else np.array([0.0])
+            quantiles = np.linspace(0.0, 1.0, threshold_count)
+            thresholds = np.quantile(combined_probs, quantiles)
+        
+        neg_results = []
+        for probs, labels in zip(all_probabilities, all_labels):
+            res = compute_pu_negative_metrics(probs, labels, thresholds, pi_values, run_logger)
+            if res is not None:
+                neg_results.append(res)
+        
+        if neg_results:
+            if 'pu_fpr' in requested_neg_metrics:
+                extended_results['pu_fpr'] = _aggregate_pi_metric(neg_results, 'fpr_bounds', pi_values)
+            if 'background_rejection' in requested_neg_metrics:
+                extended_results['background_rejection'] = _aggregate_simple_metric(neg_results, 'background_rejection')
+            if 'pu_npv' in requested_neg_metrics:
+                extended_results['pu_npv'] = {
+                    'npv': _aggregate_pi_metric(neg_results, 'npv_bounds', pi_values),
+                    'specificity': _aggregate_pi_metric(neg_results, 'specificity_bounds', pi_values),
+                }
+            if 'pu_fdr' in requested_neg_metrics:
+                extended_results['pu_fdr'] = _aggregate_pi_metric(neg_results, 'fdr_bounds', pi_values)
+            if 'pu_tpr' in requested_neg_metrics:
+                extended_results['pu_tpr'] = _aggregate_simple_metric(neg_results, 'tpr')
+            
+            if run_logger:
+                run_logger.log(f"[compute_extended_meta_evaluation] PU negative metrics aggregated over {len(neg_results)} configurations")
+        elif run_logger:
+            run_logger.log("[compute_extended_meta_evaluation] Skipped PU negative metrics (insufficient data)")
+
     return extended_results
 
 
@@ -1827,6 +2032,7 @@ def compute_extended_meta_evaluation_from_args(args, all_probabilities, all_labe
 # ============================================================================
 
 __all__ = [
+    'MetaEvaluationConfig',
     'train_cls_1_PN_PosDrop',
     'train_cls_1_PN_PosDrop_MultiClustering',
     'load_and_evaluate_existing_predictions',
@@ -1835,6 +2041,5 @@ __all__ = [
     'compute_meta_evaluation_metric',
     'compute_proxy_auc_variants',
     'compute_topk_positive_capture_with_ratios',
-    'compute_extended_meta_evaluation_from_args',
-    'DEFAULT_META_EVALUATION'
+    'compute_extended_meta_evaluation'
 ]

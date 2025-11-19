@@ -140,6 +140,7 @@ from . inference_module import run_inference_base
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stage-1 overlap alignment trainer")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--config", required=True, type=str, help="Path to alignment configuration JSON.")
     parser.add_argument("--debug", action="store_true", help="Enable debug diagnostics and save overlap figures.")
     # parser.add_argument("--use-positive-only", action="store_true", help="Restrict training pairs to positive tiles.")
@@ -170,43 +171,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--read-inference", action=argparse.BooleanOptionalAction, default=False, help="Read inference on aligned datasets after training (default: false).",)
     
     parser.add_argument("--skip-training-if-cached", action="store_true", help="Skip training if cached predictions are found and compute Meta_Evaluation from cached results.")
-    
-    # Legacy drop-rate parameter for backward compatibility
-    parser.add_argument("--drop-rate", type=float, default=None, help="Legacy parameter - use --meta-evaluation-n-clusters instead")
-    
-    # Multi-clustering arguments
-    parser.add_argument("--clustering-methods", type=str, nargs="+", default=["random"], 
-                       choices=["random", "kmeans", "hierarchical"],
-                       help="Clustering methods for positive dropping (space-separated). Available: random, kmeans, hierarchical")
-    
-    parser.add_argument("--meta-evaluation-n-clusters", type=int, nargs="+", default=[10],
-                       help="Number of clusters/iterations for meta-evaluation (space-separated). Line search over these values.")
-    
-    parser.add_argument("--hierarchical-linkage", type=str, default="ward",
-                       choices=["ward", "complete", "average", "single"],
-                       help="Linkage criterion for hierarchical clustering")
 
-    parser.add_argument("--meta-evaluation", type=str, nargs="+", default=["PosDrop_Acc", "Focus", "topk", "pauc"], help="Meta-evaluation metrics to compute (space-separated). Available: PosDrop_Acc, Focus, topk, pauc")
-    
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    
+    # Meta-evaluation parameters
+    parser.add_argument("--meta-evaluation", type=str, nargs="+", default=["PosDrop_Acc", "Focus", "topk", "pauc", "pu_tpr", "pu_fpr", "pu_npv", "background_rejection"], help="Meta-evaluation metrics to compute (space-separated). Available: PosDrop_Acc, Focus, topk, pauc")
+    parser.add_argument("--run-meta-evaluation", action=argparse.BooleanOptionalAction, default=True, help="Enable meta-evaluation metric computation.")
+    # Legacy drop-rate parameter for backward compatibility
+    # parser.add_argument("--drop-rate", type=float, default=None, help="Legacy parameter - use --meta-evaluation-n-clusters instead")
+    # ✅ Multi-clustering arguments
+    parser.add_argument("--clustering-methods", type=str, nargs="+", default=["random", "kmeans", "hierarchical"], choices=["random", "kmeans", "hierarchical"], help="Clustering methods for positive dropping (space-separated). Available: random, kmeans, hierarchical")
+    parser.add_argument("--meta-evaluation-n-clusters", type=int, nargs="+", default=[2, 3, 4, 5, 6, 7, 8, 10], help="Number of clusters/iterations for meta-evaluation (space-separated). Line search over these values.")
+    parser.add_argument("--hierarchical-linkage", type=str, default="ward", choices=["ward", "complete", "average", "single"], help="Linkage criterion for hierarchical clustering")
     # ✅ TOPK PARAMETERS
-    parser.add_argument("--topk-k-ratio", type=float, nargs="+", 
-                       default=[0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 5.0, 10.0],
-                       help="K values as ratios of known positives for Top-K analysis")
-    
-    parser.add_argument("--topk-k-values", type=int, nargs="+", 
-                       default=[],
-                       help="Additional absolute K values for Top-K analysis (optional)")
-                       
-    parser.add_argument("--topk-area-percentages", type=float, nargs="+",
-                       default=[0.01, 0.02, 0.05, 0.1, 0.2],
-                       help="Area percentages for Top-K area-based analysis")
-    
+    parser.add_argument("--topk-k-ratio", type=float, nargs="+", default=[0.5, 1.0, 2.0, 4.0, 7.0, 10.0, 15.0, 20.0], help="K values as ratios of known positives for Top-K analysis")
+    parser.add_argument("--topk-k-values", type=int, nargs="+", default=[], help="Additional absolute K values for Top-K analysis (optional)")
+    parser.add_argument("--topk-area-percentages", type=float, nargs="+", default=[0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0], help="Area percentages for Top-K area-based analysis")
     # ✅ PAUC PARAMETERS  
-    parser.add_argument("--pauc-prior-variants", type=float, nargs="+",
-                       default=[0.01, 0.05, 0.1, 0.2, 0.3],
-                       help="Prior probability variants for Proxy AUC correction")
+    parser.add_argument("--pauc-prior-variants", type=float, nargs="+", default=[0.01, 0.05, 0.1, 0.2, 0.3], help="Prior probability variants for Proxy AUC correction")
+    # ✅ PU-based negative meta metrics
+    parser.add_argument("--pu-prior-range", type=float, nargs=2, default=[0.01, 0.05, 0.10, 0.20], help="Min/max class prior assumptions for PU negative metrics.")
+    parser.add_argument("--pu-metric-thresholds", type=float, nargs="+", default=[], help="Optional explicit probability thresholds for PU negative metrics.")
+    parser.add_argument("--pu-metric-threshold-count", type=int, default=25, help="Number of quantile-based thresholds when not specifying --pu-metric-thresholds.")
 
     return parser.parse_args()
 
@@ -223,6 +207,8 @@ def main() -> None:
     config_path = Path(args.config).resolve()
     cfg = load_config(config_path)
     run_logger = _RunLogger(cfg)
+    meta_eval_config = train_cls_PN_base.MetaEvaluationConfig.from_args(args)
+    setattr(args, "_meta_eval_config", meta_eval_config)
 
     if torch is None or nn is None or DataLoader is None:
         raise ImportError("Overlap alignment training requires PyTorch; install torch before running the trainer.")
@@ -289,21 +275,11 @@ def main() -> None:
     debug_mode = bool(args.debug)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Handle legacy drop_rate parameter and new multi-clustering parameters
-    if args.drop_rate is not None:
-        run_logger.log(f"[main] Using legacy drop_rate parameter: {args.drop_rate}")
-        drop_rate = args.drop_rate
-        # Convert to new parameter format for backward compatibility
-        if args.clustering_methods == ["random"] and args.meta_evaluation_n_clusters == [10]:
-            # Only override if using defaults
-            args.meta_evaluation_n_clusters = [int(1 / args.drop_rate)]
-            run_logger.log(f"[main] Converted drop_rate={args.drop_rate} to meta_evaluation_n_clusters={args.meta_evaluation_n_clusters}")
+    # Use first cluster count for legacy compatibility
+    if args.meta_evaluation_n_clusters:
+        drop_rate = 1.0 / args.meta_evaluation_n_clusters[0]
     else:
-        # Use first cluster count for legacy compatibility
-        if args.meta_evaluation_n_clusters:
-            drop_rate = 1.0 / args.meta_evaluation_n_clusters[0]
-        else:
-            drop_rate = 0.1  # Default fallback
+        drop_rate = 0.1  # Default fallback
     
     # Log execution mode for debugging
     is_multi_clustering = (
@@ -373,7 +349,6 @@ def main() -> None:
     tag = create_clean_tag(method_name, encoder_name, data_name)
     train_and_save_result(tag, data_use, action, common, args, cfg, run_logger)
 
-    exit()
 
     ####################################### Train Classifier 1 on target_data (Original)  #######################################
     method_name = "base"
@@ -901,6 +876,8 @@ def train_and_save_result(
     
     # Convert meta_evaluation argument to set
     meta_evaluation_metrics = set(args.meta_evaluation)
+    meta_eval_config = getattr(args, "_meta_eval_config", train_cls_PN_base.MetaEvaluationConfig())
+    run_meta_evaluation = bool(getattr(args, "run_meta_evaluation", True))
     
     # Determine execution mode based on parameters
     is_multi_clustering = (
@@ -921,6 +898,7 @@ def train_and_save_result(
             
             # Check each method-cluster combination for cached predictions
             cached_results = {}
+            config_status: Dict[str, str] = {}
             missing_configs = []
             
             for method in args.clustering_methods:
@@ -934,11 +912,8 @@ def train_and_save_result(
                         common=common,
                         data_use=data_use,
                         run_logger=run_logger,
-                        meta_evaluation_metrics=meta_evaluation_metrics,
-                        pauc_prior_variants=args.pauc_prior_variants,
-                        topk_k_ratio=args.topk_k_ratio,
-                        topk_k_values=args.topk_k_values,
-                        topk_area_percentages=args.topk_area_percentages
+                        run_meta_evaluation=run_meta_evaluation,
+                        meta_eval_config=meta_eval_config,
                     )
                     
                     if cached_result is not None:
@@ -950,15 +925,16 @@ def train_and_save_result(
             
             # Handle cached results individually - save them immediately  
             total_configs = len(args.clustering_methods) * len(args.meta_evaluation_n_clusters)
-            for config_name, result in cached_results.items():
-                method_tag = f"{tag}_{config_name}"
-                train_cls_PN_base.save_meta_evaluation_results(
-                    meta_evaluation=result,
-                    tag_main=method_tag,
-                    common=common,
-                    run_logger=run_logger
-                )
-                run_logger.log(f"[train_and_save_result] ✅ CACHED: {config_name} - saved existing predictions")
+            if run_meta_evaluation:
+                for config_name, result in cached_results.items():
+                    method_tag = f"{tag}_{config_name}"
+                    train_cls_PN_base.save_meta_evaluation_results(
+                        meta_evaluation=result,
+                        tag_main=method_tag,
+                        common=common,
+                        run_logger=run_logger
+                    )
+                    run_logger.log(f"[train_and_save_result] ✅ CACHED: {config_name} - saved existing predictions")
             
             # If all configurations are cached, skip training entirely
             if len(cached_results) == total_configs:
@@ -969,7 +945,8 @@ def train_and_save_result(
                 for config_name, result in cached_results.items():
                     for metric, data in result.items():
                         if isinstance(data, dict) and 'mean' in data:
-                            run_logger.log(f"[train_and_save_result] {config_name} {metric}: {data['mean']:.4f} ± {data['std']:.4f}")
+                            # run_logger.log(f"[train_and_save_result] {config_name} {metric}: {data['mean']:.4f} ± {data['std']:.4f}")
+                            run_logger.log(f"[train_and_save_result] {config_name} {metric}: {data['mean']} ± {data['std']}")
                 run_logger.log(f"[train_and_save_result] ===== END CACHED RESULTS =====")
                 return
             
@@ -1004,10 +981,8 @@ def train_and_save_result(
                 inference_fn=run_inference_base,
                 tag_main=tag,
                 meta_evaluation_metrics=meta_evaluation_metrics,
-                pauc_prior_variants=args.pauc_prior_variants,
-                topk_k_ratio=args.topk_k_ratio,
-                topk_k_values=args.topk_k_values,
-                topk_area_percentages=args.topk_area_percentages
+                run_meta_evaluation=run_meta_evaluation,
+                meta_eval_config=meta_eval_config,
             )
         elif not args.skip_training_if_cached:
             # Train all configurations (no caching)
@@ -1024,10 +999,8 @@ def train_and_save_result(
                 inference_fn=run_inference_base,
                 tag_main=tag,
                 meta_evaluation_metrics=meta_evaluation_metrics,
-                pauc_prior_variants=args.pauc_prior_variants,
-                topk_k_ratio=args.topk_k_ratio,
-                topk_k_values=args.topk_k_values,
-                topk_area_percentages=args.topk_area_percentages
+                run_meta_evaluation=run_meta_evaluation,
+                meta_eval_config=meta_eval_config,
             )
         else:
             # All cached, no training needed
@@ -1036,9 +1009,14 @@ def train_and_save_result(
         # Combine cached and training results for final summary
         if args.skip_training_if_cached and 'cached_results' in locals():
             all_results = {**cached_results, **training_results}
+            for name in cached_results:
+                config_status[name] = "CACHED"
+            for name in training_results:
+                config_status[name] = "TRAINED"
             run_logger.log(f"[train_and_save_result] Combined {len(cached_results)} cached + {len(training_results)} trained = {len(all_results)} total results")
         else:
             all_results = training_results
+            config_status = {name: "TRAINED" for name in training_results}
         
         # Save newly trained results (cached results already saved above)
         for method_cluster_key, result in training_results.items():
@@ -1046,12 +1024,13 @@ def train_and_save_result(
                 method_tag = f"{tag}_{method_cluster_key}"
                 
                 # Save meta evaluation results
-                train_cls_PN_base.save_meta_evaluation_results(
-                    meta_evaluation=result,
-                    tag_main=method_tag,
-                    common=common,
-                    run_logger=run_logger
-                )
+                if run_meta_evaluation:
+                    train_cls_PN_base.save_meta_evaluation_results(
+                        meta_evaluation=result,
+                        tag_main=method_tag,
+                        common=common,
+                        run_logger=run_logger
+                    )
                 
                 # Save full training results
                 save_training_results(
@@ -1065,15 +1044,21 @@ def train_and_save_result(
                 run_logger.log(f"[train_and_save_result] ❌ ERROR in {method_cluster_key}: {result['error']}")
         
         # Final comprehensive summary showing both cached and trained results
-        run_logger.log(f"[train_and_save_result] ===== COMPLETE MULTI-CLUSTERING SUMMARY for {tag} =====")
-        for method_cluster_key, result in all_results.items():
-            if "error" not in result:
-                # Determine if this result was cached or trained
-                status = "CACHED" if (args.skip_training_if_cached and 'cached_results' in locals() and method_cluster_key in cached_results) else "TRAINED"
+        if run_meta_evaluation and all_results:
+            run_logger.log(f"[train_and_save_result] ===== COMPLETE MULTI-CLUSTERING SUMMARY for {tag} =====")
+            metrics_group: Dict[str, List[Tuple[str, str, Dict[str, float]]]] = {}
+            for method_cluster_key, result in all_results.items():
+                if "error" in result:
+                    continue
+                status = config_status.get(method_cluster_key, "TRAINED")
                 for metric, data in result.items():
                     if isinstance(data, dict) and 'mean' in data:
-                        run_logger.log(f"[train_and_save_result] {method_cluster_key} ({status}): {metric}={data['mean']:.4f} ± {data['std']:.4f}")
-        run_logger.log(f"[train_and_save_result] ===== END SUMMARY =====")
+                        metrics_group.setdefault(metric, []).append((method_cluster_key, status, data))
+            for metric_name, entries in metrics_group.items():
+                run_logger.log(f"[train_and_save_result] -- {metric_name} --")
+                # for method_cluster_key, status, data in entries:
+                #     run_logger.log(f"[train_and_save_result] {method_cluster_key} ({status}): {data['mean']:.4f} ± {data['std']:.4f}")
+            run_logger.log(f"[train_and_save_result] ===== END SUMMARY =====")
     
     else:
         # LEGACY MODE: Single method, single cluster count
@@ -1099,11 +1084,8 @@ def train_and_save_result(
                 common=common,
                 data_use=data_use,
                 run_logger=run_logger,
-                meta_evaluation_metrics=meta_evaluation_metrics,
-                pauc_prior_variants=args.pauc_prior_variants,
-                topk_k_ratio=args.topk_k_ratio,
-                topk_k_values=args.topk_k_values,
-                topk_area_percentages=args.topk_area_percentages
+                run_meta_evaluation=run_meta_evaluation,
+                meta_eval_config=meta_eval_config,
             )
             
             # ✅ BACKWARD COMPATIBILITY: Try legacy format if new format fails
@@ -1116,11 +1098,8 @@ def train_and_save_result(
                         common=common,
                         data_use=data_use,
                         run_logger=run_logger,
-                        meta_evaluation_metrics=meta_evaluation_metrics,
-                        pauc_prior_variants=args.pauc_prior_variants,
-                        topk_k_ratio=args.topk_k_ratio,
-                        topk_k_values=args.topk_k_values,
-                        topk_area_percentages=args.topk_area_percentages
+                        run_meta_evaluation=run_meta_evaluation,
+                        meta_eval_config=meta_eval_config,
                     )
                 except TypeError:
                     # Function doesn't support legacy drop_rate parameter
@@ -1130,12 +1109,13 @@ def train_and_save_result(
             run_logger.log(f"[train_and_save_result] ✅ Found cached predictions for '{tag}'")
             
             # Save cached meta evaluation results
-            train_cls_PN_base.save_meta_evaluation_results(
-                meta_evaluation=cached_meta_evaluation,
-                tag_main=tag,
-                common=common,
-                run_logger=run_logger
-            )
+            if run_meta_evaluation:
+                train_cls_PN_base.save_meta_evaluation_results(
+                    meta_evaluation=cached_meta_evaluation,
+                    tag_main=tag,
+                    common=common,
+                    run_logger=run_logger
+                )
             
             run_logger.log(f"[train_and_save_result] Skipping training (cached predictions used)")
             for metric, data in cached_meta_evaluation.items():
@@ -1158,7 +1138,8 @@ def train_and_save_result(
             action=action,
             inference_fn=run_inference_base,
             tag_main=tag,
-            meta_evaluation_metrics=meta_evaluation_metrics
+            run_meta_evaluation=run_meta_evaluation,
+            meta_eval_config=meta_eval_config,
         )
         
         # Save training results
@@ -1170,12 +1151,13 @@ def train_and_save_result(
         )
         
         # Save meta evaluation results
-        train_cls_PN_base.save_meta_evaluation_results(
-            meta_evaluation=result,
-            tag_main=tag,
-            common=common,
-            run_logger=run_logger
-        )
+        if run_meta_evaluation:
+            train_cls_PN_base.save_meta_evaluation_results(
+                meta_evaluation=result,
+                tag_main=tag,
+                common=common,
+                run_logger=run_logger
+            )
         
         run_logger.log(f"[train_and_save_result] Completed training for {tag}")
         for metric, data in result.items():
