@@ -443,6 +443,8 @@ def train_ssl(
         Callable[[int, torch.nn.Module, List[Dict[str, Any]]], None]
     ] = None,
     val_dataloader: Optional[DataLoader] = None,
+    start_epoch: int = 0,
+    history: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[torch.nn.Module, List[Dict[str, float]]]:
     if mask_scope not in {"pixel", "patch"}:
         raise ValueError(f"mask_scope must be 'pixel' or 'patch', received '{mask_scope}'")
@@ -457,15 +459,16 @@ def train_ssl(
     )
     model.train()
 
-    history: List[Dict[str, Any]] = []
+    history_records: List[Dict[str, Any]] = history if history is not None else []
     warned_ssim = False
     skipped_ssim_scalar = False
     skipped_ssim_small_window = False
     last_spatial_shape: Optional[Tuple[int, int]] = None
     checkpoint_epoch_set = {int(epoch) for epoch in checkpoint_epochs} if checkpoint_epochs else set()
-    checkpoint_epoch_set = {
-        epoch for epoch in checkpoint_epoch_set if 1 <= epoch <= max(1, epochs)
-    }
+    start_epoch = max(0, int(start_epoch))
+    total_epochs = max(0, int(epochs))
+    if total_epochs <= 0:
+        return model, history_records
 
     def _save_preview_samples(
         cache: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
@@ -772,12 +775,13 @@ def train_ssl(
 
         return metrics, sample_cache_local, totals["ssim_count"]
 
-    for ep in range(1, epochs + 1):
+    for ep in range(1, total_epochs + 1):
+        global_epoch = start_epoch + ep
         train_metrics, sample_cache, train_ssim_count = _process_epoch(
             dataloader,
             train_mode=True,
             collect_samples=preview_samples > 0 and preview_dir is not None,
-            epoch_idx=ep,
+            epoch_idx=global_epoch,
         )
         if train_metrics is None:
             raise RuntimeError("Training dataloader yielded no batches.")
@@ -812,12 +816,12 @@ def train_ssl(
                 val_dataloader,
                 train_mode=False,
                 collect_samples=False,
-                epoch_idx=ep,
+                epoch_idx=global_epoch,
             )
 
         train_ssim_str = f"{train_metrics['ssim']:.4f}" if train_metrics["ssim"] is not None else "n/a"
         log_msg = (
-            f"[SSL] epoch {ep} "
+            f"[SSL] epoch {global_epoch} "
             f"train_loss={train_metrics['recon_loss']:.4f} "
             f"train_mae={train_metrics['mae']:.4f} "
             f"train_psnr={train_metrics['psnr']:.2f} "
@@ -834,7 +838,7 @@ def train_ssl(
         print(log_msg)
 
         history_entry: Dict[str, Any] = {
-            "epoch": ep,
+            "epoch": global_epoch,
             "train": train_metrics,
             "recon_loss": train_metrics["recon_loss"],
             "mae": train_metrics["mae"],
@@ -847,7 +851,7 @@ def train_ssl(
             history_entry["val_mae"] = val_metrics["mae"]
             history_entry["val_psnr"] = val_metrics["psnr"]
             history_entry["val_ssim"] = val_metrics["ssim"]
-        history.append(history_entry)
+        history_records.append(history_entry)
 
         if preview_samples > 0 and preview_dir is not None and sample_cache:
             # sample_shapes = (
@@ -856,10 +860,10 @@ def train_ssl(
             #     sample_cache[0][2].shape,
             # )
             # print("             [dev] CHECK", *sample_shapes)
-            epoch_prefix = f"epoch_{ep:03d}_ssl_sample"
+            epoch_prefix = f"epoch_{global_epoch:03d}_ssl_sample"
             _save_preview_samples(sample_cache, epoch_prefix)
 
-        if checkpoint_callback is not None and ep in checkpoint_epoch_set:
-            checkpoint_callback(ep, model, history)
+        if checkpoint_callback is not None and global_epoch in checkpoint_epoch_set:
+            checkpoint_callback(global_epoch, model, history_records)
 
-    return model, history
+    return model, history_records

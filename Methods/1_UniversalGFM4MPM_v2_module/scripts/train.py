@@ -83,13 +83,14 @@ from Common.Augmentation import (
     _print_augmentation_usage,
 )
 from Common.Unifying.DCCA import (
-    _format_optional_scalar,
-    _project_in_batches,
     _load_pretrained_dcca_state,
-    _projection_head_from_state,
-    _load_DCCA_projectors,
     _resolve_dcca_weights_path,
     _prepare_output_dir,
+    resolve_dcca_embeddings_and_projectors,
+    _format_optional_scalar,
+    _project_in_batches,
+    _projection_head_from_state,
+    _load_DCCA_projectors,
     _persist_state,
     _persist_metrics,
     _maybe_save_debug_figures,
@@ -101,20 +102,19 @@ from Common.Unifying.DCCA import (
     _compute_dcca_checkpoint_hash,
     _save_dcca_projections,
     _load_dcca_projections,
-    resolve_dcca_embeddings_and_projectors,
 )
 
 # Import transformer-aggregated DCCA components from the new module
 from Common.Unifying.DCCA.method1_phi_TransAgg import (
+    build_phi,
+    build_cls2_dataset_from_dcca_pairs,
     PNHeadUnified,
     CrossAttentionAggregator, 
     AggregatorTargetHead,
-    build_phi,
     cosine_sim,
     fit_unified_head_OVERLAP_from_uv,
     _train_transformer_aggregator,
     run_overlap_inference_gAB_from_pairs,
-    build_cls2_dataset_from_dcca_pairs,
     TargetSetDataset,
     PUBatchSampler,
     _collate_target_sets,
@@ -168,15 +168,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mlp-dropout", type=float, default=0.2, help="Dropout probability applied to classifier MLP layers.", )
     parser.add_argument("--mlp-dropout-passes", type=int, default=5, help="Number of Monte Carlo dropout passes for uncertainty estimation in classifier inference.", )
 
-    parser.add_argument("--read-inference", action=argparse.BooleanOptionalAction, default=False, help="Read inference on aligned datasets after training (default: false).",)
+    # parser.add_argument("--read-inference", action=argparse.BooleanOptionalAction, default=False, help="Read inference on aligned datasets after training (default: false).",)
     
     parser.add_argument("--skip-training-if-cached", action="store_true", help="Skip training if cached predictions are found and compute Meta_Evaluation from cached results.")
 
     # Meta-evaluation parameters
     parser.add_argument("--meta-evaluation", type=str, nargs="+", default=["PosDrop_Acc", "Focus", "topk", "pauc", "pu_tpr", "pu_fpr", "pu_npv", "background_rejection"], help="Meta-evaluation metrics to compute (space-separated). Available: PosDrop_Acc, Focus, topk, pauc")
     parser.add_argument("--run-meta-evaluation", action=argparse.BooleanOptionalAction, default=True, help="Enable meta-evaluation metric computation.")
-    # Legacy drop-rate parameter for backward compatibility
-    # parser.add_argument("--drop-rate", type=float, default=None, help="Legacy parameter - use --meta-evaluation-n-clusters instead")
     # ✅ Multi-clustering arguments
     parser.add_argument("--clustering-methods", type=str, nargs="+", default=["random", "kmeans", "hierarchical"], choices=["random", "kmeans", "hierarchical"], help="Clustering methods for positive dropping (space-separated). Available: random, kmeans, hierarchical")
     parser.add_argument("--meta-evaluation-n-clusters", type=int, nargs="+", default=[2, 3, 4, 5, 6, 7, 8, 10], help="Number of clusters/iterations for meta-evaluation (space-separated). Line search over these values.")
@@ -206,7 +204,11 @@ def main() -> None:
     args = parse_args()
     config_path = Path(args.config).resolve()
     cfg = load_config(config_path)
-    run_logger = _RunLogger(cfg)
+    if args.debug:
+        run_logger = _RunLogger(cfg)
+    else:
+        run_logger = None
+        
     meta_eval_config = train_cls_PN_base.MetaEvaluationConfig.from_args(args)
     setattr(args, "_meta_eval_config", meta_eval_config)
 
@@ -327,6 +329,35 @@ def main() -> None:
     # unified_overlap_data = Unifying_METHOD1_PHI_OverlapOnly(overlap_info, device, run_logger, batch_size=1000)
     # overlap_info_pair_metadata_only = get_overlap_info_pair_metadata_only(cfg, args, device, run_logger)
 
+
+    ####################################### Train METHOD3 (shared; using KL; overlap) classifier #######################################
+    method_name = "M3_Uni_KL_Overlap"
+    data_name = f"{anchor_name}_{target_name}"
+    encoder_name = "Shared_MAEViT_plus_TransDCCA"
+
+    # Grab original + DCCA embeddings for both datasets, restricted to overlap
+    anchor_original = get_original_dataset_for_training(cfg=cfg, dataset_name=anchor_name, run_logger=run_logger)
+    anchor_original = extract_overlap_only_using_masks(anchor_original, overlap_info["mask"], run_logger=run_logger)
+    anchor_dcca = extract_overlap_only_using_masks(dcca_sets[anchor_name], overlap_info["mask"], run_logger=run_logger)
+
+    target_original = get_original_dataset_for_training(cfg=cfg, dataset_name=target_name, run_logger=run_logger)
+    target_original = extract_overlap_only_using_masks(target_original, overlap_info["mask"], run_logger=run_logger)
+    target_dcca = extract_overlap_only_using_masks(dcca_sets[target_name], overlap_info["mask"], run_logger=run_logger)
+
+    data_use = Unifying_METHOD3_Uni_KL_Overlap(
+        anchor_original=anchor_original,
+        target_original=target_original,
+        anchor_dcca=anchor_dcca,
+        target_dcca=target_dcca,
+        overlap_info=overlap_info,
+        run_logger=run_logger,
+        lambda_consistency=1.0,  # adjust/add CLI arg if you want this tunable
+    )
+
+    action = None
+    tag = create_clean_tag(method_name, encoder_name, data_name)
+    train_and_save_result(tag, data_use, action, common, args, cfg, run_logger)
+    exit()
 
     ####################################### Train on target [z_b | u_b] #######################################
     method_name = "Method2_concat"
@@ -693,6 +724,211 @@ def Unifying_METHOD2_concat_two_embeddings(
         'source_type': 'original_plus_dcca',
     }   
 
+
+def Unifying_METHOD3_Uni_KL_Overlap(
+    anchor_original: Dict[str, object],
+    target_original: Dict[str, object],
+    anchor_dcca: Dict[str, object],
+    target_dcca: Dict[str, object],
+    overlap_info: Dict[str, object],
+    run_logger: "_RunLogger",
+    *,
+    lambda_consistency: float = 1.0,
+) -> Dict[str, object]:
+    """
+    Build a unified overlap dataset that concatenates [z | u] for both anchor and target
+    samples and keeps track of overlapping pairs for the KL consistency term.
+
+    Returns a dictionary containing the combined features/labels plus metadata needed
+    by the shared classifier (domain ids + overlap pair indices).
+    """
+
+    def _ensure_tensor(data: object, label: str) -> torch.Tensor:
+        if isinstance(data, torch.Tensor):
+            return data.float()
+        if isinstance(data, np.ndarray):
+            return torch.from_numpy(data).float()
+        raise TypeError(f"Unsupported {label} type {type(data)!r}; expected numpy array or torch tensor.")
+
+    def _coord_key(coord: Optional[Sequence[float]]) -> Optional[Tuple[float, float]]:
+        if coord is None:
+            return None
+        if isinstance(coord, (list, tuple)) and len(coord) >= 2:
+            try:
+                return (round(float(coord[0]), 6), round(float(coord[1]), 6))
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _normalise_coords(coords_obj: object, expected_len: int) -> List[Tuple[float, float]]:
+        coords_list: List[Tuple[float, float]] = []
+        if isinstance(coords_obj, np.ndarray):
+            coords_list = [tuple(map(float, row[:2])) for row in coords_obj]
+        elif isinstance(coords_obj, (list, tuple)):
+            for entry in coords_obj:
+                if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                    try:
+                        coords_list.append((float(entry[0]), float(entry[1])))
+                    except (TypeError, ValueError):
+                        coords_list.append((0.0, 0.0))
+                else:
+                    coords_list.append((0.0, 0.0))
+        if not coords_list:
+            coords_list = [(0.0, 0.0)] * expected_len
+        if len(coords_list) < expected_len:
+            coords_list.extend([(0.0, 0.0)] * (expected_len - len(coords_list)))
+        return coords_list[:expected_len]
+
+    # Convert anchor features
+    anchor_z = _ensure_tensor(anchor_original.get('features'), 'anchor features (z)')
+    anchor_u = _ensure_tensor(anchor_dcca.get('features'), 'anchor DCCA features (u)')
+    target_z = _ensure_tensor(target_original.get('features'), 'target features (z)')
+    target_u = _ensure_tensor(target_dcca.get('features'), 'target DCCA features (u)')
+
+    if anchor_z.shape[0] != anchor_u.shape[0]:
+        raise ValueError(f"Anchor feature mismatch: z has {anchor_z.shape[0]} samples but u has {anchor_u.shape[0]}.")
+    if target_z.shape[0] != target_u.shape[0]:
+        raise ValueError(f"Target feature mismatch: z has {target_z.shape[0]} samples but u has {target_u.shape[0]}.")
+
+    anchor_features = torch.cat([anchor_z, anchor_u], dim=1)
+    target_features = torch.cat([target_z, target_u], dim=1)
+
+    run_logger.log(f"[M3_Uni_KL_Overlap] anchor concat: {anchor_z.shape[1]} + {anchor_u.shape[1]} -> {anchor_features.shape[1]}")
+    run_logger.log(f"[M3_Uni_KL_Overlap] target concat: {target_z.shape[1]} + {target_u.shape[1]} -> {target_features.shape[1]}")
+
+    def _prepare_labels(source: Dict[str, object], label_name: str) -> np.ndarray:
+        labels = source.get('labels')
+        if labels is None:
+            raise ValueError(f"{label_name} missing labels for shared classifier.")
+        if isinstance(labels, torch.Tensor):
+            return labels.cpu().numpy()
+        if isinstance(labels, np.ndarray):
+            return labels
+        return np.asarray(labels)
+
+    anchor_labels = _prepare_labels(anchor_original, 'anchor_original')
+    target_labels = _prepare_labels(target_original, 'target_original')
+
+    if len(anchor_labels) != anchor_features.shape[0]:
+        raise ValueError("Anchor labels size does not match features.")
+    if len(target_labels) != target_features.shape[0]:
+        raise ValueError("Target labels size does not match features.")
+
+    anchor_coords = _normalise_coords(anchor_original.get('coords', anchor_original.get('coordinates', [])), anchor_features.shape[0])
+    target_coords = _normalise_coords(target_original.get('coords', target_original.get('coordinates', [])), target_features.shape[0])
+    anchor_indices = anchor_original.get('indices')
+    target_indices = target_original.get('indices')
+
+    # Combine datasets
+    combined_features = torch.cat([anchor_features, target_features], dim=0).cpu().numpy()
+    combined_labels = np.concatenate([anchor_labels, target_labels], axis=0)
+    domain_ids = np.concatenate(
+        [
+            np.zeros(anchor_features.shape[0], dtype=np.int32),
+            np.ones(target_features.shape[0], dtype=np.int32),
+        ],
+        axis=0,
+    )
+
+    combined_coords: List[Tuple[float, float]] = []
+    combined_coords.extend(anchor_coords)
+    combined_coords.extend(target_coords)
+
+    # Map coordinates/indices to dataset positions for overlap consistency lookups
+    anchor_coord_map: Dict[Tuple[float, float], int] = {}
+    for idx, coord in enumerate(anchor_coords):
+        key = _coord_key(coord)
+        if key is not None and key not in anchor_coord_map:
+            anchor_coord_map[key] = idx
+    anchor_index_map: Dict[int, int] = {}
+    if isinstance(anchor_indices, (list, tuple, np.ndarray)):
+        for idx, value in enumerate(anchor_indices):
+            try:
+                anchor_index_map[int(value)] = idx
+            except Exception:
+                continue
+
+    target_coord_map: Dict[Tuple[float, float], int] = {}
+    for idx, coord in enumerate(target_coords):
+        key = _coord_key(coord)
+        if key is not None and key not in target_coord_map:
+            target_coord_map[key] = idx
+    target_index_map: Dict[int, int] = {}
+    if isinstance(target_indices, (list, tuple, np.ndarray)):
+        for idx, value in enumerate(target_indices):
+            try:
+                target_index_map[int(value)] = idx
+            except Exception:
+                continue
+
+    pair_metadata = []
+    if overlap_info:
+        pair_metadata = overlap_info.get('pair_metadata', []) or []
+    consistency_pairs: List[Tuple[int, int]] = []
+    seen_pairs: set[Tuple[int, int]] = set()
+    for entry in pair_metadata:
+        meta_anchor_index = entry.get('anchor_index')
+        anchor_idx = None
+        if meta_anchor_index is not None and anchor_index_map:
+            try:
+                anchor_idx = anchor_index_map.get(int(meta_anchor_index))
+            except Exception:
+                anchor_idx = None
+        if anchor_idx is None:
+            anchor_coord = entry.get('anchor_coord') or entry.get('anchor_coordinate')
+            anchor_idx = anchor_coord_map.get(_coord_key(anchor_coord))
+        if anchor_idx is None:
+            continue
+
+        candidate_target_positions: List[int] = []
+        target_idx_list = entry.get('target_indices') or []
+        if target_index_map and target_idx_list:
+            for raw_idx in target_idx_list:
+                try:
+                    mapped = target_index_map.get(int(raw_idx))
+                except Exception:
+                    mapped = None
+                if mapped is not None:
+                    candidate_target_positions.append(mapped)
+        if not candidate_target_positions:
+            # Fall back to per-target coordinates or weighted coord
+            for coord in entry.get('target_coords', []):
+                mapped = target_coord_map.get(_coord_key(coord))
+                if mapped is not None:
+                    candidate_target_positions.append(mapped)
+            if not candidate_target_positions:
+                target_coord = entry.get('target_weighted_coord')
+                mapped = target_coord_map.get(_coord_key(target_coord))
+                if mapped is not None:
+                    candidate_target_positions.append(mapped)
+
+        if not candidate_target_positions:
+            continue
+
+        global_anchor_idx = anchor_idx
+        for target_idx in candidate_target_positions:
+            global_target_idx = anchor_features.shape[0] + target_idx
+            pair = (global_anchor_idx, global_target_idx)
+            if pair not in seen_pairs:
+                seen_pairs.add(pair)
+                consistency_pairs.append(pair)
+
+    run_logger.log(f"[M3_Uni_KL_Overlap] prepared {len(consistency_pairs)} overlap pairs for KL consistency.")
+
+    return {
+        'features': combined_features,
+        'labels': combined_labels,
+        'coords': combined_coords,
+        'domain_ids': domain_ids,
+        'consistency_pairs': consistency_pairs,
+        'lambda_consistency': float(lambda_consistency),
+        'feature_type': 'shared_concat_z_u',
+        'source_type': 'M3_Uni_KL_Overlap',
+        'anchor_samples': anchor_features.shape[0],
+        'target_samples': target_features.shape[0],
+    }
+
+
 def _substitute_label_overlap_constrained(
     data: Dict[str, object],
     label_source: Dict[str, object],
@@ -878,96 +1114,108 @@ def train_and_save_result(
     meta_evaluation_metrics = set(args.meta_evaluation)
     meta_eval_config = getattr(args, "_meta_eval_config", train_cls_PN_base.MetaEvaluationConfig())
     run_meta_evaluation = bool(getattr(args, "run_meta_evaluation", True))
+    source_type = data_use.get("source_type")
+    is_method3 = source_type == "M3_Uni_KL_Overlap"
     
     # Determine execution mode based on parameters
-    is_multi_clustering = (
+    multi_clustering_requested = (
         len(args.clustering_methods) > 1 or 
         len(args.meta_evaluation_n_clusters) > 1 or
         args.clustering_methods != ["random"]
     )
-    
-    if is_multi_clustering:
-        run_logger.log(f"[train_and_save_result] MULTI-CLUSTERING MODE for '{tag}'")
+
+    # METHOD3 always reuses the multi-configuration path even when only a single
+    # clustering config is supplied, so track that explicitly to avoid confusion.
+    force_multi_for_method3 = is_method3
+    use_multi_clustering = multi_clustering_requested or force_multi_for_method3
+
+    if use_multi_clustering:
+        if is_method3:
+            run_logger.log(f"[train_and_save_result] METHOD3 (shared overlap) multi-configuration mode for '{tag}'")
+        else:
+            run_logger.log(f"[train_and_save_result] MULTI-CLUSTERING MODE for '{tag}'")
         run_logger.log(f"[train_and_save_result] Methods: {args.clustering_methods}")
         run_logger.log(f"[train_and_save_result] Cluster counts: {args.meta_evaluation_n_clusters}")
         run_logger.log(f"[train_and_save_result] Hierarchical linkage: {args.hierarchical_linkage}")
-        
+
+        supports_caching = not is_method3
+        cached_results = {}
+        config_status: Dict[str, str] = {}
+        missing_configs: List[Dict[str, object]] = []
+
         # ✅ CHECK FOR CACHED RESULTS FIRST (multi-clustering)
         if args.skip_training_if_cached:
             run_logger.log(f"[train_and_save_result] Checking for cached multi-clustering results...")
-            
-            # Check each method-cluster combination for cached predictions
-            cached_results = {}
-            config_status: Dict[str, str] = {}
-            missing_configs = []
-            
-            for method in args.clustering_methods:
-                for n_clusters in args.meta_evaluation_n_clusters:
-                    config_name = f"{method}{n_clusters}"
-                    
-                    cached_result = train_cls_PN_base.load_and_evaluate_existing_predictions(
-                        tag_main=tag,
-                        meta_evaluation_n_clusters=n_clusters,
-                        clustering_method=method,
-                        common=common,
-                        data_use=data_use,
-                        run_logger=run_logger,
-                        run_meta_evaluation=run_meta_evaluation,
-                        meta_eval_config=meta_eval_config,
-                    )
-                    
-                    if cached_result is not None:
-                        cached_results[config_name] = cached_result
-                        run_logger.log(f"[train_and_save_result] ✅ Found cached predictions for {config_name}")
-                    else:
-                        missing_configs.append({'method': method, 'n_clusters': n_clusters, 'name': config_name})
-                        run_logger.log(f"[train_and_save_result] ❌ No cached predictions for {config_name}")
-            
-            # Handle cached results individually - save them immediately  
-            total_configs = len(args.clustering_methods) * len(args.meta_evaluation_n_clusters)
-            if run_meta_evaluation:
-                for config_name, result in cached_results.items():
-                    method_tag = f"{tag}_{config_name}"
-                    train_cls_PN_base.save_meta_evaluation_results(
-                        meta_evaluation=result,
-                        tag_main=method_tag,
-                        common=common,
-                        run_logger=run_logger
-                    )
-                    run_logger.log(f"[train_and_save_result] ✅ CACHED: {config_name} - saved existing predictions")
-            
-            # If all configurations are cached, skip training entirely
-            if len(cached_results) == total_configs:
-                run_logger.log(f"[train_and_save_result] ✅ All {total_configs} configurations cached, no training needed")
-                
-                # Log summary of cached results
-                run_logger.log(f"[train_and_save_result] ===== CACHED MULTI-CLUSTERING RESULTS =====")
-                for config_name, result in cached_results.items():
-                    for metric, data in result.items():
-                        if isinstance(data, dict) and 'mean' in data:
-                            # run_logger.log(f"[train_and_save_result] {config_name} {metric}: {data['mean']:.4f} ± {data['std']:.4f}")
-                            run_logger.log(f"[train_and_save_result] {config_name} {metric}: {data['mean']} ± {data['std']}")
-                run_logger.log(f"[train_and_save_result] ===== END CACHED RESULTS =====")
-                return
-            
-            # Selective training: only train missing configurations
-            run_logger.log(f"[train_and_save_result] CACHE SUMMARY: {len(cached_results)} cached, {len(missing_configs)} to train (total: {total_configs})")
-            
-            # Filter methods and clusters to only include missing ones
+            if supports_caching:
+                for method in args.clustering_methods:
+                    for n_clusters in args.meta_evaluation_n_clusters:
+                        config_name = f"{method}{n_clusters}"
+
+                        cached_result = train_cls_PN_base.load_and_evaluate_existing_predictions(
+                            tag_main=tag,
+                            meta_evaluation_n_clusters=n_clusters,
+                            clustering_method=method,
+                            common=common,
+                            data_use=data_use,
+                            run_logger=run_logger,
+                            run_meta_evaluation=run_meta_evaluation,
+                            meta_eval_config=meta_eval_config,
+                        )
+
+                        if cached_result is not None:
+                            cached_results[config_name] = cached_result
+                            run_logger.log(f"[train_and_save_result] ✅ Found cached predictions for {config_name}")
+                        else:
+                            missing_configs.append({'method': method, 'n_clusters': n_clusters, 'name': config_name})
+                            run_logger.log(f"[train_and_save_result] ❌ No cached predictions for {config_name}")
+
+                total_configs = len(args.clustering_methods) * len(args.meta_evaluation_n_clusters)
+                if run_meta_evaluation:
+                    for config_name, result in cached_results.items():
+                        method_tag = f"{tag}_{config_name}"
+                        train_cls_PN_base.save_meta_evaluation_results(
+                            meta_evaluation=result,
+                            tag_main=method_tag,
+                            common=common,
+                            run_logger=run_logger
+                        )
+                        run_logger.log(f"[train_and_save_result] ✅ CACHED: {config_name} - saved existing predictions")
+
+                if len(cached_results) == total_configs:
+                    run_logger.log(f"[train_and_save_result] ✅ All {total_configs} configurations cached, no training needed")
+                    run_logger.log(f"[train_and_save_result] ===== CACHED MULTI-CLUSTERING RESULTS =====")
+                    for config_name, result in cached_results.items():
+                        for metric, data in result.items():
+                            if isinstance(data, dict) and 'mean' in data:
+                                run_logger.log(f"[train_and_save_result] {config_name} {metric}: {data['mean']} ± {data['std']}")
+                    run_logger.log(f"[train_and_save_result] ===== END CACHED RESULTS =====")
+                    return
+
+                if missing_configs:
+                    run_logger.log(f"[train_and_save_result] CACHE SUMMARY: {len(cached_results)} cached, {len(missing_configs)} to train (total: {total_configs})")
+                methods_to_train = list(set(config['method'] for config in missing_configs))
+                clusters_to_train = list(set(config['n_clusters'] for config in missing_configs))
+            else:
+                run_logger.log("[train_and_save_result] Caching not supported for METHOD3; training all configurations.")
+                missing_configs = [
+                    {'method': method, 'n_clusters': n_clusters, 'name': f"{method}{n_clusters}"}
+                    for method in args.clustering_methods
+                    for n_clusters in args.meta_evaluation_n_clusters
+                ]
+                methods_to_train = list(set(config['method'] for config in missing_configs))
+                clusters_to_train = list(set(config['n_clusters'] for config in missing_configs))
+        else:
+            missing_configs = [
+                {'method': method, 'n_clusters': n_clusters, 'name': f"{method}{n_clusters}"}
+                for method in args.clustering_methods
+                for n_clusters in args.meta_evaluation_n_clusters
+            ]
             methods_to_train = list(set(config['method'] for config in missing_configs))
             clusters_to_train = list(set(config['n_clusters'] for config in missing_configs))
-            
-            run_logger.log(f"[train_and_save_result] Methods to train: {methods_to_train}")
-            run_logger.log(f"[train_and_save_result] Clusters to train: {clusters_to_train}")
-            
-        else:
-            # No caching - train everything
-            methods_to_train = args.clustering_methods
-            clusters_to_train = args.meta_evaluation_n_clusters
             run_logger.log(f"[train_and_save_result] No caching - training all configurations")
-        
-        # Execute multi-clustering training (only for missing configurations if caching enabled)
-        if args.skip_training_if_cached and 'methods_to_train' in locals() and len(missing_configs) > 0:
+
+        training_results = {}
+        if missing_configs:
             training_results = train_cls_PN_base.train_cls_1_PN_PosDrop_MultiClustering(
                 clustering_methods=methods_to_train,
                 meta_evaluation_n_clusters_list=clusters_to_train,
@@ -984,27 +1232,6 @@ def train_and_save_result(
                 run_meta_evaluation=run_meta_evaluation,
                 meta_eval_config=meta_eval_config,
             )
-        elif not args.skip_training_if_cached:
-            # Train all configurations (no caching)
-            training_results = train_cls_PN_base.train_cls_1_PN_PosDrop_MultiClustering(
-                clustering_methods=args.clustering_methods,
-                meta_evaluation_n_clusters_list=args.meta_evaluation_n_clusters,
-                linkage=args.hierarchical_linkage,
-                seed=seed,
-                common={**common, 'verbose': False},
-                data_use=data_use,
-                filter_top_pct=args.filter_top_pct,
-                negs_per_pos=args.negs_per_pos,
-                action=action,
-                inference_fn=run_inference_base,
-                tag_main=tag,
-                meta_evaluation_metrics=meta_evaluation_metrics,
-                run_meta_evaluation=run_meta_evaluation,
-                meta_eval_config=meta_eval_config,
-            )
-        else:
-            # All cached, no training needed
-            training_results = {}
         
         # Combine cached and training results for final summary
         if args.skip_training_if_cached and 'cached_results' in locals():
@@ -1022,7 +1249,7 @@ def train_and_save_result(
         for method_cluster_key, result in training_results.items():
             if "error" not in result:
                 method_tag = f"{tag}_{method_cluster_key}"
-                
+
                 # Save meta evaluation results
                 if run_meta_evaluation:
                     train_cls_PN_base.save_meta_evaluation_results(
@@ -1031,7 +1258,7 @@ def train_and_save_result(
                         common=common,
                         run_logger=run_logger
                     )
-                
+
                 # Save full training results
                 save_training_results(
                     result=result,

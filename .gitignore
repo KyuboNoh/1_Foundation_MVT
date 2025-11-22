@@ -5,3 +5,5 @@
 outputs/
 # large binaries
 *.pth
+
+f21_dim1024_patch3_window18/

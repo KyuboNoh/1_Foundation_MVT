@@ -13,7 +13,7 @@ import json
 import math
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any, Callable, Set
+from typing import Dict, List, Optional, Tuple, Any, Callable, Set, Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -202,6 +202,7 @@ def train_base_classifier(
     mlp_dropout = common['mlp_dropout']
     debug_mode = common.get('debug_mode', False)
     run_logger = common.get('run_logger', None)
+    seed_value = int(common.get('seed', getattr(cfg, 'seed', 42)))
     
     # Phase 1: Create DataLoaders
     dl_tr, dl_va, metrics_summary_append = dataloader_metric_inputORembedding(
@@ -357,10 +358,25 @@ def train_cls_1_PN(
     
     neg_idx_arr = np.asarray(neg_idx_region, dtype=int)
     
+    if data_use.get('source_type') == "M3_Uni_KL_Overlap":
+        return _train_method3_with_pn_selection(
+            data_use=data_use,
+            features=features,
+            filter_top_pct=filter_top_pct,
+            negs_per_pos=negs_per_pos,
+            active_pos_idx=pos_idx,
+            all_pos_idx=pos_idx,
+            domain_distance_dirs=None,
+            common=common,
+            cfg=cfg,
+            inference_fn=inference_fn,
+            tag=tag,
+        )
+
     # Phase 2: Create Balanced P+N Dataset
     pn_indices = np.concatenate([pos_idx_arr, neg_idx_arr], axis=0)
     inf_indices = np.setdiff1d(np.arange(len(features)), pn_indices)
-    
+
     # Extract features and labels for P+N
     features_pn = features[pn_indices]
     yA_pn = torch.where(
@@ -368,25 +384,25 @@ def train_cls_1_PN(
         1,  # Positive
         0   # Negative (0 for BCE loss)
     ).long()
-    
+
     # Phase 3: Train/Val Split on P+N
     val_frac = max(0.0, min(cfg.cls_training.validation_fraction, 0.9))
     total_pn = len(pn_indices)
     val_count = int(total_pn * val_frac)
-    
+
     gen = torch.Generator()
-    gen.manual_seed(int(cfg.seed))
+    gen.manual_seed(seed_value)
     indices_pn = torch.randperm(total_pn, generator=gen)
-    
+
     val_indices_pn = indices_pn[:val_count].tolist()
     train_indices_pn = indices_pn[val_count:].tolist()
-    
+
     # Create train/val data
     Xtr = features_pn[train_indices_pn]
     ytr = yA_pn[train_indices_pn]
     Xval = features_pn[val_indices_pn]
     yval = yA_pn[val_indices_pn]
-    
+
     # Phase 4: Train the classifier using the base training function
     results = train_base_classifier(
         Xtr=Xtr,
@@ -398,15 +414,202 @@ def train_cls_1_PN(
         inference_fn=inference_fn,
         pos_crd_plot=pos_crd_plot
     )
-    
+
     # Add PN-specific information to results
     results.update({
         'pos_crd_plot': pos_crd_plot,
         'pn_indices': pn_indices,
         'inf_indices': inf_indices,
     })
-    
+
     return results
+
+
+def _train_method3_with_pn_selection(
+    *,
+    data_use: Dict[str, Any],
+    features: torch.Tensor,
+    filter_top_pct: float,
+    negs_per_pos: int,
+    active_pos_idx: Sequence[int],
+    all_pos_idx: Sequence[int],
+    domain_distance_dirs: Optional[Dict[int, Path]],
+    common: Dict[str, Any],
+    cfg,
+    inference_fn: Optional[callable],
+    tag: Optional[str],
+) -> Dict[str, Any]:
+    device = common['device']
+    run_logger = common.get('run_logger')
+
+    domain_ids = data_use.get('domain_ids')
+    if domain_ids is None:
+        raise ValueError("Method3 dataset missing 'domain_ids'.")
+    domain_ids = np.asarray(domain_ids)
+
+    labels = data_use.get('labels')
+    if isinstance(labels, torch.Tensor):
+        labels_np = labels.detach().cpu().numpy()
+    elif isinstance(labels, np.ndarray):
+        labels_np = labels
+    else:
+        labels_np = np.asarray(labels)
+
+    features_np = features.detach().cpu().numpy()
+    allowed_pos_idx = [int(idx) for idx in all_pos_idx if labels_np[int(idx)] > 0]
+    active_pos_idx = [int(idx) for idx in active_pos_idx if labels_np[int(idx)] > 0]
+    unlabeled_idx = np.where(labels_np <= 0)[0].tolist()
+
+    per_domain_negs = max(1, int(negs_per_pos * 0.5))
+
+    def _build_domain_subset(domain_value: int):
+        domain_mask = domain_ids == domain_value
+        domain_pos_all = [idx for idx in allowed_pos_idx if domain_mask[idx]]
+        if not domain_pos_all:
+            return None
+        domain_pos_active = [idx for idx in active_pos_idx if domain_mask[idx]]
+        if not domain_pos_active:
+            return None
+        domain_unl = [idx for idx in unlabeled_idx if domain_mask[idx]]
+        if not domain_unl:
+            domain_unl = [idx for idx in np.where(domain_mask)[0] if idx not in domain_pos_all]
+        if not domain_unl:
+            return None
+        if domain_distance_dirs is not None and domain_value in domain_distance_dirs:
+            neg_idx = pu_select_negatives_from_individual_distances(
+                individual_distances_dir=domain_distance_dirs[domain_value],
+                all_pos_idx=np.asarray(domain_pos_all, dtype=int),
+                unk_idx=np.asarray(domain_unl, dtype=int),
+                active_pos_idx=np.asarray(domain_pos_active, dtype=int),
+                filter_top_pct=filter_top_pct,
+                negatives_per_pos=per_domain_negs,
+            )
+        else:
+            neg_idx = pu_select_negatives(
+                Z_all=features_np,
+                pos_idx=np.asarray(domain_pos_active, dtype=int),
+                unk_idx=np.asarray(domain_unl, dtype=int),
+                filter_top_pct=filter_top_pct,
+                negatives_per_pos=per_domain_negs,
+                tag=f"method3_domain{domain_value}"
+            )
+        pn_idx = np.concatenate([np.asarray(domain_pos_active, dtype=int), np.asarray(neg_idx, dtype=int)])
+        labels_domain = np.zeros(len(pn_idx), dtype=np.int64)
+        labels_domain[:len(domain_pos_active)] = 1
+        return pn_idx, labels_domain
+
+    anchor_subset = _build_domain_subset(0)
+    target_subset = _build_domain_subset(1)
+
+    if anchor_subset is None or target_subset is None:
+        raise RuntimeError("Method3 requires positives for both anchor and target domains after PU selection.")
+
+    anchor_indices, anchor_labels = anchor_subset
+    target_indices, target_labels = target_subset
+    combined_indices = np.concatenate([anchor_indices, target_indices])
+    combined_labels = np.concatenate([anchor_labels, target_labels])
+    domain_flags = np.concatenate([
+        np.zeros(len(anchor_indices), dtype=np.int64),
+        np.ones(len(target_indices), dtype=np.int64),
+    ])
+
+    index_tensor = torch.tensor(combined_indices, dtype=torch.long, device=device)
+    features_selected = features.index_select(0, index_tensor)
+    labels_tensor = torch.from_numpy(combined_labels).float().to(device)
+    domain_tensor = torch.from_numpy(domain_flags).long().to(device)
+
+    index_lookup = {int(orig_idx): new_pos for new_pos, orig_idx in enumerate(combined_indices)}
+    consistency_pairs = data_use.get('consistency_pairs', [])
+    pair_index = []
+    for anchor_idx, target_idx in consistency_pairs:
+        mapped_anchor = index_lookup.get(int(anchor_idx))
+        mapped_target = index_lookup.get(int(target_idx))
+        if mapped_anchor is not None and mapped_target is not None:
+            pair_index.append((mapped_anchor, mapped_target))
+    pair_index_tensor = (
+        torch.tensor(pair_index, dtype=torch.long, device=device)
+        if pair_index else
+        torch.empty((0, 2), dtype=torch.long, device=device)
+    )
+
+    lambda_consistency = float(data_use.get('lambda_consistency', 1.0))
+    in_dim = features_selected.shape[1]
+    cls = MLPDropout(in_dim=in_dim, hidden_dims=common['mlp_hidden_dims'], p=float(common['mlp_dropout'])).to(device)
+    optimizer = torch.optim.AdamW(cls.parameters(), lr=float(getattr(cfg.cls_training, "lr", 1e-3)))
+    bce = torch.nn.BCELoss()
+
+    history: List[Dict[str, float]] = []
+    epochs = int(getattr(cfg.cls_training, "epochs", 50))
+    for epoch in range(1, epochs + 1):
+        cls.train()
+        optimizer.zero_grad()
+        preds = cls(features_selected).view(-1)
+
+        anchor_mask = domain_tensor == 0
+        target_mask = domain_tensor == 1
+        loss_anchor = bce(preds[anchor_mask], labels_tensor[anchor_mask]) if anchor_mask.any() else torch.tensor(0.0, device=device)
+        loss_target = bce(preds[target_mask], labels_tensor[target_mask]) if target_mask.any() else torch.tensor(0.0, device=device)
+
+        loss_cons = torch.tensor(0.0, device=device)
+        if pair_index_tensor.numel() > 0:
+            pa = torch.clamp(preds[pair_index_tensor[:, 0]], 1e-6, 1 - 1e-6)
+            pb = torch.clamp(preds[pair_index_tensor[:, 1]], 1e-6, 1 - 1e-6)
+            loss_cons = (pa * torch.log(pa / pb) + (1 - pa) * torch.log((1 - pa) / (1 - pb))).mean()
+
+        total_loss = loss_anchor + loss_target + lambda_consistency * loss_cons
+        total_loss.backward()
+        optimizer.step()
+
+        history.append({
+            'epoch': epoch,
+            'loss_total': float(total_loss.item()),
+            'loss_anchor': float(loss_anchor.item()),
+            'loss_target': float(loss_target.item()),
+            'loss_consistency': float(loss_cons.item()),
+        })
+
+    cls.eval()
+    with torch.no_grad():
+        final_preds = cls(features_selected).view(-1)
+
+    def _binary_accuracy(mask: torch.Tensor):
+        if not mask.any():
+            return None
+        binary = (final_preds[mask] >= 0.5).float()
+        truth = labels_tensor[mask]
+        return float((binary == truth).float().mean().item())
+
+    metrics_summary = {
+        'anchor_accuracy': _binary_accuracy(domain_tensor == 0),
+        'target_accuracy': _binary_accuracy(domain_tensor == 1),
+        'overall_accuracy': float(((final_preds >= 0.5).float() == labels_tensor).float().mean().item()),
+        'lambda_consistency': lambda_consistency,
+        'num_pairs': len(pair_index),
+    }
+
+    inference_result = None
+    if inference_fn is not None:
+        inference_result = inference_fn(
+            samples=data_use,
+            cls=cls,
+            device=device,
+            output_dir=Path(cfg.output_dir) / "cls_1_training_results" / "All",
+            run_logger=run_logger,
+            passes=common.get('mlp_dropout_passes', 5),
+            pos_crd=None,
+            tag=tag,
+            save_coordinates=False,
+        )
+
+    return {
+        'cls': cls,
+        'epoch_history': history,
+        'inference_result': inference_result,
+        'metrics_summary': metrics_summary,
+        'early_stopping_summary': None,
+        'pn_indices': combined_indices,
+        'inf_indices': np.array([], dtype=int),
+    }
 
 
 # ============================================================================
@@ -805,15 +1008,15 @@ def train_cls_1_PN_PosDrop(
     run_logger = common.get('run_logger', None)
     verbose = common.get('verbose', True)
     
+    seed_value = int(seed)
+    method3_mode = data_use.get('source_type') == "M3_Uni_KL_Overlap"
+
     if meta_eval_config is None:
         meta_eval_config = MetaEvaluationConfig()
     meta_evaluation_metrics = set(meta_eval_config.metrics)
     
     if run_logger is not None:
-        run_logger.log(f"[cls-1-PN-PosDrop] Meta_evaluation_n_clusters: {meta_evaluation_n_clusters}")
-        run_logger.log(f"[cls-1-PN-PosDrop] Clustering method: {clustering_method}")
-        run_logger.log(f"[cls-1-PN-PosDrop] Seed: {seed}")
-        run_logger.log(f"[cls-1-PN-PosDrop] Meta_Evaluation metrics: {meta_evaluation_metrics}")
+        run_logger.log(f"[cls-1-PN-PosDrop] Meta_eval_n_clstrs: {meta_evaluation_n_clusters} Clstr method: {clustering_method}, Seed: {seed_value}")
     
     if data_use is None:
         raise RuntimeError("Data unavailable for classifier training; aborting.")
@@ -836,6 +1039,9 @@ def train_cls_1_PN_PosDrop(
     # Get coordinates for visualization
     temp_crd = data_use.get("coords") or data_use.get("coordinates")
     coords_array = np.array(temp_crd) if temp_crd is not None else None
+    domain_ids_array = data_use.get('domain_ids')
+    if domain_ids_array is not None:
+        domain_ids_array = np.asarray(domain_ids_array)
 
     # Prepare positive dropping
     all_pos_idx = (yA_pu == 1).nonzero(as_tuple=True)[0].tolist()
@@ -850,12 +1056,12 @@ def train_cls_1_PN_PosDrop(
         meta_evaluation_n_clusters=meta_evaluation_n_clusters,
         method=clustering_method,
         linkage=linkage,
-        seed=seed,
+        seed=seed_value,
         min_training_size=1
     )
     
     if run_logger is not None and verbose:
-        run_logger.log(f"[cls-1-PN-PosDrop] Created {clustering_method} drop schedule: {num_iterations} iterations, {len(all_pos_idx)} total positives")
+        run_logger.log(f"[cls-1-PN-PosDrop] Created {clustering_method} drop schdl: {num_iterations} iter, {len(all_pos_idx)} total pos")
         
         # Log cluster information for debugging
         if clustering_method in ["kmeans", "hierarchical"]:
@@ -874,27 +1080,57 @@ def train_cls_1_PN_PosDrop(
     
     # Precompute distances if using individual files
     individual_distances_dir = None
+    method3_distance_dirs: Optional[Dict[int, Path]] = None
     if use_individual_distances:
-        if run_logger is not None and verbose:
-            run_logger.log(f"[cls-1-PN-PosDrop] Using individual distance files (memory-safe approach)")
-        
-        try:
-            rotation_tag = f"{tag_main}_posdrop_{clustering_method}_individual" if tag_main else None
-            individual_distances_dir = precompute_distances_per_positive(
-                Z_all=features,
-                all_pos_idx=all_pos_idx,
-                unk_idx=all_unl_idx,
-                tag=rotation_tag,
-                use_float16=True
-            )
-            
+        if method3_mode:
+            if domain_ids_array is None:
+                if run_logger is not None:
+                    run_logger.log("[cls-1-PN-PosDrop] WARNING: Method3 requires domain_ids for individual distances; disabling cache")
+                method3_distance_dirs = None
+                use_individual_distances = False
+            else:
+                method3_distance_dirs = {}
+                for domain_value in (0, 1):
+                    dom_pos_all = [idx for idx in all_pos_idx if domain_ids_array[idx] == domain_value]
+                    dom_unl_all = [idx for idx in all_unl_idx if domain_ids_array[idx] == domain_value]
+                    if not dom_pos_all or not dom_unl_all:
+                        continue
+                    try:
+                        rotation_tag = f"{tag_main}_method3_domain{domain_value}_individual" if tag_main else None
+                        dir_path = precompute_distances_per_positive(
+                            Z_all=features,
+                            all_pos_idx=dom_pos_all,
+                            unk_idx=dom_unl_all,
+                            tag=rotation_tag,
+                            use_float16=True,
+                        )
+                        method3_distance_dirs[domain_value] = dir_path
+                        if run_logger is not None and verbose:
+                            run_logger.log(f"[cls-1-PN-PosDrop] Method3 domain {domain_value} distances stored in: {dir_path}")
+                    except Exception as exc:
+                        if run_logger is not None:
+                            run_logger.log(f"[cls-1-PN-PosDrop] WARNING: Failed to pre-compute domain {domain_value} distances ({exc})")
+                if not method3_distance_dirs:
+                    use_individual_distances = False
+        else:
             if run_logger is not None and verbose:
-                run_logger.log(f"[cls-1-PN-PosDrop] Pre-computed individual distance files in: {individual_distances_dir}")
-        except Exception as e:
-            if run_logger is not None:
-                run_logger.log(f"[cls-1-PN-PosDrop] WARNING: Failed to pre-compute individual distances ({e}), falling back to standard method")
-            individual_distances_dir = None
-            use_individual_distances = False
+                run_logger.log(f"[cls-1-PN-PosDrop] Using individual distance files (memory-safe approach)")
+            try:
+                rotation_tag = f"{tag_main}_posdrop_{clustering_method}_individual" if tag_main else None
+                individual_distances_dir = precompute_distances_per_positive(
+                    Z_all=features,
+                    all_pos_idx=all_pos_idx,
+                    unk_idx=all_unl_idx,
+                    tag=rotation_tag,
+                    use_float16=True
+                )
+                if run_logger is not None and verbose:
+                    run_logger.log(f"[cls-1-PN-PosDrop] Pre-computed individual distance files in: {individual_distances_dir}")
+            except Exception as e:
+                if run_logger is not None:
+                    run_logger.log(f"[cls-1-PN-PosDrop] WARNING: Failed to pre-compute individual distances ({e}), falling back to standard method")
+                individual_distances_dir = None
+                use_individual_distances = False
     
     # Training iterations
     all_results = []
@@ -920,65 +1156,76 @@ def train_cls_1_PN_PosDrop(
         pos_idx_arr = np.asarray(pos_idx, dtype=int)
         unk_idx_arr = np.asarray(unl_idx, dtype=int)
         
-        # Negative selection
-        if use_individual_distances and individual_distances_dir is not None:
-            neg_idx_region = pu_select_negatives_from_individual_distances(
-                individual_distances_dir=individual_distances_dir,
-                all_pos_idx=all_pos_idx,
-                unk_idx=unk_idx_arr,
-                active_pos_idx=pos_idx_arr,
+        if method3_mode:
+            iteration_results = _train_method3_with_pn_selection(
+                data_use=data_use,
+                features=features,
                 filter_top_pct=filter_top_pct,
-                negatives_per_pos=negs_per_pos
+                negs_per_pos=negs_per_pos,
+                active_pos_idx=pos_idx,
+                all_pos_idx=all_pos_idx,
+                domain_distance_dirs=method3_distance_dirs if (use_individual_distances and method3_distance_dirs) else None,
+                common=common,
+                cfg=cfg,
+                inference_fn=inference_fn,
+                tag=tag,
             )
         else:
-            neg_idx_region = pu_select_negatives(
-                Z_all=features,
-                pos_idx=pos_idx_arr,
-                unk_idx=unk_idx_arr,
-                filter_top_pct=filter_top_pct,
-                negatives_per_pos=negs_per_pos,
+            if use_individual_distances and individual_distances_dir is not None:
+                neg_idx_region = pu_select_negatives_from_individual_distances(
+                    individual_distances_dir=individual_distances_dir,
+                    all_pos_idx=all_pos_idx,
+                    unk_idx=unk_idx_arr,
+                    active_pos_idx=pos_idx_arr,
+                    filter_top_pct=filter_top_pct,
+                    negatives_per_pos=negs_per_pos
+                )
+            else:
+                neg_idx_region = pu_select_negatives(
+                    Z_all=features,
+                    pos_idx=pos_idx_arr,
+                    unk_idx=unk_idx_arr,
+                    filter_top_pct=filter_top_pct,
+                    negatives_per_pos=negs_per_pos,
+                    tag=tag
+                )
+
+            neg_idx_arr = np.asarray(neg_idx_region, dtype=int)
+
+            pn_indices = np.concatenate([pos_idx_arr, neg_idx_arr], axis=0)
+            features_pn = features[pn_indices]
+            yA_pn = torch.where(
+                torch.tensor([i in pos_idx for i in pn_indices], dtype=torch.bool),
+                1, 0
+            ).long()
+
+            val_frac = max(0.0, min(cfg.cls_training.validation_fraction, 0.9))
+            total_pn = len(pn_indices)
+            val_count = int(total_pn * val_frac)
+
+            gen = torch.Generator()
+            gen.manual_seed(seed_value)
+            indices_pn = torch.randperm(total_pn, generator=gen)
+
+            val_indices_pn = indices_pn[:val_count].tolist()
+            train_indices_pn = indices_pn[val_count:].tolist()
+
+            Xtr = features_pn[train_indices_pn]
+            ytr = yA_pn[train_indices_pn]
+            Xval = features_pn[val_indices_pn]
+            yval = yA_pn[val_indices_pn]
+
+            iteration_results = train_base_classifier(
+                Xtr=Xtr,
+                Xval=Xval,
+                ytr=ytr,
+                yval=yval,
+                common=common,
+                data_use=data_use,
+                inference_fn=inference_fn,
+                pos_crd_plot=pos_crd_plot,
                 tag=tag
             )
-        
-        neg_idx_arr = np.asarray(neg_idx_region, dtype=int)
-        
-        # Create balanced dataset
-        pn_indices = np.concatenate([pos_idx_arr, neg_idx_arr], axis=0)
-        features_pn = features[pn_indices]
-        yA_pn = torch.where(
-            torch.tensor([i in pos_idx for i in pn_indices], dtype=torch.bool),
-            1, 0
-        ).long()
-        
-        # Train/Val split
-        val_frac = max(0.0, min(cfg.cls_training.validation_fraction, 0.9))
-        total_pn = len(pn_indices)
-        val_count = int(total_pn * val_frac)
-        
-        gen = torch.Generator()
-        gen.manual_seed(int(cfg.seed))
-        indices_pn = torch.randperm(total_pn, generator=gen)
-        
-        val_indices_pn = indices_pn[:val_count].tolist()
-        train_indices_pn = indices_pn[val_count:].tolist()
-        
-        Xtr = features_pn[train_indices_pn]
-        ytr = yA_pn[train_indices_pn]
-        Xval = features_pn[val_indices_pn]
-        yval = yA_pn[val_indices_pn]
-        
-        # Train classifier
-        iteration_results = train_base_classifier(
-            Xtr=Xtr,
-            Xval=Xval,
-            ytr=ytr,
-            yval=yval,
-            common=common,
-            data_use=data_use,
-            inference_fn=inference_fn,
-            pos_crd_plot=pos_crd_plot,
-            tag=tag
-        )
 
         iteration_results['pos_indices_this_iter'] = pos_idx
         all_results.append(iteration_results)
@@ -994,63 +1241,78 @@ def train_cls_1_PN_PosDrop(
     if coords_array is not None:
         pos_crd_plot_all = [coords_array[i] for i in pos_idx]
 
-    pos_idx_arr = np.asarray(pos_idx, dtype=int)
-    unk_idx_arr = np.asarray(all_unl_idx, dtype=int)
-    
-    if use_individual_distances and individual_distances_dir is not None:
-        neg_idx_region_all = pu_select_negatives_from_individual_distances(
-            individual_distances_dir=individual_distances_dir,
-            all_pos_idx=all_pos_idx,
-            unk_idx=unk_idx_arr,
-            active_pos_idx=pos_idx_arr,
+    if method3_mode:
+        all_results_final = _train_method3_with_pn_selection(
+            data_use=data_use,
+            features=features,
             filter_top_pct=filter_top_pct,
-            negatives_per_pos=negs_per_pos
+            negs_per_pos=negs_per_pos,
+            active_pos_idx=pos_idx,
+            all_pos_idx=all_pos_idx,
+            domain_distance_dirs=method3_distance_dirs if (use_individual_distances and method3_distance_dirs) else None,
+            common=common,
+            cfg=cfg,
+            inference_fn=inference_fn,
+            tag=tag_all,
         )
     else:
-        neg_idx_region_all = pu_select_negatives(
-            Z_all=features.cpu().numpy(),
-            pos_idx=pos_idx_arr,
-            unk_idx=unk_idx_arr,
-            filter_top_pct=filter_top_pct,
-            negatives_per_pos=negs_per_pos,
+        pos_idx_arr = np.asarray(pos_idx, dtype=int)
+        unk_idx_arr = np.asarray(all_unl_idx, dtype=int)
+
+        if use_individual_distances and individual_distances_dir is not None:
+            neg_idx_region_all = pu_select_negatives_from_individual_distances(
+                individual_distances_dir=individual_distances_dir,
+                all_pos_idx=all_pos_idx,
+                unk_idx=unk_idx_arr,
+                active_pos_idx=pos_idx_arr,
+                filter_top_pct=filter_top_pct,
+                negatives_per_pos=negs_per_pos
+            )
+        else:
+            neg_idx_region_all = pu_select_negatives(
+                Z_all=features.cpu().numpy(),
+                pos_idx=pos_idx_arr,
+                unk_idx=unk_idx_arr,
+                filter_top_pct=filter_top_pct,
+                negatives_per_pos=negs_per_pos,
+                tag=tag_all
+            )
+
+        neg_idx_arr_all = np.asarray(neg_idx_region_all, dtype=int)
+        pn_indices_all = np.concatenate([pos_idx_arr, neg_idx_arr_all], axis=0)
+        features_pn_all = features[pn_indices_all]
+        yA_pn_all = torch.where(
+            torch.tensor([i in pos_idx for i in pn_indices_all], dtype=torch.bool),
+            1, 0
+        ).long()
+
+        val_frac = max(0.0, min(cfg.cls_training.validation_fraction, 0.9))
+        total_pn_all = len(pn_indices_all)
+        val_count_all = int(total_pn_all * val_frac)
+
+        gen_all = torch.Generator()
+        gen_all.manual_seed(seed_value)
+        indices_pn_all = torch.randperm(total_pn_all, generator=gen_all)
+
+        val_indices_pn_all = indices_pn_all[:val_count_all].tolist()
+        train_indices_pn_all = indices_pn_all[val_count_all:].tolist()
+
+        Xtr_all = features_pn_all[train_indices_pn_all]
+        ytr_all = yA_pn_all[train_indices_pn_all]
+        Xval_all = features_pn_all[val_indices_pn_all]
+        yval_all = yA_pn_all[val_indices_pn_all]
+
+        all_results_final = train_base_classifier(
+            Xtr=Xtr_all,
+            Xval=Xval_all,
+            ytr=ytr_all,
+            yval=yval_all,
+            common=common,
+            data_use=data_use,
+            inference_fn=inference_fn,
+            pos_crd_plot=pos_crd_plot_all,
             tag=tag_all
         )
-    
-    neg_idx_arr_all = np.asarray(neg_idx_region_all, dtype=int)
-    pn_indices_all = np.concatenate([pos_idx_arr, neg_idx_arr_all], axis=0)
-    features_pn_all = features[pn_indices_all]
-    yA_pn_all = torch.where(
-        torch.tensor([i in pos_idx for i in pn_indices_all], dtype=torch.bool),
-        1, 0
-    ).long()
-    
-    val_frac = max(0.0, min(cfg.cls_training.validation_fraction, 0.9))
-    total_pn_all = len(pn_indices_all)
-    val_count_all = int(total_pn_all * val_frac)
-    
-    gen_all = torch.Generator()
-    gen_all.manual_seed(int(cfg.seed))
-    indices_pn_all = torch.randperm(total_pn_all, generator=gen_all)
-    
-    val_indices_pn_all = indices_pn_all[:val_count_all].tolist()
-    train_indices_pn_all = indices_pn_all[val_count_all:].tolist()
-    
-    Xtr_all = features_pn_all[train_indices_pn_all]
-    ytr_all = yA_pn_all[train_indices_pn_all]
-    Xval_all = features_pn_all[val_indices_pn_all]
-    yval_all = yA_pn_all[val_indices_pn_all]
-    
-    all_results_final = train_base_classifier(
-        Xtr=Xtr_all,
-        Xval=Xval_all,
-        ytr=ytr_all,
-        yval=yval_all,
-        common=common,
-        data_use=data_use,
-        inference_fn=inference_fn,
-        pos_crd_plot=pos_crd_plot_all,
-        tag=tag_all
-    )
     
     all_results_final['pos_indices_this_iter'] = pos_idx
     all_results.append(all_results_final)
@@ -1262,11 +1524,13 @@ def load_and_evaluate_existing_predictions(
     else:
         features = torch.tensor(features, dtype=torch.float32)
     
+    seed_value = int(common.get('seed', getattr(cfg, 'seed', 42)))
+
     drop_schedule = create_pos_drop_schedule_unified(
         all_pos_idx=all_pos_idx,
         features=features,
         meta_evaluation_n_clusters=meta_evaluation_n_clusters,
-        seed=int(cfg.seed),
+        seed=seed_value,
         method=clustering_method,
         min_training_size=1
     )
@@ -1649,8 +1913,6 @@ def compute_proxy_auc_variants(probs_all, y_true, prior_variants, run_logger=Non
                 run_logger.log(f"[compute_proxy_auc_variants] Error with prior π={prior:.3f}: {e}")
             results[f"prior_{prior:.3f}"] = 0.5
     
-    if run_logger:
-        run_logger.log(f"[compute_proxy_auc_variants] Completed PAUC for {len(prior_variants)} priors")
     return results
 
 

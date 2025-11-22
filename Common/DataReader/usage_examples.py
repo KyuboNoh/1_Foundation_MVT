@@ -132,6 +132,7 @@ def get_original_dataset_for_training(cfg: Any, dataset_name: str, run_logger: A
         'features': dataset['embeddings'],      # Rename 'embeddings' to 'features'
         'labels': dataset['labels'],
         'coords': dataset['coordinates'],       # Rename 'coordinates' to 'coords'
+        'indices': dataset.get('indices'),
         'n_samples': dataset['n_samples'],
         'n_positive': dataset['n_positive'],
         'n_negative': dataset['n_negative'],

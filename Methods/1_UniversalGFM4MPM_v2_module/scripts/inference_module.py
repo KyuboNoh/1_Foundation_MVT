@@ -84,8 +84,8 @@ def run_inference_base(
     if save_coordinates:
         np.save(model_dir / "coordinates.npy", np.array(matched_coords))
         run_logger.log(f"[cls-inference] Saved coordinates.npy for {len(matched_coords)} samples")
-    else:
-        run_logger.log(f"[cls-inference] Skipped saving coordinates.npy (iteration training)")
+    # else:
+    #     run_logger.log(f"[cls-inference] Skipped saving coordinates.npy (iteration training)")
     
     # Create scatter plots
     _create_inference_plots(
@@ -109,7 +109,7 @@ def run_inference_base(
     with open(model_dir / "summary.json", 'w') as f:
         json.dump(summary, f, indent=2)
     
-    run_logger.log(f"[cls-inference] Saved results to {model_dir}")
+    # run_logger.log(f"[cls-inference] Saved results to {model_dir}")
     
     return {
         "predictions_mean": mean_pred,

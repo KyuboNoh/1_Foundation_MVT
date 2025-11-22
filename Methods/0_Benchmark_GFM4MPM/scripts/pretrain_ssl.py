@@ -828,6 +828,67 @@ def _persist_training_args_to_metadata(
         print(f"[warn] Failed to persist training args to {metadata_path}: {exc}")
 
 
+def _load_history_entries(history_path: Path) -> List[Dict[str, Any]]:
+    if not history_path.exists():
+        return []
+    try:
+        data = json.loads(history_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"[warn] Unable to parse existing training history at {history_path}: {exc}")
+        return []
+    if not isinstance(data, list):
+        print(f"[warn] Unexpected history format at {history_path}; expected a list.")
+        return []
+    entries: List[Dict[str, Any]] = []
+    for entry in data:
+        if isinstance(entry, dict):
+            entries.append(entry)
+        else:
+            print("[warn] Skipping malformed history entry that is not a dictionary.")
+    return entries
+
+
+def _extract_last_history_epoch(history_entries: Sequence[Dict[str, Any]]) -> int:
+    for entry in reversed(history_entries):
+        epoch_val = entry.get("epoch")
+        if isinstance(epoch_val, (int, float)):
+            epoch_int = int(epoch_val)
+            if epoch_int > 0:
+                return epoch_int
+    return 0
+
+
+def _trim_history_to_epoch(history_entries: List[Dict[str, Any]], max_epoch: int) -> List[Dict[str, Any]]:
+    if max_epoch <= 0 or not history_entries:
+        return []
+    trimmed: List[Dict[str, Any]] = []
+    for entry in history_entries:
+        epoch_val = entry.get("epoch")
+        try:
+            epoch_int = int(epoch_val)
+        except (TypeError, ValueError):
+            continue
+        if epoch_int <= max_epoch:
+            trimmed.append(entry)
+    return trimmed
+
+
+def _read_checkpoint_meta_epoch(meta_path: Path) -> Optional[int]:
+    if not meta_path.exists():
+        return None
+    try:
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"[warn] Failed to parse checkpoint metadata at {meta_path}: {exc}")
+        return None
+    epoch_val = data.get("epoch") if isinstance(data, dict) else None
+    if isinstance(epoch_val, (int, float)):
+        epoch_int = int(epoch_val)
+        if epoch_int > 0:
+            return epoch_int
+    return None
+
+
 def _maybe_check_image_preproc(
     stack,
     feature_name: str,
@@ -1270,8 +1331,12 @@ if __name__ == '__main__':
     ap.add_argument('--skip-nan-attempts', type=int, default=64, help='Maximum resampling attempts when skipping NaN-containing patches')
     ap.add_argument('--button-inference', action='store_true', help='Skip training and generate previews from existing checkpoints')
     ap.add_argument('--button-debug-fraction', type=float, default=100.0, help='Percentage of training samples to keep for debug runs (fixed subset reused each epoch)',)
+    ap.add_argument('--resume-ssl-training', action='store_true', help='Resume SSL training from an existing checkpoint in the output directory')
 
     args = ap.parse_args()
+    if args.button_inference and args.resume_ssl_training:
+        print("[warn] --resume-ssl-training has no effect when --button-inference is provided; ignoring resume flag.")
+        args.resume_ssl_training = False
 
     training_args_data: Optional[Dict[str, Any]] = None
 
@@ -1625,6 +1690,14 @@ if __name__ == '__main__':
     output_dir.mkdir(parents=True, exist_ok=True)
     history_path = output_dir / 'ssl_history.json'
     checkpoint_path = output_dir / 'mae_encoder.pth'
+    checkpoint_meta_path = output_dir / 'ssl_checkpoint_meta.json'
+    checkpoint_percentages = (0.25, 0.5, 0.75, 1.0)
+    checkpoint_epochs = sorted(
+        {
+            min(args.epochs, max(1, math.ceil(args.epochs * pct)))
+            for pct in checkpoint_percentages
+        }
+    )
 
     if not args.button_inference:
         args_snapshot = {}
@@ -1641,44 +1714,87 @@ if __name__ == '__main__':
         if stac_root_path is not None:
             _persist_training_args_to_metadata(stac_root_path, args_snapshot, output_dir, used_feature_list)
 
-        checkpoint_percentages = (0.25, 0.5, 0.75, 1.0)
-        checkpoint_epochs = sorted(
-            {
-                min(args.epochs, max(1, math.ceil(args.epochs * pct)))
-                for pct in checkpoint_percentages
-            }
-        )
-
-        def _save_checkpoint(epoch: int, current_model: torch.nn.Module, history_entries: List[Dict[str, float]]):
+        def _save_checkpoint(epoch: int, current_model: torch.nn.Module, history_entries: List[Dict[str, Any]]):
             if checkpoint_path.exists():
                 checkpoint_path.unlink()
             torch.save(current_model.state_dict(), checkpoint_path)
             if history_path.exists():
                 history_path.unlink()
             history_path.write_text(json.dumps(history_entries, indent=2), encoding='utf-8')
+            metadata_payload = {
+                "epoch": epoch,
+                "history_length": len(history_entries),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            checkpoint_meta_path.write_text(json.dumps(metadata_payload, indent=2), encoding='utf-8')
             print(
                 f"[info] Saved checkpoint artifacts at epoch {epoch} to {checkpoint_path.parent}"
             )
 
-        model, history = train_ssl(
-            model,
-            train_dl,
-            epochs=args.epochs,
-            lr=args.lr,
-            optimizer=args.optimizer,
-            preview_samples=args.preview_samples,
-            preview_dir=preview_dir if args.preview_samples > 0 else None,
-            feature_names=getattr(stack, 'feature_columns', None),
-            feature_metadata=getattr(stack, 'feature_metadata', None),
-            mask_scope=args.mask_scope,
-            norm_per_patch=args.norm_per_patch,
-            use_ssim=args.use_ssim,
-            checkpoint_epochs=checkpoint_epochs,
-            checkpoint_callback=_save_checkpoint,
-            val_dataloader=val_dl,
-        )
-        if args.epochs not in checkpoint_epochs:
-            _save_checkpoint(args.epochs, model, history)
+        existing_history: List[Dict[str, Any]] = []
+        resume_epoch = 0
+        epochs_to_run = args.epochs
+        if args.resume_ssl_training:
+            if not checkpoint_path.exists():
+                raise FileNotFoundError(
+                    "[resume] Unable to locate checkpoint weights at "
+                    f"{checkpoint_path}; run without --resume-ssl-training or ensure training has saved a checkpoint."
+                )
+            model.load_state_dict(torch.load(checkpoint_path, map_location='cpu'))
+            existing_history = _load_history_entries(history_path)
+            last_history_epoch = _extract_last_history_epoch(existing_history)
+            meta_epoch = _read_checkpoint_meta_epoch(checkpoint_meta_path)
+            resolved_epoch = 0
+            if meta_epoch is not None:
+                resolved_epoch = meta_epoch
+            elif checkpoint_epochs:
+                resolved_epoch = max(
+                    (epoch for epoch in checkpoint_epochs if epoch <= last_history_epoch),
+                    default=0,
+                )
+            else:
+                resolved_epoch = min(last_history_epoch, args.epochs)
+            if resolved_epoch < last_history_epoch and last_history_epoch > 0:
+                trimmed_history = _trim_history_to_epoch(existing_history, resolved_epoch)
+                if len(trimmed_history) != len(existing_history):
+                    print(
+                        f"[warn] Trimmed training history from epoch {last_history_epoch} "
+                        f"down to checkpoint epoch {resolved_epoch} to maintain consistency."
+                    )
+                existing_history = trimmed_history
+            resume_epoch = resolved_epoch
+            epochs_to_run = max(0, args.epochs - resume_epoch)
+            if epochs_to_run <= 0:
+                print(
+                    f"[info] Requested epochs ({args.epochs}) already satisfied by checkpoint epoch {resume_epoch}; "
+                    "nothing to train."
+                )
+        history: List[Dict[str, Any]] = existing_history
+
+        if epochs_to_run > 0:
+            model, history = train_ssl(
+                model,
+                train_dl,
+                epochs=epochs_to_run,
+                lr=args.lr,
+                optimizer=args.optimizer,
+                preview_samples=args.preview_samples,
+                preview_dir=preview_dir if args.preview_samples > 0 else None,
+                feature_names=getattr(stack, 'feature_columns', None),
+                feature_metadata=getattr(stack, 'feature_metadata', None),
+                mask_scope=args.mask_scope,
+                norm_per_patch=args.norm_per_patch,
+                use_ssim=args.use_ssim,
+                checkpoint_epochs=checkpoint_epochs,
+                checkpoint_callback=_save_checkpoint,
+                val_dataloader=val_dl,
+                start_epoch=resume_epoch,
+                history=history,
+            )
+            if args.epochs not in checkpoint_epochs:
+                _save_checkpoint(args.epochs, model, history)
+        else:
+            print("[info] Skipping training loop because no remaining epochs were requested.")
         print(f"Training history available at {history_path}")
     else:
         state_source: Optional[Path] = None
