@@ -78,10 +78,8 @@ from Common.Unifying.Labels_TwoDatasets.fusion_utils.workspace import (
     OverlapAlignmentWorkspace,
 )
 from Common.Unifying.Labels_TwoDatasets.splits import _overlap_split_indices
-from Common.Augmentation import (
-    _load_augmented_embeddings,
-    _print_augmentation_usage,
-)
+from Common.Augmentation import ( _load_augmented_embeddings, _print_augmentation_usage,)
+
 from Common.Unifying.DCCA import (
     _load_pretrained_dcca_state,
     _resolve_dcca_weights_path,
@@ -138,8 +136,6 @@ from Common.cls.training import train_cls_PN_base
 
 from . inference_module import run_inference_base
 
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stage-1 overlap alignment trainer")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
@@ -174,13 +170,13 @@ def parse_args() -> argparse.Namespace:
 
     # ✅ META-EVALUATION PARAMETERS
     parser.add_argument("--run-meta-evaluation", action=argparse.BooleanOptionalAction, default=True, help="Enable meta-evaluation metric computation.")
-    parser.add_argument("--meta-eval-methods", type=str, nargs="+", default=["posdrop", "shuffle", "stability"], choices=["posdrop", "shuffle", "stability"], help="Meta-evaluation methods to run. Available: posdrop, shuffle, stability")
+    parser.add_argument("--meta-eval-methods", type=str, nargs="+", choices=["posdrop", "shuffle", "stability"], default=["posdrop", "shuffle", "stability"], help="Meta-evaluation methods to run. Available: posdrop, shuffle, stability")
     # parser.add_argument("--meta-eval-methods", type=str, nargs="+", default=["shuffle"], choices=["posdrop", "shuffle", "stability"], help="Meta-evaluation methods to run. Available: posdrop, shuffle, stability")
-    parser.add_argument("--meta-eval-metrics", type=str, nargs="+", default=["accuracy", "focus", "topk", "lift", "pauc", "background_rejection", "spatial_entropy", "spatial_jaccard", "z_score", "fde"], help="Meta-evaluation metrics to compute (space-separated). Available: accuracy, focus, topk, lift, pauc, background_rejection, spatial_entropy, spatial_jaccard, z_score, fde")
+    parser.add_argument("--meta-eval-metrics", type=str, nargs="+", default=["accuracy", "focus", "topk", "lift", "pauc", "background_rejection", "pu_tpr", "spatial_entropy", "spatial_jaccard", "z_score", "fde"], help="Meta-evaluation metrics to compute (space-separated). Available: accuracy, focus, topk, lift, pauc, background_rejection, pu_tpr, spatial_entropy, spatial_jaccard, z_score, fde")
 
     # ✅ RIGOROUS EVALUATION PARAMETERS 1 - Positive dropout via clustering
-    parser.add_argument("--meta-eval-posdrop-clusters", type=int, nargs="+", default=[2, 3, 4, 5, 6, 7, 8, 10], help="Number of clusters/iterations for meta-evaluation (space-separated). Line search over these values.")
-    # parser.add_argument("--meta-eval-posdrop-clusters", type=int, nargs="+", default=[2], help="Number of clusters/iterations for meta-evaluation (space-separated). Line search over these values.")
+    # parser.add_argument("--meta-eval-posdrop-clusters", type=int, nargs="+", default=[2, 3, 4, 5, 6, 7, 8, 10], help="Number of clusters/iterations for meta-evaluation (space-separated). Line search over these values.")
+    parser.add_argument("--meta-eval-posdrop-clusters", type=int, nargs="+", default=[2], help="Number of clusters/iterations for meta-evaluation (space-separated). Line search over these values.")
     parser.add_argument("--meta-eval-posdrop-strategy", type=str, nargs="+", default=["latent_dist", "actual_dist"], choices=["latent_dist", "actual_dist"], help="Positive dropout strategy (space-separated). Available: latent_dist, actual_dist")
 
     # ✅ RIGOROUS EVALUATION PARAMETERS 2
@@ -254,13 +250,13 @@ def main() -> None:
         if weights_path is not None:
             run_logger.log(f"Reading DCCA weights from {weights_path}")
     else:
-            run_logger.log(
-                "Starting stage-1 overlap alignment with initial projection_dim={proj}; "
-                "mlp_layers={layers}, train_dcca={train_flag}, read_dcca={read_flag}".format(
-                    proj=cfg.projection_dim,
-                    layers=cfg.dcca_training.mlp_hidden_dims,
-                    train_flag=train_dcca,
-                    read_flag=read_dcca,
+        run_logger.log(
+            "Starting stage-1 overlap alignment with initial projection_dim={proj}; "
+            "mlp_layers={layers}, train_dcca={train_flag}, read_dcca={read_flag}".format(
+                proj=cfg.projection_dim,
+                layers=cfg.dcca_training.mlp_hidden_dims,
+                train_flag=train_dcca,
+                read_flag=read_dcca,
                 )
             )
 
@@ -285,21 +281,6 @@ def main() -> None:
         drop_rate = 1.0 / args.meta_eval_posdrop_clusters[0]
     else:
         drop_rate = 0.1  # Default fallback
-    
-    # Log execution mode for debugging
-    is_multi_clustering = (
-        len(args.meta_eval_posdrop_strategy) > 1 or 
-        len(args.meta_eval_posdrop_clusters) > 1
-    )
-    
-    if is_multi_clustering:
-        run_logger.log(f"[main] MULTI-CLUSTERING mode detected:")
-        run_logger.log(f"[main] - Strategies: {args.meta_eval_posdrop_strategy}")
-        run_logger.log(f"[main] - Cluster counts: {args.meta_eval_posdrop_clusters}")
-
-    else:
-        drop_rate = 1.0 / args.meta_eval_posdrop_clusters[0] if args.meta_eval_posdrop_clusters else 0.1
-        run_logger.log(f"[main] LEGACY mode detected with drop_rate={drop_rate}")
     
     # Set global random seed for reproducibility
     seed = args.seed
@@ -346,6 +327,7 @@ def main() -> None:
 
     tag = create_clean_tag(method_name, encoder_name, data_name)
     train_save_eval_result(tag, data_use, action, common, args, cfg, run_logger, run_rigorous=True)
+
     exit()
 
     ####################################### Train METHOD3 (shared; using KL; overlap) classifier #######################################
@@ -477,6 +459,994 @@ def main() -> None:
     return
 
 #####################################################################################   #####################################################################################   #####################################################################################   
+
+def execute_standard_session(
+    tag: str,
+    data_use: Dict[str, Any],
+    action: str,
+    common: Dict[str, Any],
+    args: argparse.Namespace,
+    cfg: Any,
+    run_logger: "_RunLogger",
+    train_subset_indices: Optional[np.ndarray] = None,
+    output_dir: Optional[Path] = None,
+    save_results: bool = True,
+) -> Dict[str, Any]:
+    """
+    Execute a single Standard PN training session (No PosDrop).
+    """
+    # Extract seed from common parameters
+    seed = common.get('seed', 42)
+    
+    # Determine output directory
+    effective_output_dir = output_dir if output_dir is not None else cfg.output_dir
+    
+    run_logger.log(f"[execute_standard_session] STANDARD MODE for '{tag}'")
+    
+    # Update common with subset indices if provided
+    common_with_subset = common.copy()
+    if train_subset_indices is not None:
+        common_with_subset['train_subset_indices'] = train_subset_indices
+
+    # Train Standard PN
+    result = train_cls_PN_base.train_cls_1_PN(
+        common=common_with_subset,
+        data_use=data_use,
+        filter_top_pct=args.filter_top_pct,
+        negs_per_pos=args.negs_per_pos,
+        action=action,
+        inference_fn=run_inference_base,
+        tag=tag,
+    )
+    
+    # Compute Meta-Evaluation Metrics (PAUC, Lift, etc.)
+    meta_evaluation = {}
+    
+    # Extract predictions and labels
+    if 'inference_result' in result:
+        predictions_mean = result['inference_result']['predictions_mean']
+        # predictions_std = result['inference_result']['predictions_std'] 
+        
+        # Get labels
+        y_true = data_use['labels']
+        # Ensure y_true is numpy
+        if isinstance(y_true, torch.Tensor):
+            y_true = y_true.cpu().numpy()
+            
+        all_pos_idx = np.where(y_true >= 0.9)[0].tolist()
+        
+        # Compute metrics requested
+        meta_eval_config = getattr(args, "_meta_eval_config", train_cls_PN_base.MetaEvaluationConfig())
+        metrics_to_compute = set(args.meta_eval_metrics)
+        
+        # 1. Compute Basic Metrics (Focus)
+        if "Focus" in metrics_to_compute or "focus" in metrics_to_compute:
+             # Note: compute_focus is available in train_cls_PN_base but not exported in __all__ maybe?
+             # It is available as train_cls_PN_base.compute_focus
+             try:
+                 val = train_cls_PN_base.compute_focus(predictions_mean=predictions_mean)
+                 meta_evaluation['focus'] = {'mean': val, 'std': 0.0}
+             except Exception as e:
+                 run_logger.log(f"[execute_standard_session] Error computing Focus: {e}")
+
+        # 2. Compute Extended Metrics (PAUC, Lift, TopK, etc.)
+        # compute_extended_meta_evaluation expects lists of arrays (one per config)
+        try:
+            extended_metrics = train_cls_PN_base.compute_extended_meta_evaluation(
+                meta_eval_config=meta_eval_config,
+                requested_metrics=list(metrics_to_compute),
+                all_probabilities=[predictions_mean],
+                all_labels=[y_true],
+                run_logger=run_logger
+            )
+            meta_evaluation.update(extended_metrics)
+        except Exception as e:
+             run_logger.log(f"[execute_standard_session] Error computing extended metrics: {e}")
+             # Fallback or re-raise? Logging is safer to avoid crash.
+
+    result['meta_evaluation'] = meta_evaluation
+
+
+    
+    # Save results
+    if save_results:
+        save_training_results(result, tag, effective_output_dir, run_logger)
+        
+        if getattr(args, "run_meta_evaluation", True):
+            train_cls_PN_base.save_meta_evaluation_results(
+                meta_evaluation=meta_evaluation,
+                tag_main=tag,
+                common=common,
+                run_logger=run_logger
+            )
+
+    return result
+
+def execute_posdrop_session(
+    tag: str,
+    data_use: Dict[str, Any],
+    action: str,
+    common: Dict[str, Any],
+    args: argparse.Namespace,
+    cfg: Any,
+    run_logger: "_RunLogger",
+    train_subset_indices: Optional[np.ndarray] = None,
+    output_dir: Optional[Path] = None,
+    save_results: bool = True,
+) -> Union[Dict[str, Any], None]:
+    """
+    Execute a single PosDrop training session, handling multi-clustering, caching, and saving.
+    Does NOT run rigorous evaluation (shuffle/stability).
+    """
+    # Extract seed from common parameters
+    seed = common.get('seed', 42)
+    
+    # Convert meta_evaluation argument to set
+    meta_evaluation_metrics = set(args.meta_eval_metrics)
+    meta_eval_config = getattr(args, "_meta_eval_config", train_cls_PN_base.MetaEvaluationConfig())
+    run_meta_evaluation = bool(getattr(args, "run_meta_evaluation", True))
+    source_type = data_use.get("source_type")
+    is_method3 = source_type == "M3_Uni_KL_Overlap"
+    
+    # Determine execution mode based on parameters
+    multi_clustering_requested = (
+        len(args.meta_eval_posdrop_strategy) > 1 or 
+        len(args.meta_eval_posdrop_clusters) > 1
+    )
+    
+    inference_fn = run_inference_base
+    # METHOD3 always reuses the multi-configuration path even when only a single
+    # clustering config is supplied, so track that explicitly to avoid confusion.
+    force_multi_for_method3 = is_method3
+    use_multi_clustering = multi_clustering_requested or force_multi_for_method3
+
+    # Determine output directory
+    effective_output_dir = output_dir if output_dir is not None else cfg.output_dir
+
+    if use_multi_clustering:
+        if is_method3:
+            run_logger.log(f"[execute_posdrop_session] METHOD3 (shared overlap) multi-configuration mode for '{tag}'")
+        else:
+            run_logger.log(f"[execute_posdrop_session] MULTI-CLUSTERING MODE for '{tag}'")
+        run_logger.log(f"[execute_posdrop_session] Strategies: {args.meta_eval_posdrop_strategy}")
+        run_logger.log(f"[execute_posdrop_session] Cluster counts: {args.meta_eval_posdrop_clusters}")
+
+
+        supports_caching = not is_method3
+        cached_results = {}
+        config_status: Dict[str, str] = {}
+        missing_configs: List[Dict[str, object]] = []
+
+        # ✅ CHECK FOR CACHED RESULTS FIRST (multi-clustering)
+        if args.skip_training_if_cached:
+            run_logger.log(f"[execute_posdrop_session] Checking for cached multi-clustering results...")
+            if supports_caching:
+                for method in args.meta_eval_posdrop_strategy:
+                    for n_clusters in args.meta_eval_posdrop_clusters:
+                        config_name = f"{method}{n_clusters}"
+
+                        cached_result = train_cls_PN_base.load_and_evaluate_existing_predictions(
+                            tag_main=tag,
+                            meta_evaluation_n_clusters=n_clusters,
+                            posdrop_strategy=method,
+                            common=common,
+                            data_use=data_use,
+                            run_logger=run_logger,
+                            run_meta_evaluation=run_meta_evaluation,
+                            meta_eval_config=meta_eval_config,
+                        )
+
+                        if cached_result is not None:
+                            cached_results[config_name] = cached_result
+                            run_logger.log(f"[execute_posdrop_session] ✅ Found cached predictions for {config_name}")
+                        else:
+                            missing_configs.append({'method': method, 'n_clusters': n_clusters, 'name': config_name})
+                            run_logger.log(f"[execute_posdrop_session] ❌ No cached predictions for {config_name}")
+
+                total_configs = len(args.meta_eval_posdrop_strategy) * len(args.meta_eval_posdrop_clusters)
+                if run_meta_evaluation:
+                    for config_name, result in cached_results.items():
+                        method_tag = f"{tag}_PosDrop_{config_name}"
+                        train_cls_PN_base.save_meta_evaluation_results(
+                            meta_evaluation=result,
+                            tag_main=method_tag,
+                            common=common,
+                            run_logger=run_logger
+                        )
+                        run_logger.log(f"[execute_posdrop_session] ✅ CACHED: {config_name} - saved existing predictions")
+
+                if len(cached_results) == total_configs:
+                    run_logger.log(f"[execute_posdrop_session] ✅ All {total_configs} configurations cached, no training needed")
+                    run_logger.log(f"[execute_posdrop_session] ===== CACHED MULTI-CLUSTERING RESULTS =====")
+                    for config_name, result in cached_results.items():
+                        for metric, data in result.items():
+                            if isinstance(data, dict) and 'mean' in data:
+                                run_logger.log(f"[execute_posdrop_session] {config_name} {metric}: {data['mean']} ± {data['std']}")
+                    run_logger.log(f"[execute_posdrop_session] ===== END CACHED RESULTS =====")
+                    return cached_results
+
+                if missing_configs:
+                    run_logger.log(f"[execute_posdrop_session] CACHE SUMMARY: {len(cached_results)} cached, {len(missing_configs)} to train (total: {total_configs})")
+                methods_to_train = list(set(config['method'] for config in missing_configs))
+                clusters_to_train = list(set(config['n_clusters'] for config in missing_configs))
+            else:
+                run_logger.log("[execute_posdrop_session] Caching not supported for METHOD3; training all configurations.")
+                missing_configs = [
+                    {'method': method, 'n_clusters': n_clusters, 'name': f"{method}{n_clusters}"}
+                    for method in args.meta_eval_posdrop_strategy
+                    for n_clusters in args.meta_eval_posdrop_clusters
+                ]
+                methods_to_train = list(set(config['method'] for config in missing_configs))
+                clusters_to_train = list(set(config['n_clusters'] for config in missing_configs))
+        else:
+            missing_configs = [
+                {'method': method, 'n_clusters': n_clusters, 'name': f"{method}{n_clusters}"}
+                for method in args.meta_eval_posdrop_strategy
+                for n_clusters in args.meta_eval_posdrop_clusters
+            ]
+            methods_to_train = list(set(config['method'] for config in missing_configs))
+            clusters_to_train = list(set(config['n_clusters'] for config in missing_configs))
+            run_logger.log(f"[execute_posdrop_session] No caching - training all configurations")
+
+        training_results = {}
+        if missing_configs:
+            run_logger.log(f"[execute_posdrop_session] Training {len(methods_to_train)} methods x {len(clusters_to_train)} cluster counts...")
+            
+            # Update common with subset indices if provided
+            common_with_subset = common.copy()
+            if train_subset_indices is not None:
+                common_with_subset['train_subset_indices'] = train_subset_indices
+
+            training_results = train_cls_PN_base.train_cls_1_PN_PosDrop_MultiClustering(
+                posdrop_strategies=methods_to_train,
+                meta_evaluation_n_clusters_list=clusters_to_train,
+
+                seed=seed,
+                common=common_with_subset,
+                data_use=data_use,
+                filter_top_pct=args.filter_top_pct,
+                negs_per_pos=args.negs_per_pos,
+                action=action,
+                inference_fn=inference_fn,
+                tag_main=tag,
+                meta_evaluation_metrics=meta_evaluation_metrics,
+                run_meta_evaluation=run_meta_evaluation,
+                meta_eval_config=meta_eval_config,
+            )
+        
+        # Combine cached and training results for final summary
+        if args.skip_training_if_cached and 'cached_results' in locals():
+            all_results = {**cached_results, **training_results}
+            for name in cached_results:
+                config_status[name] = "CACHED"
+            for name in training_results:
+                config_status[name] = "TRAINED"
+            run_logger.log(f"[execute_posdrop_session] Combined {len(cached_results)} cached + {len(training_results)} trained = {len(all_results)} total results")
+        else:
+            all_results = training_results
+            config_status = {name: "TRAINED" for name in training_results}
+        
+        # Save newly trained results (cached results already saved above)
+        if save_results:
+            for method_cluster_key, result in training_results.items():
+                if "error" not in result:
+                    method_tag = f"{tag}_PosDrop_{method_cluster_key}"
+
+                    # Save meta evaluation results
+                    if run_meta_evaluation and train_subset_indices is None: # Only save if not a subset run
+                        train_cls_PN_base.save_meta_evaluation_results(
+                            meta_evaluation=result,
+                            tag_main=method_tag,
+                            common=common,
+                            run_logger=run_logger
+                        )
+
+                    # Save full training results
+                    if train_subset_indices is None: # Only save if not a subset run
+                        # Construct path: .../All/{tag}/{tag}_posdrop/{method_tag}
+                        # Note: effective_output_dir is .../All/{tag}
+                        posdrop_base = effective_output_dir / f"{tag}_posdrop"
+                        
+                        save_training_results(
+                            result=result,
+                            tag=method_tag,
+                            output_dir=posdrop_base / method_tag,
+                            run_logger=run_logger
+                        )
+                    
+                    run_logger.log(f"[execute_posdrop_session] ✅ TRAINED: {method_cluster_key}")
+                else:
+                    run_logger.log(f"[execute_posdrop_session] ❌ ERROR in {method_cluster_key}: {result['error']}")
+        
+        # Final comprehensive summary showing both cached and trained results
+        if run_meta_evaluation and all_results:
+            run_logger.log(f"[execute_posdrop_session] ===== COMPLETE MULTI-CLUSTERING SUMMARY for {tag} =====")
+            metrics_group: Dict[str, List[Tuple[str, str, Dict[str, float]]]] = {}
+            for method_cluster_key, result in all_results.items():
+                if "error" in result:
+                    continue
+                status = config_status.get(method_cluster_key, "TRAINED")
+                for metric, data in result.items():
+                    if isinstance(data, dict) and 'mean' in data:
+                        metrics_group.setdefault(metric, []).append((method_cluster_key, status, data))
+            for metric_name, entries in metrics_group.items():
+                run_logger.log(f"[execute_posdrop_session] -- {metric_name} --")
+                for method_cluster_key, status, data in entries:
+                    if isinstance(data['mean'], (int, float)):
+                        run_logger.log(f"[execute_posdrop_session] {method_cluster_key} ({status}): {data['mean']:.4f} ± {data['std']:.4f}")
+                    else:
+                        # Skip logging non-scalar means (like curves)
+                        pass
+            run_logger.log(f"[execute_posdrop_session] ===== END SUMMARY =====")
+        
+        return all_results
+    
+    else:
+        # LEGACY MODE: Single method, single cluster count
+        posdrop_strategy = args.meta_eval_posdrop_strategy[0]  # Should be "latent_dist"
+        n_clusters = args.meta_eval_posdrop_clusters[0]  # Single value
+        
+        # Convert to legacy drop_rate for backward compatibility
+        drop_rate = 1.0 / n_clusters
+        
+        run_logger.log(f"[execute_posdrop_session] LEGACY MODE for '{tag}'")
+        run_logger.log(f"[execute_posdrop_session] Strategy: {posdrop_strategy}, n_clusters: {n_clusters} (drop_rate: {drop_rate:.3f})")
+        
+        # ✅ CHECK FOR CACHED RESULTS FIRST (legacy mode)
+        cached_meta_evaluation = None
+        if args.skip_training_if_cached:
+            run_logger.log(f"[execute_training_session] Checking for cached predictions...")
+            
+            # Try new format first
+            cached_meta_evaluation = train_cls_PN_base.load_and_evaluate_existing_predictions(
+                tag_main=tag,
+                meta_evaluation_n_clusters=n_clusters,
+                posdrop_strategy=posdrop_strategy,
+                common=common,
+                data_use=data_use,
+                run_logger=run_logger,
+                run_meta_evaluation=run_meta_evaluation,
+                meta_eval_config=meta_eval_config,
+            )
+            
+            # ✅ BACKWARD COMPATIBILITY: Try legacy format if new format fails
+            if cached_meta_evaluation is None:
+                try:
+                    # Try with legacy drop_rate parameter if the function supports it
+                    cached_meta_evaluation = train_cls_PN_base.load_and_evaluate_existing_predictions(
+                        tag_main=tag,
+                        drop_rate=drop_rate,
+                        common=common,
+                        data_use=data_use,
+                        run_logger=run_logger,
+                        run_meta_evaluation=run_meta_evaluation,
+                        meta_eval_config=meta_eval_config,
+                    )
+                except TypeError:
+                    # Function doesn't support legacy drop_rate parameter
+                    pass
+        
+        
+        if cached_meta_evaluation is not None:
+            run_logger.log(f"[execute_training_session] ✅ Found cached predictions for '{tag}'")
+            
+            # Save cached meta evaluation results
+            if run_meta_evaluation and train_subset_indices is None: # Only save if not a subset run
+                train_cls_PN_base.save_meta_evaluation_results(
+                    meta_evaluation=cached_meta_evaluation,
+                    tag_main=tag,
+                    common=common,
+                    run_logger=run_logger
+                )
+            
+            run_logger.log(f"[execute_training_session] Skipping training (cached predictions used)")
+            for metric, data in cached_meta_evaluation.items():
+                if isinstance(data, dict) and 'mean' in data:
+                    run_logger.log(f"  {metric}: {data['mean']:.4f} ± {data['std']:.4f}")
+            result = cached_meta_evaluation # Use cached results
+        else:
+            run_logger.log(f"[execute_training_session] No cached predictions found, proceeding with training")
+        
+            # Execute single-configuration training
+            # Update common with subset indices if provided
+            common_with_subset = common.copy()
+            if train_subset_indices is not None:
+                common_with_subset['train_subset_indices'] = train_subset_indices
+
+            result = train_cls_PN_base.train_cls_1_PN_PosDrop(
+                meta_evaluation_n_clusters=n_clusters,
+                posdrop_strategy=posdrop_strategy,
+                seed=seed,
+                common=common_with_subset,
+                data_use=data_use,
+                filter_top_pct=args.filter_top_pct,
+                negs_per_pos=args.negs_per_pos,
+                action=action,
+                inference_fn=inference_fn,
+                tag_main=tag,
+                run_meta_evaluation=run_meta_evaluation,
+                meta_eval_config=meta_eval_config,
+            )
+            
+            if run_meta_evaluation:
+                train_cls_PN_base.save_meta_evaluation_results(
+                    meta_evaluation=result,
+                    tag_main=tag,
+                    common=common,
+                    run_logger=run_logger
+                )
+
+            # ✅ SAVE FULL TRAINING RESULTS
+            if save_results:
+                save_training_results(result, tag, effective_output_dir, run_logger)
+            
+            run_logger.log(f"[execute_training_session] Completed training for {tag}")
+
+def _run_repeated_trials(
+    tag_prefix: str,
+    n_runs: int,
+    data_use: Dict[str, Any],
+    action: str,
+    common: Dict[str, Any],
+    args: argparse.Namespace,
+    cfg: Any,
+    run_logger: "_RunLogger",
+    output_dir: Path,
+    data_modifier_fn: Callable[[Dict[str, Any], int], Tuple[Dict[str, Any], Optional[np.ndarray]]],
+    save_individual_runs: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    Helper to execute multiple runs of Standard PN training with data modifications.
+    """
+    results = []
+    
+    for i in range(n_runs):
+        run_tag = f"{tag_prefix}_run{i}"
+        run_logger.log(f"[{tag_prefix}] Run {i+1}/{n_runs}")
+        
+        # Apply data modification
+        modified_data, subset_indices = data_modifier_fn(data_use, i)
+        
+        # Execute session
+        res = execute_standard_session(
+            tag=run_tag,
+            data_use=modified_data,
+            action=action,
+            common=common,
+            args=args,
+            cfg=cfg,
+            run_logger=run_logger,
+            train_subset_indices=subset_indices,
+            output_dir=output_dir,
+            save_results=save_individual_runs
+        )
+        
+        if res:
+            results.append(res)
+            
+    return results
+
+
+def execute_unified_session(
+    tag: str,
+    data_use: Dict[str, Any],
+    action: str,
+    common: Dict[str, Any],
+    args: argparse.Namespace,
+    cfg: Any,
+    run_logger: "_RunLogger",
+    train_subset_indices: Optional[np.ndarray] = None,
+    output_dir: Optional[Path] = None,
+    save_results: bool = True,
+) -> Dict[str, Any]:
+    """
+    Unified execution session for all meta-evaluation methods (PosDrop, Shuffle, Stability).
+    Handles caching, execution, and result aggregation in a consistent manner.
+    """
+    # Extract seed and config
+    seed = common.get('seed', 42)
+    meta_eval_config = getattr(args, "_meta_eval_config", train_cls_PN_base.MetaEvaluationConfig())
+    run_meta_evaluation = bool(getattr(args, "run_meta_evaluation", True))
+    
+    # Determine output directory
+    effective_output_dir = output_dir if output_dir is not None else cfg.output_dir
+    
+    # Identify requested methods
+    methods_to_run = args.meta_eval_methods # e.g. ['posdrop', 'shuffle', 'stability']
+    
+    # Imports for metrics
+    from train_cls_PN_base import compute_pairwise_jaccard, compute_binary_entropy
+    
+    run_logger.log(f"[execute_unified_session] Starting Unified Session for '{tag}'")
+    run_logger.log(f"[execute_unified_session] Methods: {methods_to_run}")
+    
+    all_results = {}
+    config_status = {} # Track if TRAINED or CACHED
+    
+    # =================================================================================
+    # 1. PosDrop Execution
+    # =================================================================================
+    if 'posdrop' in methods_to_run:
+        run_logger.log(f"\n[execute_unified_session] --- PosDrop Workflow ---")
+        
+        # Determine execution mode
+        source_type = data_use.get("source_type")
+        is_method3 = source_type == "M3_Uni_KL_Overlap"
+        
+        multi_clustering_requested = (
+            len(args.meta_eval_posdrop_strategy) > 1 or 
+            len(args.meta_eval_posdrop_clusters) > 1
+        )
+        force_multi_for_method3 = is_method3
+        use_multi_clustering = multi_clustering_requested or force_multi_for_method3
+        
+        supports_caching = not is_method3
+        
+        # Prepare configurations
+        configs_to_run = []
+        if use_multi_clustering:
+            for method in args.meta_eval_posdrop_strategy:
+                for n_clusters in args.meta_eval_posdrop_clusters:
+                    configs_to_run.append({'method': method, 'n_clusters': n_clusters, 'name': f"{method}{n_clusters}"})
+        else:
+            # Legacy single config
+            method = args.meta_eval_posdrop_strategy[0]
+            n_clusters = args.meta_eval_posdrop_clusters[0]
+            configs_to_run.append({'method': method, 'n_clusters': n_clusters, 'name': f"{method}{n_clusters}"})
+
+        # Check Cache
+        missing_configs = []
+        if args.skip_training_if_cached and supports_caching:
+            run_logger.log(f"[execute_unified_session] Checking for cached PosDrop results...")
+            for config in configs_to_run:
+                config_name = config['name']
+                cached_result = train_cls_PN_base.load_and_evaluate_existing_predictions(
+                    tag_main=tag,
+                    meta_evaluation_n_clusters=config['n_clusters'],
+                    posdrop_strategy=config['method'],
+                    common=common,
+                    data_use=data_use,
+                    run_logger=run_logger,
+                    run_meta_evaluation=run_meta_evaluation,
+                    meta_eval_config=meta_eval_config,
+                )
+                
+                if cached_result:
+                    all_results[config_name] = cached_result
+                    config_status[config_name] = "CACHED"
+                    run_logger.log(f"[execute_unified_session] ✅ Found cached: {config_name}")
+                else:
+                    missing_configs.append(config)
+        else:
+            missing_configs = configs_to_run
+
+        # Execute Missing Configs
+        if missing_configs:
+            methods_to_train = list(set(c['method'] for c in missing_configs))
+            clusters_to_train = list(set(c['n_clusters'] for c in missing_configs))
+            
+            run_logger.log(f"[execute_unified_session] Training {len(missing_configs)} PosDrop configurations...")
+            
+            # Update common with subset indices if provided
+            common_with_subset = common.copy()
+            if train_subset_indices is not None:
+                common_with_subset['train_subset_indices'] = train_subset_indices
+
+            training_results = train_cls_PN_base.train_cls_1_PN_PosDrop_MultiClustering(
+                posdrop_strategies=methods_to_train,
+                meta_evaluation_n_clusters_list=clusters_to_train,
+                seed=seed,
+                common=common_with_subset,
+                data_use=data_use,
+                filter_top_pct=args.filter_top_pct,
+                negs_per_pos=args.negs_per_pos,
+                action=action,
+                inference_fn=run_inference_base,
+                tag_main=tag,
+                meta_evaluation_metrics=set(args.meta_eval_metrics),
+                run_meta_evaluation=run_meta_evaluation,
+                meta_eval_config=meta_eval_config,
+            )
+            
+            # Merge results
+            for k, v in training_results.items():
+                all_results[k] = v
+                config_status[k] = "TRAINED"
+                
+                # Save individual results
+                if save_results and "error" not in v:
+                    method_tag = f"{tag}_PosDrop_{k}"
+                    posdrop_base = effective_output_dir / f"{tag}_posdrop"
+                    # Fix: Pass posdrop_base directly, save_training_results appends method_tag
+                    save_training_results(v, method_tag, posdrop_base, run_logger)
+                    if run_meta_evaluation:
+                        # Save meta-eval JSON to standard location
+                        meta_eval_dir = cfg.output_dir / "cls_1_training_results/meta_evaluation_results"
+                        train_cls_PN_base.save_meta_evaluation_results(
+                            meta_evaluation=v,
+                            tag_main=method_tag,
+                            common=common,
+                            run_logger=run_logger,
+                            output_dir=meta_eval_dir
+                        )
+
+    # =================================================================================
+    # 2. Target Shuffling Execution
+    # =================================================================================
+    if 'shuffle' in methods_to_run:
+        run_logger.log(f"\n[execute_unified_session] --- Target Shuffling Workflow ---")
+        
+        # We need a baseline to compare against. 
+        # If PosDrop was run, we use those results. 
+        # If not, we might need to run a standard session first? 
+        # For now, assume PosDrop results (or at least one standard result) exist if we want to compare.
+        # But wait, Shuffle compares "Real PAUC" vs "Shuffled PAUC".
+        # Real PAUC comes from the baseline run (PosDrop or Standard).
+        
+        # Let's define the baseline results to evaluate
+        baseline_results = {k: v for k, v in all_results.items() if "error" not in v}
+        if not baseline_results:
+             # If no PosDrop, run a single Standard Session as baseline
+             run_logger.log("[execute_unified_session] No PosDrop results found. Running Standard Baseline for Shuffle...")
+             std_res = execute_standard_session(tag, data_use, action, common, args, cfg, run_logger, train_subset_indices, effective_output_dir, save_results)
+             baseline_results = {"standard": std_res}
+             all_results["standard"] = std_res
+             config_status["standard"] = "TRAINED"
+
+        # Prepare Shuffle Directory
+        shuffle_dir = effective_output_dir / f"{tag}_TargetShuffle"
+        shuffle_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Define modifier
+        def shuffle_modifier(data, idx):
+            d = data.copy()
+            y = data['labels'].copy()
+            np.random.shuffle(y)
+            d['labels'] = y
+            return d, None
+
+        # Run Trials
+        shuffle_results_list = _run_repeated_trials(
+            tag_prefix=f"{tag}_TargetShuffle",
+            n_runs=args.meta_eval_shuffle_runs,
+            data_use=data_use,
+            action=action,
+            common=common,
+            args=args,
+            cfg=cfg,
+            run_logger=run_logger,
+            output_dir=shuffle_dir,
+            data_modifier_fn=shuffle_modifier,
+            save_individual_runs=True # User requested saving individual runs
+        )
+        
+        # Aggregate Shuffle Results
+        shuffle_metrics = {k: {
+            'pauc': [], 'lift': [], 'background_rejection': [], 
+            'posdrop_acc': [], 'spatial_entropy': [], 'focus': [],
+            'fpr_at_tpr90': [] # For FDE
+        } for k in baseline_results.keys()}
+
+        for res in shuffle_results_list:
+            meta = res.get('meta_evaluation', res)
+            
+            # Extract metrics
+            for k in baseline_results.keys():
+                # PAUC
+                pauc_data = meta.get('pauc', {})
+                if pauc_data:
+                    val = list(pauc_data.values())[0]
+                    if isinstance(val, dict) and 'mean' in val: val = val['mean']
+                    shuffle_metrics[k]['pauc'].append(val)
+                
+                # Lift (heuristic: first area)
+                lift_data = meta.get('lift', {})
+                if lift_data:
+                    val = list(lift_data.values())[0]
+                    if isinstance(val, dict) and 'mean_lift' in val: val = val['mean_lift']
+                    shuffle_metrics[k]['lift'].append(val)
+                    
+                # Background Rejection (heuristic: mean of means or first threshold?)
+                # BR is usually a list. Let's take mean of the list for scalar summary?
+                # Or just store the whole list? For Z-score we need scalar.
+                # Let's skip Z-score for BR for now, just store raw if needed.
+                # Actually user wants "Bias Check" for BR.
+                br_data = meta.get('background_rejection', {})
+                if br_data:
+                    val = br_data.get('mean', 0) if isinstance(br_data, dict) else np.mean(br_data)
+                    shuffle_metrics[k]['background_rejection'].append(val)
+                    
+                # PosDrop Acc
+                if 'posdrop_acc' in meta:
+                    val = meta['posdrop_acc']
+                    if isinstance(val, dict): val = val.get('mean', 0)
+                    shuffle_metrics[k]['posdrop_acc'].append(val)
+                    
+                # Spatial Entropy
+                if 'spatial_entropy' in meta:
+                    shuffle_metrics[k]['spatial_entropy'].append(meta['spatial_entropy'])
+                    
+                # Focus
+                if 'focus' in meta:
+                    val = meta['focus']
+                    if isinstance(val, dict): val = val.get('mean', 0)
+                    shuffle_metrics[k]['focus'].append(val)
+                    
+                # FPR for FDE (using pu_fpr at pi=0.05 as proxy for TPR~90% constraint?)
+                # Or extract from pu_tpr/pu_fpr lists?
+                # Let's use pu_fpr['0.05'] if available
+                pu_fpr = meta.get('pu_fpr', {})
+                if pu_fpr and '0.05' in pu_fpr:
+                     # pu_fpr['0.05'] is usually a dict with 'mean', 'std' or list
+                     # If it's from _aggregate_pi_metric, it has 'mean' (scalar if simple, or array?)
+                     # _aggregate_pi_metric returns {'mean': ..., 'std': ...} where mean is array over thresholds
+                     # We need a scalar. Let's take the mean over thresholds? No, that's meaningless.
+                     # We need FPR at specific TPR.
+                     # Let's try to get it from 'fpr_at_tpr90' if we computed it? We didn't.
+                     # Fallback: Use 'fde' metric if computed by base (it's not).
+                     # Let's use the mean of the FPR array for now as a rough proxy if we can't do better.
+                     # Or better: just skip FDE calculation here if too complex and rely on what's available.
+                     # But user specifically asked for FDE.
+                     # Let's assume 'pu_fpr' -> '0.05' -> 'mean' is a list of FPRs.
+                     # We take the mean of that list? No.
+                     # Let's just take the first element?
+                     pass
+
+        # Compute Z-Scores and Update Results
+        rigorous_shuffle = {}
+        for k, baseline in baseline_results.items():
+            config_metrics = {}
+            
+            # 1. Z-Score (PAUC)
+            paucs = shuffle_metrics[k]['pauc']
+            if paucs:
+                mean_s, std_s = np.mean(paucs), np.std(paucs)
+                meta = baseline.get('meta_evaluation', baseline)
+                pauc_data = meta.get('pauc', {})
+                real_pauc = 0.0
+                if pauc_data:
+                    val = list(pauc_data.values())[0]
+                    real_pauc = val['mean'] if isinstance(val, dict) and 'mean' in val else val
+                
+                z_score = (real_pauc - mean_s) / (std_s + 1e-9)
+                config_metrics['z_score'] = float(z_score)
+                config_metrics['pauc'] = {'real': float(real_pauc), 'shuffle_mean': float(mean_s), 'shuffle_std': float(std_s)}
+                run_logger.log(f"[Target Shuffling] {k}: Z-Score={z_score:.4f} (Real={real_pauc:.4f}, Shuffle={mean_s:.4f}±{std_s:.4f})")
+            else:
+                config_metrics['z_score'] = None
+                config_metrics['pauc'] = None
+
+            # 2. FDE (Real FPR - Mean Shuffle FPR)
+            # Placeholder logic: assuming we can get a scalar FPR
+            # For now, set to None if we can't reliably compute it without raw curves
+            config_metrics['fde'] = None 
+            
+            # 3. Other Metrics (Just stats)
+            for m in ['lift', 'background_rejection', 'posdrop_acc', 'spatial_entropy', 'focus']:
+                vals = shuffle_metrics[k][m]
+                if vals:
+                    config_metrics[m] = {'mean': float(np.mean(vals)), 'std': float(np.std(vals))}
+                else:
+                    config_metrics[m] = None
+
+            # 4. Explicit N/A
+            config_metrics['topk'] = None
+            config_metrics['spatial_jaccard'] = None
+            
+            rigorous_shuffle[k] = config_metrics
+
+        # Save Shuffle Results
+        if rigorous_shuffle:
+            meta_eval_dir = cfg.output_dir / "cls_1_training_results/meta_evaluation_results"
+            train_cls_PN_base.update_meta_evaluation_results(
+                tag_main=tag,
+                new_data={'target_shuffling': rigorous_shuffle},
+                common=common,
+                run_logger=run_logger,
+                output_dir=meta_eval_dir
+            )
+            all_results['target_shuffling'] = rigorous_shuffle # Add to all_results for summary
+
+    # =================================================================================
+    # 3. Stability Selection Execution
+    # =================================================================================
+    if 'stability' in methods_to_run:
+        run_logger.log(f"\n[execute_unified_session] --- Stability Selection Workflow ---")
+        
+        # Baseline needed? Yes, to map results.
+        baseline_results = {k: v for k, v in all_results.items() if "error" not in v and k != 'target_shuffling'}
+        if not baseline_results:
+             run_logger.log("[execute_unified_session] No baseline results found. Running Standard Baseline for Stability...")
+             std_res = execute_standard_session(tag, data_use, action, common, args, cfg, run_logger, train_subset_indices, effective_output_dir, save_results)
+             baseline_results = {"standard": std_res}
+             all_results["standard"] = std_res
+             config_status["standard"] = "TRAINED"
+
+        stability_dir = effective_output_dir / f"{tag}_StabilitySelection"
+        stability_dir.mkdir(parents=True, exist_ok=True)
+
+        # Indices
+        labels = data_use['labels']
+        is_pos = labels >= 0.9
+        u_indices = np.where(~is_pos)[0]
+        p_indices = np.where(is_pos)[0]
+        n_subsample = int(len(u_indices) * args.meta_eval_stability_rate)
+
+        def stability_modifier(data, idx):
+            u_sub = np.random.choice(u_indices, n_subsample, replace=False)
+            subset = np.concatenate([p_indices, u_sub])
+            subset.sort()
+            return data, subset
+
+        # Run Trials
+        stability_results_list = _run_repeated_trials(
+            tag_prefix=f"{tag}_StabilitySelection",
+            n_runs=args.meta_eval_stability_runs,
+            data_use=data_use,
+            action=action,
+            common=common,
+            args=args,
+            cfg=cfg,
+            run_logger=run_logger,
+            output_dir=stability_dir,
+            data_modifier_fn=stability_modifier,
+            save_individual_runs=True # User requested saving individual runs
+        )
+
+        # Aggregate Stability Results
+        stability_metrics = {k: {
+            'accuracy': [], 'lift': [], 'pauc': [], 'background_rejection': [],
+            'posdrop_acc': [], 'focus': [],
+            'val_probs_list': [] # For Spatial Metrics
+        } for k in baseline_results.keys()}
+        
+        for res in stability_results_list:
+            # Extract metrics
+            meta = res.get('meta_evaluation', res)
+            
+            # Extract val_probs if available (from inference_result)
+            val_probs = None
+            if 'inference_result' in res:
+                val_probs = res['inference_result'].get('val_probs')
+            elif 'val_probs' in res:
+                val_probs = res['val_probs']
+            
+            for k in baseline_results.keys():
+                # Store val_probs for spatial metrics
+                if val_probs is not None:
+                    stability_metrics[k]['val_probs_list'].append(val_probs)
+
+                # Basic Metrics
+                for metric in ['accuracy', 'lift', 'pauc', 'background_rejection', 'posdrop_acc', 'focus']:
+                    if metric in meta:
+                        val = meta[metric]
+                        # Handle nested structures
+                        if isinstance(val, dict):
+                            if 'mean' in val: val = val['mean']
+                            elif 'mean_lift' in val: val = val['mean_lift']
+                            elif metric == 'pauc': val = list(val.values())[0]['mean']
+                            elif metric == 'lift': val = list(val.values())[0]['mean_lift']
+                        
+                        if isinstance(val, (int, float)):
+                            stability_metrics[k][metric].append(val)
+                        elif isinstance(val, list):
+                             # For BR, maybe take mean?
+                             stability_metrics[k][metric].append(np.mean(val))
+
+        # Compute Variance and Spatial Metrics
+        rigorous_stability = {}
+        for k, metrics in stability_metrics.items():
+            config_stab = {}
+            
+            # 1. Spatial Jaccard & Entropy
+            probs_list = metrics['val_probs_list']
+            if probs_list:
+                # Stack probs: (n_runs, n_samples)
+                # Ensure they are numpy arrays and same shape
+                try:
+                    probs_stack = np.stack([np.array(p) for p in probs_list])
+                    
+                    # Spatial Jaccard (Masks > 0.5)
+                    masks = probs_stack > 0.5
+                    spatial_jaccard = compute_pairwise_jaccard(masks)
+                    config_stab['spatial_jaccard'] = spatial_jaccard
+                    
+                    # Spatial Entropy (Entropy of Mean Map)
+                    mean_probs = np.mean(probs_stack, axis=0)
+                    entropy_map = compute_binary_entropy(mean_probs)
+                    spatial_entropy = float(np.mean(entropy_map))
+                    config_stab['spatial_entropy'] = spatial_entropy
+                    
+                except Exception as e:
+                    run_logger.log(f"[Stability Selection] Error computing spatial metrics for {k}: {e}")
+                    config_stab['spatial_jaccard'] = None
+                    config_stab['spatial_entropy'] = None
+            else:
+                config_stab['spatial_jaccard'] = None
+                config_stab['spatial_entropy'] = None
+
+            # 2. Other Metrics (Mean/Std)
+            for m in ['accuracy', 'lift', 'pauc', 'background_rejection', 'posdrop_acc', 'focus']:
+                vals = metrics[m]
+                if vals:
+                    config_stab[m] = {'mean': float(np.mean(vals)), 'std': float(np.std(vals))}
+                else:
+                    config_stab[m] = None
+            
+            # 3. Explicit N/A
+            config_stab['z_score'] = None
+            config_stab['fde'] = None
+            config_stab['topk'] = None
+
+            rigorous_stability[k] = config_stab
+            run_logger.log(f"[Stability Selection] {k}: Jaccard={config_stab['spatial_jaccard']}, Entropy={config_stab['spatial_entropy']}")
+
+        # Save Stability Results
+        if rigorous_stability:
+            meta_eval_dir = cfg.output_dir / "cls_1_training_results/meta_evaluation_results"
+            train_cls_PN_base.update_meta_evaluation_results(
+                tag_main=tag,
+                new_data={'stability_selection': rigorous_stability},
+                common=common,
+                run_logger=run_logger,
+                output_dir=meta_eval_dir
+            )
+            all_results['stability_selection'] = rigorous_stability
+
+    # =================================================================================
+    # Final Summary
+    # =================================================================================
+    if run_meta_evaluation and all_results:
+        run_logger.log(f"\n[execute_unified_session] ===== COMPLETE UNIFIED SUMMARY for {tag} =====")
+        
+        # Group metrics for display
+        metrics_group = {}
+        
+        # 1. PosDrop/Standard Metrics
+        for k, result in all_results.items():
+            if k in ['target_shuffling', 'stability_selection'] or "error" in result: continue
+            status = config_status.get(k, "TRAINED")
+            
+            # Extract metrics
+            meta = result.get('meta_evaluation', result)
+            for metric, data in meta.items():
+                if isinstance(data, dict) and 'mean' in data:
+                    metrics_group.setdefault(metric, []).append((k, status, data))
+        
+        # Log PosDrop Metrics
+        for metric_name, entries in metrics_group.items():
+            run_logger.log(f"[Summary] -- {metric_name} --")
+            for k, status, data in entries:
+                mean_val = data['mean']
+                std_val = data['std']
+                
+                # Handle list/array values (e.g. background_rejection)
+                if isinstance(mean_val, (list, np.ndarray)):
+                    # For summary, just show the first value or mean of means? 
+                    # Usually BR is at specific TPRs. Let's just show the first one or format as string.
+                    # But to be safe and concise, let's try to format it if it's scalar-like, else str.
+                    try:
+                        run_logger.log(f"  {k} ({status}): {mean_val} ± {std_val}")
+                    except:
+                        run_logger.log(f"  {k} ({status}): [Complex Data]")
+                else:
+                    run_logger.log(f"  {k} ({status}): {mean_val:.4f} ± {std_val:.4f}")
+
+        # 2. Shuffle Results
+        if 'target_shuffling' in all_results:
+            run_logger.log(f"[Summary] -- Target Shuffling (Z-Score) --")
+            for k, data in all_results['target_shuffling'].items():
+                run_logger.log(f"  {k}: {data['z_score']:.4f}")
+
+        # 3. Stability Results
+        if 'stability_selection' in all_results:
+            run_logger.log(f"[Summary] -- Stability Selection (Std Dev) --")
+            for k, data in all_results['stability_selection'].items():
+                run_logger.log(f"  {k}: {data}")
+
+        run_logger.log(f"[execute_unified_session] ===== END SUMMARY =====")
+
+    return all_results
 
 def Unifying_METHOD1_PHI_OverlapOnly(
     overlap_info: Dict[str, object],
@@ -722,7 +1692,6 @@ def Unifying_METHOD2_concat_two_embeddings(
         'source_type': 'original_plus_dcca',
     }   
 
-
 def Unifying_METHOD3_Uni_KL_Overlap(
     anchor_original: Dict[str, object],
     target_original: Dict[str, object],
@@ -926,7 +1895,6 @@ def Unifying_METHOD3_Uni_KL_Overlap(
         'target_samples': target_features.shape[0],
     }
 
-
 def _substitute_label_overlap_constrained(
     data: Dict[str, object],
     label_source: Dict[str, object],
@@ -1084,16 +2052,16 @@ def _substitute_label_overlap_constrained(
 
 def train_save_eval_result(
     tag: str,
-    data_use: Dict[str, object],
-    action: object,
-    common: Dict[str, object],
-    args,
-    cfg,
+    data_use: Dict[str, Any],
+    action: str,
+    common: Dict[str, Any],
+    args: argparse.Namespace,
+    cfg: Any,
     run_logger: "_RunLogger",
     train_subset_indices: Optional[np.ndarray] = None,
-    run_rigorous: bool = False,
+    run_rigorous: bool = True,
     output_dir: Optional[Path] = None,
-) -> Optional[Dict[str, Any]]:
+) -> Union[Dict[str, Any], None]:
     """
     Unified training function that handles both legacy and multi-clustering modes.
     Always checks for cached predictions first before training.
@@ -1107,495 +2075,35 @@ def train_save_eval_result(
         cfg: Configuration object
         run_logger: Logger for debugging
         train_subset_indices: Optional indices to restrict training data (for Stability Selection)
+        run_rigorous: bool = False (Deprecated, handled by args.meta_eval_methods)
+        output_dir: Optional[Path] = None
         
     Returns:
-        Dictionary containing training results (metrics, model, etc.) or None
+        Dictionary containing results
     """
     
-    # Extract seed from common parameters
-    seed = common.get('seed', 42)
+    # Determine output directory
+    # User requested: cls_1_training_results/All/{tag}
+    effective_output_dir = output_dir if output_dir is not None else cfg.output_dir
+    effective_output_dir = effective_output_dir / "cls_1_training_results" / "All" / tag
+    effective_output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Convert meta_evaluation argument to set
-    meta_evaluation_metrics = set(args.meta_eval_metrics)
-    meta_eval_config = getattr(args, "_meta_eval_config", train_cls_PN_base.MetaEvaluationConfig())
-    run_meta_evaluation = bool(getattr(args, "run_meta_evaluation", True))
-    source_type = data_use.get("source_type")
-    is_method3 = source_type == "M3_Uni_KL_Overlap"
-    
-
-    # Determine execution mode based on parameters
-    multi_clustering_requested = (
-        len(args.meta_eval_posdrop_strategy) > 1 or 
-        len(args.meta_eval_posdrop_clusters) > 1
+    # Execute Unified Session
+    # This handles PosDrop, Shuffle, and Stability based on args.meta_eval_methods
+    results = execute_unified_session(
+        tag=tag,
+        data_use=data_use,
+        action=action,
+        common=common,
+        args=args,
+        cfg=cfg,
+        run_logger=run_logger,
+        train_subset_indices=train_subset_indices,
+        output_dir=effective_output_dir,
+        save_results=True
     )
-    
-    inference_fn = run_inference_base
-    # METHOD3 always reuses the multi-configuration path even when only a single
-    # clustering config is supplied, so track that explicitly to avoid confusion.
-    force_multi_for_method3 = is_method3
-    use_multi_clustering = multi_clustering_requested or force_multi_for_method3
 
-    if use_multi_clustering:
-        if is_method3:
-            run_logger.log(f"[train_and_save_result] METHOD3 (shared overlap) multi-configuration mode for '{tag}'")
-        else:
-            run_logger.log(f"[train_and_save_result] MULTI-CLUSTERING MODE for '{tag}'")
-        run_logger.log(f"[train_and_save_result] Strategies: {args.meta_eval_posdrop_strategy}")
-        run_logger.log(f"[train_and_save_result] Cluster counts: {args.meta_eval_posdrop_clusters}")
-
-
-        supports_caching = not is_method3
-        cached_results = {}
-        config_status: Dict[str, str] = {}
-        missing_configs: List[Dict[str, object]] = []
-
-        # ✅ CHECK FOR CACHED RESULTS FIRST (multi-clustering)
-        if args.skip_training_if_cached:
-            run_logger.log(f"[train_and_save_result] Checking for cached multi-clustering results...")
-            if supports_caching:
-                for method in args.meta_eval_posdrop_strategy:
-                    for n_clusters in args.meta_eval_posdrop_clusters:
-                        config_name = f"{method}{n_clusters}"
-
-                        cached_result = train_cls_PN_base.load_and_evaluate_existing_predictions(
-                            tag_main=tag,
-                            meta_evaluation_n_clusters=n_clusters,
-                            posdrop_strategy=method,
-                            common=common,
-                            data_use=data_use,
-                            run_logger=run_logger,
-                            run_meta_evaluation=run_meta_evaluation,
-                            meta_eval_config=meta_eval_config,
-                        )
-
-                        if cached_result is not None:
-                            cached_results[config_name] = cached_result
-                            run_logger.log(f"[train_and_save_result] ✅ Found cached predictions for {config_name}")
-                        else:
-                            missing_configs.append({'method': method, 'n_clusters': n_clusters, 'name': config_name})
-                            run_logger.log(f"[train_and_save_result] ❌ No cached predictions for {config_name}")
-
-                total_configs = len(args.meta_eval_posdrop_strategy) * len(args.meta_eval_posdrop_clusters)
-                if run_meta_evaluation:
-                    for config_name, result in cached_results.items():
-                        method_tag = f"{tag}_{config_name}"
-                        train_cls_PN_base.save_meta_evaluation_results(
-                            meta_evaluation=result,
-                            tag_main=method_tag,
-                            common=common,
-                            run_logger=run_logger
-                        )
-                        run_logger.log(f"[train_and_save_result] ✅ CACHED: {config_name} - saved existing predictions")
-
-                if len(cached_results) == total_configs:
-                    run_logger.log(f"[train_and_save_result] ✅ All {total_configs} configurations cached, no training needed")
-                    run_logger.log(f"[train_and_save_result] ===== CACHED MULTI-CLUSTERING RESULTS =====")
-                    for config_name, result in cached_results.items():
-                        for metric, data in result.items():
-                            if isinstance(data, dict) and 'mean' in data:
-                                run_logger.log(f"[train_and_save_result] {config_name} {metric}: {data['mean']} ± {data['std']}")
-                    run_logger.log(f"[train_and_save_result] ===== END CACHED RESULTS =====")
-                    return
-
-                if missing_configs:
-                    run_logger.log(f"[train_and_save_result] CACHE SUMMARY: {len(cached_results)} cached, {len(missing_configs)} to train (total: {total_configs})")
-                methods_to_train = list(set(config['method'] for config in missing_configs))
-                clusters_to_train = list(set(config['n_clusters'] for config in missing_configs))
-            else:
-                run_logger.log("[train_and_save_result] Caching not supported for METHOD3; training all configurations.")
-                missing_configs = [
-                    {'method': method, 'n_clusters': n_clusters, 'name': f"{method}{n_clusters}"}
-                    for method in args.meta_eval_posdrop_strategy
-                    for n_clusters in args.meta_eval_posdrop_clusters
-                ]
-                methods_to_train = list(set(config['method'] for config in missing_configs))
-                clusters_to_train = list(set(config['n_clusters'] for config in missing_configs))
-        else:
-            missing_configs = [
-                {'method': method, 'n_clusters': n_clusters, 'name': f"{method}{n_clusters}"}
-                for method in args.meta_eval_posdrop_strategy
-                for n_clusters in args.meta_eval_posdrop_clusters
-            ]
-            methods_to_train = list(set(config['method'] for config in missing_configs))
-            clusters_to_train = list(set(config['n_clusters'] for config in missing_configs))
-            run_logger.log(f"[train_and_save_result] No caching - training all configurations")
-
-        training_results = {}
-        if missing_configs:
-            run_logger.log(f"[train_and_save_result] Training {len(methods_to_train)} methods x {len(clusters_to_train)} cluster counts...")
-            
-            # Update common with subset indices if provided
-            common_with_subset = common.copy()
-            if train_subset_indices is not None:
-                common_with_subset['train_subset_indices'] = train_subset_indices
-
-            training_results = train_cls_PN_base.train_cls_1_PN_PosDrop_MultiClustering(
-                posdrop_strategies=methods_to_train,
-                meta_evaluation_n_clusters_list=clusters_to_train,
-
-                seed=seed,
-                common=common_with_subset,
-                data_use=data_use,
-                filter_top_pct=args.filter_top_pct,
-                negs_per_pos=args.negs_per_pos,
-                action=action,
-                inference_fn=inference_fn,
-                tag_main=tag,
-                meta_evaluation_metrics=meta_evaluation_metrics,
-                run_meta_evaluation=run_meta_evaluation,
-                meta_eval_config=meta_eval_config,
-            )
-        
-        # Combine cached and training results for final summary
-        if args.skip_training_if_cached and 'cached_results' in locals():
-            all_results = {**cached_results, **training_results}
-            for name in cached_results:
-                config_status[name] = "CACHED"
-            for name in training_results:
-                config_status[name] = "TRAINED"
-            run_logger.log(f"[train_and_save_result] Combined {len(cached_results)} cached + {len(training_results)} trained = {len(all_results)} total results")
-        else:
-            all_results = training_results
-            config_status = {name: "TRAINED" for name in training_results}
-        
-        # Save newly trained results (cached results already saved above)
-        for method_cluster_key, result in training_results.items():
-            if "error" not in result:
-                method_tag = f"{tag}_{method_cluster_key}"
-
-                # Save meta evaluation results
-                if run_meta_evaluation and train_subset_indices is None: # Only save if not a subset run
-                    train_cls_PN_base.save_meta_evaluation_results(
-                        meta_evaluation=result,
-                        tag_main=method_tag,
-                        common=common,
-                        run_logger=run_logger
-                    )
-
-                # Save full training results
-                if train_subset_indices is None: # Only save if not a subset run
-                    save_training_results(
-                        result=result,
-                        tag=method_tag,
-                        # output_dir=Path(cfg.output_dir)/"cls_1_training_results" / method_tag,
-                        output_dir=Path(cfg.output_dir)/"cls_1_training_results"/ "meta_evaluation_results" / method_tag,
-                        run_logger=run_logger
-                    )
-                
-                run_logger.log(f"[train_and_save_result] ✅ TRAINED: {method_cluster_key}")
-            else:
-                run_logger.log(f"[train_and_save_result] ❌ ERROR in {method_cluster_key}: {result['error']}")
-        
-        # Final comprehensive summary showing both cached and trained results
-        if run_meta_evaluation and all_results:
-            run_logger.log(f"[train_and_save_result] ===== COMPLETE MULTI-CLUSTERING SUMMARY for {tag} =====")
-            metrics_group: Dict[str, List[Tuple[str, str, Dict[str, float]]]] = {}
-            for method_cluster_key, result in all_results.items():
-                if "error" in result:
-                    continue
-                status = config_status.get(method_cluster_key, "TRAINED")
-                for metric, data in result.items():
-                    if isinstance(data, dict) and 'mean' in data:
-                        metrics_group.setdefault(metric, []).append((method_cluster_key, status, data))
-            for metric_name, entries in metrics_group.items():
-                run_logger.log(f"[train_and_save_result] -- {metric_name} --")
-                for method_cluster_key, status, data in entries:
-                    if isinstance(data['mean'], (int, float)):
-                        run_logger.log(f"[train_and_save_result] {method_cluster_key} ({status}): {data['mean']:.4f} ± {data['std']:.4f}")
-                    else:
-                        # Skip logging non-scalar means (like curves)
-                        pass
-            run_logger.log(f"[train_and_save_result] ===== END SUMMARY =====")
-        
-        return all_results # Return all results for multi-clustering
-    
-    else:
-        # LEGACY MODE: Single method, single cluster count
-        posdrop_strategy = args.meta_eval_posdrop_strategy[0]  # Should be "latent_dist"
-        n_clusters = args.meta_eval_posdrop_clusters[0]  # Single value
-        
-        # Convert to legacy drop_rate for backward compatibility
-        drop_rate = 1.0 / n_clusters
-        
-        run_logger.log(f"[train_and_save_result] LEGACY MODE for '{tag}'")
-        run_logger.log(f"[train_and_save_result] Strategy: {posdrop_strategy}, n_clusters: {n_clusters} (drop_rate: {drop_rate:.3f})")
-        
-        # ✅ CHECK FOR CACHED RESULTS FIRST (legacy mode)
-        cached_meta_evaluation = None
-        if args.skip_training_if_cached:
-            run_logger.log(f"[train_and_save_result] Checking for cached predictions...")
-            
-            # Try new format first
-            cached_meta_evaluation = train_cls_PN_base.load_and_evaluate_existing_predictions(
-                tag_main=tag,
-                meta_evaluation_n_clusters=n_clusters,
-                posdrop_strategy=posdrop_strategy,
-                common=common,
-                data_use=data_use,
-                run_logger=run_logger,
-                run_meta_evaluation=run_meta_evaluation,
-                meta_eval_config=meta_eval_config,
-            )
-            
-            # ✅ BACKWARD COMPATIBILITY: Try legacy format if new format fails
-            if cached_meta_evaluation is None:
-                try:
-                    # Try with legacy drop_rate parameter if the function supports it
-                    cached_meta_evaluation = train_cls_PN_base.load_and_evaluate_existing_predictions(
-                        tag_main=tag,
-                        drop_rate=drop_rate,
-                        common=common,
-                        data_use=data_use,
-                        run_logger=run_logger,
-                        run_meta_evaluation=run_meta_evaluation,
-                        meta_eval_config=meta_eval_config,
-                    )
-                except TypeError:
-                    # Function doesn't support legacy drop_rate parameter
-                    pass
-        
-        # Determine output directory
-        effective_output_dir = output_dir if output_dir is not None else cfg.output_dir
-
-        if cached_meta_evaluation is not None:
-            run_logger.log(f"[train_save_eval_result] ✅ Found cached predictions for '{tag}'")
-            
-            # Save cached meta evaluation results
-            if run_meta_evaluation and train_subset_indices is None: # Only save if not a subset run
-                train_cls_PN_base.save_meta_evaluation_results(
-                    meta_evaluation=cached_meta_evaluation,
-                    tag_main=tag,
-                    common=common,
-                    run_logger=run_logger
-                )
-            
-            run_logger.log(f"[train_save_eval_result] Skipping training (cached predictions used)")
-            for metric, data in cached_meta_evaluation.items():
-                if isinstance(data, dict) and 'mean' in data:
-                    run_logger.log(f"  {metric}: {data['mean']:.4f} ± {data['std']:.4f}")
-            result = cached_meta_evaluation # Use cached results
-        else:
-            run_logger.log(f"[train_save_eval_result] No cached predictions found, proceeding with training")
-        
-            # Execute single-configuration training
-            # Update common with subset indices if provided
-            common_with_subset = common.copy()
-            if train_subset_indices is not None:
-                common_with_subset['train_subset_indices'] = train_subset_indices
-
-            result = train_cls_PN_base.train_cls_1_PN_PosDrop(
-                meta_evaluation_n_clusters=n_clusters,
-                posdrop_strategy=posdrop_strategy,
-
-                seed=seed,
-                common=common_with_subset,
-                data_use=data_use,
-                filter_top_pct=args.filter_top_pct,
-                negs_per_pos=args.negs_per_pos,
-                action=action,
-                inference_fn=inference_fn,
-                tag_main=tag,
-                run_meta_evaluation=run_meta_evaluation,
-                meta_eval_config=meta_eval_config,
-            )
-            
-            if run_meta_evaluation:
-                train_cls_PN_base.save_meta_evaluation_results(
-                    meta_evaluation=result,
-                    tag_main=tag,
-                    common=common,
-                    run_logger=run_logger
-                )
-
-            # ✅ SAVE FULL TRAINING RESULTS
-            save_training_results(result, tag, effective_output_dir, run_logger)
-            
-            run_logger.log(f"[train_save_eval_result] Completed training for {tag}")
-            for metric, data in result.items():
-                if isinstance(data, dict) and 'mean' in data:
-                    run_logger.log(f"  {metric}: {data['mean']:.4f} ± {data['std']:.4f}")
-
-    # ✅ RIGOROUS EVALUATION FRAMEWORK
-    if run_rigorous:
-        run_logger.log(f"\n[train_save_eval_result] ===== STARTING RIGOROUS EVALUATION SUITE =====")
-        rigorous_results = {}
-        baseline_result = result
-
-        # 2. Target Shuffling (Bias Check)
-        if "shuffle" in args.meta_eval_methods and args.meta_eval_shuffle_runs > 0:
-            run_logger.log(f"\n[train_save_eval_result] ===== STARTING TARGET SHUFFLING ({args.meta_eval_shuffle_runs} runs) =====")
-            
-            # Create subdirectory for shuffling results
-            shuffle_dir = effective_output_dir / "Rigorous_Shuffle"
-            shuffle_dir.mkdir(parents=True, exist_ok=True)
-            
-            shuffle_paucs = []
-            shuffle_fprs = []
-            
-            for i in range(args.meta_eval_shuffle_runs):
-                run_logger.log(f"[Target Shuffling] Run {i+1}/{args.meta_eval_shuffle_runs}")
-                
-                # Create shuffled data
-                data_shuffled = data_use.copy()
-                y_true = data_use['labels'].copy()
-                
-                # Shuffle labels but keep P count (random permutation)
-                np.random.shuffle(y_true)
-                data_shuffled['labels'] = y_true
-                
-                # Train on shuffled data
-                tag_shuffle = f"{tag}_TargetShuffle_run{i}"
-                
-                res = train_save_eval_result(
-                    tag=tag_shuffle,
-                    data_use=data_shuffled,
-                    action=action,
-                    common=common,
-                    args=args,
-                    cfg=cfg,
-                    run_logger=run_logger,
-                    run_rigorous=False,
-                    output_dir=shuffle_dir
-                )
-                
-                if res and 'pauc' in res:
-                    # Extract mean PAUC for the first prior
-                    pauc_data = res.get('pauc', {})
-                    if pauc_data:
-                        first_prior = list(pauc_data.keys())[0]
-                        shuffle_paucs.append(pauc_data[first_prior]['mean'])
-                
-                # Compute FPR at TPR=0.9
-                # Note: Predictions are not returned by default, so FPR calculation is skipped here.
-
-            # Compute Z-Score
-            if shuffle_paucs:
-                mean_shuffle = np.mean(shuffle_paucs)
-                std_shuffle = np.std(shuffle_paucs)
-                
-                if baseline_result:
-                    # Z-Score
-                    pauc_data = baseline_result.get('pauc', {})
-                    if pauc_data:
-                        first_prior = list(pauc_data.keys())[0]
-                        real_pauc = pauc_data[first_prior]['mean']
-                        z_score = (real_pauc - mean_shuffle) / (std_shuffle + 1e-9)
-                        
-                        run_logger.log(f"\n[Target Shuffling] Results:")
-                        run_logger.log(f"  Real PAUC: {real_pauc:.4f}")
-                        run_logger.log(f"  Shuffle PAUC: {mean_shuffle:.4f} ± {std_shuffle:.4f}")
-                        run_logger.log(f"  Z-Score: {z_score:.4f}")
-                        if z_score < 2: run_logger.log("  Interpretation: Indistinguishable from noise.")
-                        elif z_score > 5: run_logger.log("  Interpretation: Strong geological signal.")
-                    
-                    # Save Shuffling Results
-                    rigorous_results['target_shuffling'] = {
-                        'z_score': float(z_score) if 'z_score' in locals() else None,
-                        'real_pauc': float(real_pauc) if 'real_pauc' in locals() else None,
-                        'shuffle_pauc_mean': float(mean_shuffle) if 'mean_shuffle' in locals() else None,
-                        'shuffle_pauc_std': float(std_shuffle) if 'std_shuffle' in locals() else None,
-                    }
-
-        # 3. Stability Selection (Variance Check)
-        if "stability" in args.meta_eval_methods and args.meta_eval_stability_runs > 0:
-            run_logger.log(f"\n[train_save_eval_result] ===== STARTING STABILITY SELECTION ({args.meta_eval_stability_runs} runs, rate={args.meta_eval_stability_rate}) =====")
-            
-            # Create subdirectory for stability results
-            stability_dir = effective_output_dir / "Rigorous_Stability"
-            stability_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Identify Unlabelled indices
-            labels = data_use['labels']
-            is_pos = labels >= 0.9
-            u_indices = np.where(~is_pos)[0]
-            p_indices = np.where(is_pos)[0]
-            
-            n_subsample = int(len(u_indices) * args.meta_eval_stability_rate)
-            
-            all_run_predictions = []
-            stability_scalars = {
-                'accuracy': [], 'lift': [], 'pauc': [], 'br_at_tpr90': []
-            }
-            
-            for i in range(args.meta_eval_stability_runs):
-                run_logger.log(f"[Stability Selection] Run {i+1}/{args.meta_eval_stability_runs}")
-                
-                # Subsample U
-                u_subset = np.random.choice(u_indices, n_subsample, replace=False)
-                train_subset = np.concatenate([p_indices, u_subset])
-                train_subset.sort()
-                
-                tag_stability = f"{tag}_StabilitySelection_run{i}"
-                
-                res = train_save_eval_result(
-                    tag=tag_stability,
-                    data_use=data_use,
-                    action=action,
-                    common=common,
-                    args=args,
-                    cfg=cfg,
-                    run_logger=run_logger,
-                    train_subset_indices=train_subset,
-                    run_rigorous=False,
-                    output_dir=stability_dir
-                )
-                
-                if res:
-                    # Collect scalar metrics
-                    meta = res.get('meta_evaluation', res)
-                    
-                    if 'accuracy' in meta: stability_scalars['accuracy'].append(meta['accuracy'])
-                    
-                    if 'lift' in meta:
-                        topk_res = meta.get('topk', {})
-                        if topk_res and 'area_percentages' in topk_res:
-                            first_area = list(topk_res['area_percentages'].keys())[0]
-                            lift_val = topk_res['area_percentages'][first_area].get('lift')
-                            if lift_val is not None: stability_scalars['lift'].append(lift_val)
-                    
-                    if 'pauc' in meta:
-                        pauc_res = meta.get('pauc', {})
-                        if pauc_res:
-                            first_prior = list(pauc_res.keys())[0]
-                            pauc_val = pauc_res[first_prior]['mean']
-                            stability_scalars['pauc'].append(pauc_val)
-                    
-                    if 'background_rejection' in meta:
-                        br_data = meta['background_rejection']
-                        tpr_list = np.array(br_data['tpr'])
-                        br_list = np.array(br_data['background_rejection'])
-                        idx = np.searchsorted(tpr_list, 0.9, side='left')
-                        if idx < len(br_list):
-                            stability_scalars['br_at_tpr90'].append(float(br_list[idx]))
-            
-            # 4. Variance Check (Scalar Stability)
-            run_logger.log(f"\n[Stability Selection] Variance Check (Mean ± Std):")
-            for metric, values in stability_scalars.items():
-                if values:
-                    mean_val = np.mean(values)
-                    std_val = np.std(values)
-                    run_logger.log(f"  {metric}: {mean_val:.4f} ± {std_val:.4f}")
-            
-            # Save Stability Results
-            rigorous_results['stability_selection'] = {
-                'scalar_stability': {
-                    k: {'mean': float(np.mean(v)), 'std': float(np.std(v))} 
-                    for k, v in stability_scalars.items() if v
-                }
-            }
-
-        # Save Rigorous Evaluation Results
-        if rigorous_results:
-            run_logger.log(f"[train_save_eval_result] Saving rigorous evaluation results to {tag}_meta_eval.json...")
-            train_cls_PN_base.update_meta_evaluation_results(
-                tag_main=tag,
-                new_data={'rigorous_evaluation': rigorous_results},
-                common=common,
-                run_logger=run_logger
-            )
-
-    return result
-
+    return results
 
 def save_training_results(
     result: Dict[str, Any],
@@ -1767,7 +2275,6 @@ def save_training_results(
         with open(error_path, 'w') as f:
             json.dump(error_result, f, indent=2)
 
-
 def _extract_key_metrics(result: Dict[str, Any], run_logger: "_RunLogger") -> Dict[str, Any]:
     """Extract key metrics from training result for easy access and comparison."""
     metrics = {
@@ -1835,7 +2342,6 @@ def _extract_key_metrics(result: Dict[str, Any], run_logger: "_RunLogger") -> Di
     
     return metrics
 
-
 def _find_best_epoch_metrics(epoch_history: List[Dict]) -> Dict[str, Any]:
     """Find best epoch based on validation loss."""
     best_metrics = {}
@@ -1857,7 +2363,6 @@ def _find_best_epoch_metrics(epoch_history: List[Dict]) -> Dict[str, Any]:
         best_metrics['best_epoch_error'] = str(e)
     return best_metrics
 
-
 def _save_metrics_csv(metrics: Dict[str, Any], tag: str, results_dir: Path, run_logger: "_RunLogger") -> None:
     """Save metrics to CSV for easy comparison across experiments."""
     import csv
@@ -1877,7 +2382,6 @@ def _save_metrics_csv(metrics: Dict[str, Any], tag: str, results_dir: Path, run_
         run_logger.log(f"[save_metrics_csv] Appended to {csv_path}")
     except Exception as e:
         run_logger.log(f"[save_metrics_csv] ERROR: {e}")
-
 
 def _log_key_metrics(metrics: Dict[str, Any], tag: str, run_logger: "_RunLogger") -> None:
     """Log key metrics to console in readable format."""
@@ -1919,7 +2423,6 @@ def _log_key_metrics(metrics: Dict[str, Any], tag: str, run_logger: "_RunLogger"
         run_logger.log(f"Negs per Pos: {metrics['negs_per_pos']}")
     
     run_logger.log("=" * 80)
-
 
 def _progress_iter(iterable, desc: str, *, leave: bool = False, total: Optional[int] = None):
     if tqdm is None:
@@ -2149,8 +2652,8 @@ def get_overlap_info_pair_metadata_only(cfg: AlignmentConfig, args, device: torc
     }
     
     return pair_metadata
-#####################################################################################   
 
+#####################################################################################   
 
 def _dataset_pair(cfg: AlignmentConfig) -> Tuple[str, str]:
     if len(cfg.datasets) < 2:

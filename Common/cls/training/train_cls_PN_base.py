@@ -304,13 +304,24 @@ def train_cls_1_PN(
     mlp_dropout = common['mlp_dropout']
     debug_mode = common.get('debug_mode', False)
     run_logger = common.get('run_logger', None)
+    seed_value = int(common.get('seed', getattr(cfg, 'seed', 42)))
     
     if data_use is None:
         raise RuntimeError("Data unavailable for classifier training; aborting.")
     
     # Extract features and labels
-    features = data_use["features"].float().to(device)
-    yA_pu = torch.where(data_use["labels"] >= 0.9, 1, -1).long().to(device)
+    # Extract features and labels
+    features = data_use["features"]
+    if isinstance(features, np.ndarray):
+        features = torch.from_numpy(features)
+    features = features.float().to(device)
+
+    labels = data_use["labels"]
+    if isinstance(labels, np.ndarray):
+        labels = torch.from_numpy(labels)
+    labels = labels.to(device)
+    
+    yA_pu = torch.where(labels >= 0.9, 1, -1).long()
     
     # Get coordinates for visualization
     temp_crd = data_use.get("coords")
@@ -1753,7 +1764,8 @@ def save_meta_evaluation_results(
     meta_evaluation: Dict[str, Any],
     tag_main: str,
     common: Dict[str, Any],
-    run_logger: Optional[Any] = None
+    run_logger: Optional[Any] = None,
+    output_dir: Optional[Path] = None
 ) -> None:
     """
     Save Meta_Evaluation results to JSON file.
@@ -1763,13 +1775,16 @@ def save_meta_evaluation_results(
         tag_main: Tag identifier for the experiment
         common: Dictionary containing cfg
         run_logger: Optional logger for status messages
+        output_dir: Optional override for output directory
     """
     import json
     from pathlib import Path
     import numpy as np
     
     cfg = common['cfg']
-    output_dir = Path(cfg.output_dir) / "cls_1_training_results/meta_evaluation_results"
+    if output_dir is None:
+        output_dir = Path(cfg.output_dir) / "cls_1_training_results/meta_evaluation_results"
+    
     output_dir.mkdir(parents=True, exist_ok=True)
     
     output_path = output_dir / f"{tag_main}_meta_eval.json"
@@ -2124,6 +2139,10 @@ def compute_extended_meta_evaluation(
     # Check if extended metrics are requested
     meta_eval_metrics = set(requested_metrics or [])
     
+    # Initialize all requested metrics to None
+    for metric in meta_eval_metrics:
+        extended_results[metric] = None
+    
     # Compute Proxy AUC variants if requested
     if 'pauc' in meta_eval_metrics:
         prior_variants = meta_eval_config.pauc_prior_variants or [0.01, 0.05, 0.1, 0.2, 0.3]
@@ -2245,7 +2264,8 @@ def update_meta_evaluation_results(
     tag_main: str,
     new_data: Dict[str, Any],
     common: Dict[str, Any],
-    run_logger: Optional[Any] = None
+    run_logger: Optional[Any] = None,
+    output_dir: Optional[Path] = None
 ) -> None:
     """
     Update existing Meta_Evaluation JSON file with new data (e.g., rigorous metrics).
@@ -2255,13 +2275,16 @@ def update_meta_evaluation_results(
         new_data: Dictionary containing new metrics to merge
         common: Dictionary containing cfg
         run_logger: Optional logger
+        output_dir: Optional override for output directory
     """
     import json
     from pathlib import Path
     import os
     
     cfg = common['cfg']
-    output_dir = Path(cfg.output_dir) / "cls_1_training_results/meta_evaluation_results"
+    if output_dir is None:
+        output_dir = Path(cfg.output_dir) / "cls_1_training_results/meta_evaluation_results"
+    
     output_path = output_dir / f"{tag_main}_meta_eval.json"
     
     if not output_path.exists():
