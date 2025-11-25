@@ -36,34 +36,24 @@ from Common.cls.sampling.likely_negatives import (
 )
 
 # All metrics are now treated equally - no default registry
-POSITIVE_ITERATION_METRICS = {"PosDrop_Acc", "Focus"}
+POSITIVE_ITERATION_METRICS = {"accuracy", "Focus"}
 NEGATIVE_META_EVALUATION = {"pu_fpr", "background_rejection", "pu_npv", "pu_fdr", "pu_tpr"}
 EXTENDED_META_METRICS = {"pauc", "topk"} | NEGATIVE_META_EVALUATION
 
 
 @dataclass
 class MetaEvaluationConfig:
-    metrics: Set[str] = field(default_factory=lambda: {"PosDrop_Acc", "Focus", "pauc", "topk"})
+    metrics: Set[str] = field(default_factory=lambda: {"accuracy", "Focus", "pauc", "topk", "lift"})
     pauc_prior_variants: List[float] = field(default_factory=lambda: [0.01, 0.05, 0.1, 0.2, 0.3])
-    topk_k_ratio: List[float] = field(default_factory=lambda: [0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 5.0, 10.0])
-    topk_k_values: List[int] = field(default_factory=list)
     topk_area_percentages: List[float] = field(default_factory=lambda: [0.1, 0.5, 1.0, 2.0, 5.0])
-    pu_prior_range: List[float] = field(default_factory=lambda: [0.05, 0.25])
-    pu_metric_thresholds: List[float] = field(default_factory=list)
-    pu_metric_threshold_count: int = 25
 
     @classmethod
     def from_args(cls, args: Any) -> "MetaEvaluationConfig":
-        metrics = set(getattr(args, "meta_evaluation", [])) if getattr(args, "meta_evaluation", None) else {"PosDrop_Acc", "Focus", "pauc", "topk"}
+        metrics = set(getattr(args, "meta_eval_metrics", [])) if getattr(args, "meta_eval_metrics", None) else {"accuracy", "Focus", "pauc", "topk", "lift"}
         return cls(
             metrics=metrics,
-            pauc_prior_variants=list(getattr(args, "pauc_prior_variants", [0.01, 0.05, 0.1, 0.2, 0.3])),
-            topk_k_ratio=list(getattr(args, "topk_k_ratio", [0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 5.0, 10.0])),
-            topk_k_values=list(getattr(args, "topk_k_values", [])),
-            topk_area_percentages=list(getattr(args, "topk_area_percentages", [0.1, 0.5, 1.0, 2.0, 5.0])),
-            pu_prior_range=list(getattr(args, "pu_prior_range", [0.05, 0.25])),
-            pu_metric_thresholds=list(getattr(args, "pu_metric_thresholds", [])),
-            pu_metric_threshold_count=int(getattr(args, "pu_metric_threshold_count", 25)),
+            pauc_prior_variants=list(getattr(args, "meta_eval_pauc_prior_variants", [0.01, 0.05, 0.1, 0.2, 0.3])),
+            topk_area_percentages=list(getattr(args, "meta_eval_topk_area_percent", [0.1, 0.5, 1.0, 2.0, 5.0])),
         )
 
 
@@ -74,14 +64,14 @@ class MetaEvaluationConfig:
 # Meta-Evaluation Metric Functions
 # ============================================================================
 
-def compute_posdrop_acc(
+def compute_accuracy(
     *,
     predictions_mean: np.ndarray,
     all_pos_idx: List[int],
     pos_indices_this_iter: set,
 ) -> float:
     """
-    Compute PosDrop_Acc: Average prediction accuracy on positives dropped in this iteration.
+    Compute accuracy: Average prediction accuracy on positives dropped in this iteration.
     
     Args:
         predictions_mean: Mean predictions array (all samples)
@@ -148,10 +138,10 @@ def compute_meta_evaluation_metric(
     Raises:
         ValueError: If metric_name is not recognized
     """
-    if metric_name == "PosDrop_Acc":
+    if metric_name == "accuracy":
         if all_pos_idx is None or pos_indices_this_iter is None:
             raise ValueError(f"Metric '{metric_name}' requires all_pos_idx and pos_indices_this_iter")
-        return compute_posdrop_acc(
+        return compute_accuracy(
             predictions_mean=predictions_mean,
             all_pos_idx=all_pos_idx,
             pos_indices_this_iter=pos_indices_this_iter
@@ -333,6 +323,16 @@ def train_cls_1_PN(
     # Phase 1: Negative Selection & Dataset Preparation
     pos_idx = (yA_pu == 1).nonzero(as_tuple=True)[0].tolist()
     unl_idx = (yA_pu != 1).nonzero(as_tuple=True)[0].tolist()
+    
+    # ✅ Handle subset training (Stability Selection)
+    train_subset_indices = common.get('train_subset_indices')
+    if train_subset_indices is not None:
+        subset_set = set(train_subset_indices)
+        pos_idx = [i for i in pos_idx if i in subset_set]
+        unl_idx = [i for i in unl_idx if i in subset_set]
+        if run_logger is not None:
+            run_logger.log(f"[cls-1-PN] Training on subset: {len(pos_idx)} pos, {len(unl_idx)} unl")
+
     pos_idx_arr = np.asarray(pos_idx, dtype=int)
     unk_idx_arr = np.asarray(unl_idx, dtype=int)
     
@@ -681,7 +681,7 @@ def create_pos_drop_schedule(
     return use_schedule
 
 
-def create_pos_drop_schedule_kmeans(
+def create_pos_drop_schedule_latent_dist(
     all_pos_idx: List[int],
     features: torch.Tensor,
     meta_evaluation_n_clusters: int,
@@ -689,8 +689,8 @@ def create_pos_drop_schedule_kmeans(
     min_training_size: int = 1
 ) -> List[List[int]]:
     """
-    Create K-means clustering-based drop schedule.
-    Each iteration drops samples from different clusters to ensure diverse cross-validation.
+    Create latent distribution-based drop schedule (formerly KMeans).
+    Each iteration drops samples from different clusters in feature space.
     """
     from sklearn.cluster import KMeans
     
@@ -712,60 +712,55 @@ def create_pos_drop_schedule_kmeans(
         if cluster_id not in clusters:
             clusters[cluster_id] = []
         clusters[cluster_id].append(all_pos_idx[i])
-    
-    # Create drop schedule: each iteration drops one cluster
+
+    # ✅ BALANCED DROPPING: Redistribute cluster members to ensure balanced drop sizes
+    balanced_drop_groups = _rebalance_clusters_for_equal_dropping(
+        clusters, num_iterations, len(all_pos_idx), seed
+    )
+
+    # Create keep schedules from balanced drop groups
     use_schedule = []
-    
-    for iteration in range(num_iterations):
-        # Drop cluster 'iteration', keep all others
-        kept_indices = []
-        
-        for cluster_id, cluster_indices in clusters.items():
-            if cluster_id != iteration:
-                # Keep this entire cluster
-                kept_indices.extend(cluster_indices)
-            # else: drop this cluster (don't add to kept_indices)
-        
+    for drop_group in balanced_drop_groups:
+        kept_indices = [idx for idx in all_pos_idx if idx not in drop_group]
         # Ensure minimum training size
         if len(kept_indices) < min_training_size:
             kept_indices = all_pos_idx.copy()
-        
         use_schedule.append(kept_indices)
-    
+
     return use_schedule
 
 
-def create_pos_drop_schedule_hierarchical(
+def create_pos_drop_schedule_actual_dist(
     all_pos_idx: List[int],
-    features: torch.Tensor,
+    coords: np.ndarray,
     meta_evaluation_n_clusters: int,
-    linkage: str = "ward",
     seed: int = 42,
     min_training_size: int = 1
 ) -> List[List[int]]:
     """
-    Create hierarchical clustering-based drop schedule.
-    Uses agglomerative clustering to create meaningful positive groups.
+    Create actual distribution-based drop schedule using physical coordinates.
+    Each iteration drops samples from different spatial clusters.
     """
-    from sklearn.cluster import AgglomerativeClustering
+    from sklearn.cluster import KMeans
     
     if not all_pos_idx:
         return [[]]
     
+    if coords is None or len(coords) == 0:
+        raise ValueError("Coordinates required for actual_dist strategy")
+        
     num_iterations = meta_evaluation_n_clusters
     
-    # Extract positive features for clustering
-    pos_features = features[all_pos_idx].cpu().numpy()
+    # Extract positive coordinates
+    # coords is expected to be aligned with all_pos_idx if passed correctly, 
+    # but usually coords is for the whole dataset.
+    # We need to extract coords for the positive indices.
+    # Assuming coords is a full array aligned with dataset indices.
+    pos_coords = coords[all_pos_idx]
     
-    # Perform hierarchical clustering with reproducible results
-    import numpy as np
-    np.random.seed(seed)
-    
-    clustering = AgglomerativeClustering(
-        n_clusters=num_iterations,
-        linkage=linkage
-    )
-    cluster_labels = clustering.fit_predict(pos_features)
+    # Perform K-means clustering on coordinates
+    kmeans = KMeans(n_clusters=num_iterations, random_state=seed, n_init=10)
+    cluster_labels = kmeans.fit_predict(pos_coords)
     
     # Group indices by cluster
     clusters = {}
@@ -773,83 +768,25 @@ def create_pos_drop_schedule_hierarchical(
         if cluster_id not in clusters:
             clusters[cluster_id] = []
         clusters[cluster_id].append(all_pos_idx[i])
-    
+
     # ✅ BALANCED DROPPING: Redistribute cluster members to ensure balanced drop sizes
     balanced_drop_groups = _rebalance_clusters_for_equal_dropping(
         clusters, num_iterations, len(all_pos_idx), seed
     )
-    
+
     # Create keep schedules from balanced drop groups
     use_schedule = []
     for drop_group in balanced_drop_groups:
         kept_indices = [idx for idx in all_pos_idx if idx not in drop_group]
-        
         # Ensure minimum training size
         if len(kept_indices) < min_training_size:
             kept_indices = all_pos_idx.copy()
-        
         use_schedule.append(kept_indices)
-    
+
     return use_schedule
 
 
-def create_pos_drop_schedule_random(
-    all_pos_idx: List[int],
-    features: torch.Tensor,
-    meta_evaluation_n_clusters: int,
-    seed: int = 42,
-    min_training_size: int = 1
-) -> List[List[int]]:
-    """
-    Create random drop schedule with balanced distribution.
-    Uses cluster-based approach for consistency with other clustering methods.
-    """
-    if not all_pos_idx:
-        return [[]]
-    
-    num_iterations = meta_evaluation_n_clusters
-    total_positives = len(all_pos_idx)
-    
-    # Ensure minimum training size constraint
-    max_drop_per_iter = total_positives - min_training_size
-    if max_drop_per_iter <= 0:
-        return [all_pos_idx.copy() for _ in range(num_iterations)]
-    
-    # Shuffle positives for random distribution
-    rng = np.random.default_rng(seed)
-    shuffled_pos_idx = rng.permutation(all_pos_idx).tolist()
-    
-    # Create pseudo-clusters by assigning samples randomly to clusters
-    clusters = {i: [] for i in range(num_iterations)}
-    for idx, sample_idx in enumerate(shuffled_pos_idx):
-        cluster_id = idx % num_iterations
-        clusters[cluster_id].append(sample_idx)
-    
-    # Apply balanced redistribution to ensure similar drop sizes
-    balanced_clusters = _rebalance_clusters_for_equal_dropping(
-        clusters, 
-        num_iterations, 
-        total_positives,
-        seed
-    )
-    
-    # Create drop schedule from balanced clusters
-    drop_schedule = []
-    for i in range(num_iterations):
-        samples_to_drop = balanced_clusters[i]
-        drop_schedule.append(samples_to_drop)
-    
-    # Convert to use schedule
-    use_schedule = []
-    for iteration_drops in drop_schedule:
-        samples_to_use = [idx for idx in all_pos_idx if idx not in iteration_drops]
-        
-        if len(samples_to_use) < min_training_size:
-            samples_to_use = all_pos_idx.copy()
-        
-        use_schedule.append(samples_to_use)
-    
-    return use_schedule
+
 
 
 def _rebalance_clusters_for_equal_dropping(
@@ -917,15 +854,15 @@ def create_pos_drop_schedule_unified(
     features: torch.Tensor,
     meta_evaluation_n_clusters: int,
     seed: int,
-    method: str = "random",
-    linkage: str = "ward",
+    method: str = "latent_dist",
+    coords: Optional[np.ndarray] = None,
     min_training_size: int = 1
 ) -> List[List[int]]:
     """
-    Unified interface for creating positive drop schedules using different clustering methods.
+    Unified interface for creating positive drop schedules using different strategies.
     """
-    if method == "random":
-        return create_pos_drop_schedule_random(
+    if method == "latent_dist":
+        return create_pos_drop_schedule_latent_dist(
             all_pos_idx=all_pos_idx,
             features=features,
             meta_evaluation_n_clusters=meta_evaluation_n_clusters,
@@ -933,27 +870,17 @@ def create_pos_drop_schedule_unified(
             min_training_size=min_training_size
         )
     
-    elif method == "kmeans":
-        return create_pos_drop_schedule_kmeans(
+    elif method == "actual_dist":
+        return create_pos_drop_schedule_actual_dist(
             all_pos_idx=all_pos_idx,
-            features=features,
+            coords=coords,
             meta_evaluation_n_clusters=meta_evaluation_n_clusters,
             seed=seed,
-            min_training_size=min_training_size
-        )
-    
-    elif method == "hierarchical":
-        return create_pos_drop_schedule_hierarchical(
-            all_pos_idx=all_pos_idx,
-            features=features,
-            meta_evaluation_n_clusters=meta_evaluation_n_clusters,
-            seed=seed,
-            linkage=linkage,
             min_training_size=min_training_size
         )
     
     else:
-        raise ValueError(f"Unknown clustering method: {method}. Available: ['random', 'kmeans', 'hierarchical']")
+        raise ValueError(f"Unknown positive dropout strategy: {method}. Available: ['latent_dist', 'actual_dist']")
 
 
 # ============================================================================
@@ -962,10 +889,10 @@ def create_pos_drop_schedule_unified(
 
 def train_cls_1_PN_PosDrop(
     *,
-    meta_evaluation_n_clusters: int = 10,  # ✅ CHANGED: from drop_rate to n_clusters
-    clustering_method: str = "random",     # ✅ NEW: clustering method selection
-    linkage: str = "ward",                 # ✅ NEW: for hierarchical clustering
-    seed: int = 42,                        # ✅ NEW: random seed for reproducibility
+    meta_evaluation_n_clusters: int = 10,
+    posdrop_strategy: str = "latent_dist",     # ✅ CHANGED: renamed from clustering_method
+    linkage: str = "ward",                 # Keeping for compatibility, though unused now
+    seed: int = 42,
     common: Dict[str, Any],
     data_use: Dict[str, Any],
     filter_top_pct: float = 0.10,
@@ -1016,7 +943,7 @@ def train_cls_1_PN_PosDrop(
     meta_evaluation_metrics = set(meta_eval_config.metrics)
     
     if run_logger is not None:
-        run_logger.log(f"[cls-1-PN-PosDrop] Meta_eval_n_clstrs: {meta_evaluation_n_clusters} Clstr method: {clustering_method}, Seed: {seed_value}")
+        run_logger.log(f"[cls-1-PN-PosDrop] Meta_eval_n_clstrs: {meta_evaluation_n_clusters} Strategy: {posdrop_strategy}, Seed: {seed_value}")
     
     if data_use is None:
         raise RuntimeError("Data unavailable for classifier training; aborting.")
@@ -1047,24 +974,33 @@ def train_cls_1_PN_PosDrop(
     all_pos_idx = (yA_pu == 1).nonzero(as_tuple=True)[0].tolist()
     all_unl_idx = (yA_pu != 1).nonzero(as_tuple=True)[0].tolist()
     
+    # ✅ Handle subset training (Stability Selection)
+    train_subset_indices = common.get('train_subset_indices')
+    if train_subset_indices is not None:
+        subset_set = set(train_subset_indices)
+        all_pos_idx = [i for i in all_pos_idx if i in subset_set]
+        all_unl_idx = [i for i in all_unl_idx if i in subset_set]
+        if run_logger is not None:
+            run_logger.log(f"[cls-1-PN-PosDrop] Training on subset: {len(all_pos_idx)} pos, {len(all_unl_idx)} unl")
+    
     num_iterations = meta_evaluation_n_clusters
     
-    # ✅ MODIFIED: Create drop schedule using unified clustering interface
+    # ✅ MODIFIED: Create drop schedule using unified interface
     pos_splits = create_pos_drop_schedule_unified(
         all_pos_idx=all_pos_idx,
         features=features,
         meta_evaluation_n_clusters=meta_evaluation_n_clusters,
-        method=clustering_method,
-        linkage=linkage,
+        method=posdrop_strategy,
+        coords=coords_array,
         seed=seed_value,
         min_training_size=1
     )
     
     if run_logger is not None and verbose:
-        run_logger.log(f"[cls-1-PN-PosDrop] Created {clustering_method} drop schdl: {num_iterations} iter, {len(all_pos_idx)} total pos")
+        run_logger.log(f"[cls-1-PN-PosDrop] Created {posdrop_strategy} drop schdl: {num_iterations} iter, {len(all_pos_idx)} total pos")
         
         # Log cluster information for debugging
-        if clustering_method in ["kmeans", "hierarchical"]:
+        if posdrop_strategy in ["latent_dist", "actual_dist"]:
             for i, pos_indices_iter in enumerate(pos_splits):
                 dropped_count = len(all_pos_idx) - len(pos_indices_iter)
                 run_logger.log(f"  Iteration {i+1}: using {len(pos_indices_iter)} positives, dropping {dropped_count} positives")
@@ -1116,7 +1052,7 @@ def train_cls_1_PN_PosDrop(
             if run_logger is not None and verbose:
                 run_logger.log(f"[cls-1-PN-PosDrop] Using individual distance files (memory-safe approach)")
             try:
-                rotation_tag = f"{tag_main}_posdrop_{clustering_method}_individual" if tag_main else None
+                rotation_tag = f"{tag_main}_posdrop_{posdrop_strategy}_individual" if tag_main else None
                 individual_distances_dir = precompute_distances_per_positive(
                     Z_all=features,
                     all_pos_idx=all_pos_idx,
@@ -1138,8 +1074,8 @@ def train_cls_1_PN_PosDrop(
         if run_logger is not None and verbose:
             run_logger.log(f"[cls-1-PN-PosDrop] Starting training for iteration {iteration+1}/{num_iterations}...")
         
-        # ✅ MODIFIED: Updated tag to include clustering method and n_clusters
-        tag = f"{tag_main}/{clustering_method}{meta_evaluation_n_clusters}_iter{iteration+1}" if tag_main is not None else None
+        # ✅ MODIFIED: Updated tag to include strategy and n_clusters with descriptive naming
+        tag = f"{tag_main}/posdrop_{posdrop_strategy}_cluster_{meta_evaluation_n_clusters}_iter{iteration+1}" if tag_main is not None else None
 
         pos_idx = pos_splits[iteration]
         unl_idx = all_unl_idx.copy()
@@ -1148,10 +1084,10 @@ def train_cls_1_PN_PosDrop(
         if coords_array is not None:
             pos_crd_plot = [coords_array[i] for i in pos_idx]
 
-            # Spatial analysis for debugging
+            # Analysis for debugging
             dropped_idx = [idx for idx in all_pos_idx if idx not in pos_idx]
             if len(dropped_idx) > 0:
-                run_logger.log(f"[PosDrop-Spatial-{clustering_method}] Iter {iteration+1}: Kept positives: {len(pos_idx)}  Dropped positives: {len(dropped_idx)}")
+                run_logger.log(f"[PosDrop-{posdrop_strategy}] Iter {iteration+1}: Kept positives: {len(pos_idx)}  Dropped positives: {len(dropped_idx)}")
 
         pos_idx_arr = np.asarray(pos_idx, dtype=int)
         unk_idx_arr = np.asarray(unl_idx, dtype=int)
@@ -1234,8 +1170,8 @@ def train_cls_1_PN_PosDrop(
     if run_logger is not None and verbose:
         run_logger.log(f"[cls-1-PN-PosDrop] Starting final 'no positive drop' training with all {len(all_pos_idx)} positives")
     
-    # ✅ MODIFIED: Updated final tag to include clustering method
-    tag_all = f"{tag_main}/{clustering_method}{meta_evaluation_n_clusters}_final" if tag_main is not None else None
+    # ✅ MODIFIED: Updated final tag to include strategy
+    tag_all = f"{tag_main}/{posdrop_strategy}{meta_evaluation_n_clusters}_final" if tag_main is not None else None
     pos_idx = all_pos_idx
     pos_crd_plot_all = None
     if coords_array is not None:
@@ -1423,8 +1359,8 @@ def train_cls_1_PN_PosDrop(
 def load_and_evaluate_existing_predictions(
     *,
     tag_main: str,
-    meta_evaluation_n_clusters: Optional[int] = None,  # ✅ CHANGED: from drop_rate to n_clusters
-    clustering_method: str = "random", # ✅ NEW: clustering method
+    meta_evaluation_n_clusters: Optional[int] = None,
+    posdrop_strategy: str = "latent_dist", # ✅ CHANGED: renamed from clustering_method
     common: Dict[str, Any],
     data_use: Dict[str, Any],
     run_logger: Optional[Any] = None,
@@ -1439,7 +1375,7 @@ def load_and_evaluate_existing_predictions(
         tag_main: Tag identifier for the experiment
         meta_evaluation_n_clusters: Number of clusters/iterations (2, 3, 4, 6, 8, 10)
         drop_rate: Legacy positive-drop rate (used if n_clusters omitted)
-        clustering_method: Clustering method used ('random', 'kmeans', 'hierarchical')
+        posdrop_strategy: Strategy used ('latent_dist', 'actual_dist')
         common: Dictionary containing cfg, device, run_logger, etc.
         data_use: Dictionary containing 'features', 'labels', 'coords' keys
         run_logger: Optional logger for status messages
@@ -1466,7 +1402,7 @@ def load_and_evaluate_existing_predictions(
     
     if run_logger:
         run_logger.log(f"[load_cached_predictions] Searching in: {base_output_dir}")
-        run_logger.log(f"[load_cached_predictions] Clustering method: {clustering_method}")
+        run_logger.log(f"[load_cached_predictions] Strategy: {posdrop_strategy}")
         run_logger.log(f"[load_cached_predictions] Required n_clusters: {meta_evaluation_n_clusters}")
         run_logger.log(f"[load_cached_predictions] Expected iterations: {expected_num_iterations}")
         run_logger.log(f"[load_cached_predictions] Meta_Evaluation metrics: {meta_evaluation_metrics}")
@@ -1476,13 +1412,13 @@ def load_and_evaluate_existing_predictions(
             run_logger.log(f"[load_cached_predictions] ❌ Directory not found: {base_output_dir}")
         return None
     
-    # ✅ MODIFIED: Search for SPECIFIC pattern matching clustering method and n_clusters
+    # ✅ MODIFIED: Search for SPECIFIC pattern matching strategy and n_clusters
     import glob
-    specific_pattern = str(base_output_dir / f"{clustering_method}{meta_evaluation_n_clusters}_iter*")
+    specific_pattern = str(base_output_dir / f"{posdrop_strategy}{meta_evaluation_n_clusters}_iter*")
     iter_dirs = sorted(glob.glob(specific_pattern))
     
     if run_logger:
-        run_logger.log(f"[load_cached_predictions] Pattern: {clustering_method}{meta_evaluation_n_clusters}_iter*")
+        run_logger.log(f"[load_cached_predictions] Pattern: {posdrop_strategy}{meta_evaluation_n_clusters}_iter*")
         run_logger.log(f"[load_cached_predictions] Found {len(iter_dirs)} matching directories")
     
     # Validate: Must find exactly expected number of iterations
@@ -1515,7 +1451,7 @@ def load_and_evaluate_existing_predictions(
             run_logger.log("[load_cached_predictions] ❌ ERROR: No positive samples found in data_use")
         return None
     
-    # ✅ MODIFIED: Reconstruct drop schedule using clustering method
+    # ✅ MODIFIED: Reconstruct drop schedule using strategy
     features = data_use["features"]
     if isinstance(features, np.ndarray):
         features = torch.from_numpy(features).float()
@@ -1524,6 +1460,9 @@ def load_and_evaluate_existing_predictions(
     else:
         features = torch.tensor(features, dtype=torch.float32)
     
+    temp_crd = data_use.get("coords") or data_use.get("coordinates")
+    coords_array = np.array(temp_crd) if temp_crd is not None else None
+
     seed_value = int(common.get('seed', getattr(cfg, 'seed', 42)))
 
     drop_schedule = create_pos_drop_schedule_unified(
@@ -1531,12 +1470,13 @@ def load_and_evaluate_existing_predictions(
         features=features,
         meta_evaluation_n_clusters=meta_evaluation_n_clusters,
         seed=seed_value,
-        method=clustering_method,
+        method=posdrop_strategy,
+        coords=coords_array,
         min_training_size=1
     )
     
     if run_logger:
-        run_logger.log(f"[load_cached_predictions] Reconstructed {clustering_method} drop schedule with {len(drop_schedule)} iterations")
+        run_logger.log(f"[load_cached_predictions] Reconstructed {posdrop_strategy} drop schedule with {len(drop_schedule)} iterations")
     
     if run_logger:
         run_logger.log(f"[load_cached_predictions] Reconstructed drop schedule with {len(drop_schedule)} iterations")
@@ -1658,7 +1598,7 @@ def load_and_evaluate_existing_predictions(
 def train_cls_1_PN_PosDrop_MultiClustering(
     *,
     meta_evaluation_n_clusters_list: List[int] = [10],
-    clustering_methods: List[str] = ["random"],
+    posdrop_strategies: List[str] = ["latent_dist"],
     linkage: str = "ward",
     seed: int = 42,
     common: Dict[str, Any],
@@ -1683,7 +1623,7 @@ def train_cls_1_PN_PosDrop_MultiClustering(
     
     Args:
         meta_evaluation_n_clusters_list: List of cluster counts to test (e.g., [2, 4, 6, 8, 10])
-        clustering_methods: List of clustering methods to test (e.g., ["random", "kmeans", "hierarchical"])
+        posdrop_strategies: List of strategies to test (e.g., ["latent_dist", "actual_dist"])
         linkage: Linkage criterion for hierarchical clustering
         common: Dictionary containing cfg, device, mlp_hidden_dims, mlp_dropout, debug_mode, run_logger
         data_use: Dictionary containing 'features', 'labels', 'coords' keys
@@ -1708,7 +1648,7 @@ def train_cls_1_PN_PosDrop_MultiClustering(
     
     # Generate all configurations to test
     all_configs = []
-    for method in clustering_methods:
+    for method in posdrop_strategies:
         for n_clusters in meta_evaluation_n_clusters_list:
             config_name = f"{method}{n_clusters}"
             all_configs.append({
@@ -1736,7 +1676,7 @@ def train_cls_1_PN_PosDrop_MultiClustering(
         try:
             result = train_cls_1_PN_PosDrop(
                 meta_evaluation_n_clusters=n_clusters,
-                clustering_method=method,
+                posdrop_strategy=method,
                 linkage=linkage,
                 seed=seed,
                 common={**common, 'verbose': False},  # Reduce verbosity for multi-config
@@ -1758,7 +1698,11 @@ def train_cls_1_PN_PosDrop_MultiClustering(
                 # Log summary metrics
                 for metric, data in result.items():
                     if isinstance(data, dict) and 'mean' in data:
-                        run_logger.log(f"  {metric}: {data['mean']:.4f} ± {data['std']:.4f}")
+                        if isinstance(data['mean'], (int, float)):
+                            run_logger.log(f"  {metric}: {data['mean']:.4f} ± {data['std']:.4f}")
+                        else:
+                            # Skip logging non-scalar means (like curves) to avoid clutter/errors
+                            pass
         
         except Exception as e:
             if run_logger:
@@ -1916,20 +1860,18 @@ def compute_proxy_auc_variants(probs_all, y_true, prior_variants, run_logger=Non
     return results
 
 
-def compute_topk_positive_capture_with_ratios(probs_all, y_true, k_ratios, k_values, area_percentages, run_logger=None):
+def compute_topk_positive_capture_and_lift(probs_all, y_true, area_percentages, run_logger=None):
     """
-    Compute Top-K Positive Capture with ratio-based K values and area percentages.
+    Compute Top-K Positive Capture and Lift for specified area percentages.
     
     Args:
         probs_all: Array of all probabilities/predictions
         y_true: True binary labels (1 for positives, 0 for unlabeled)
-        k_ratios: List of K ratios relative to number of known positives
-        k_values: List of absolute K values to test
         area_percentages: List of area percentages for analysis
         run_logger: Optional logger for tracking progress
     
     Returns:
-        dict: Results for different K specifications and area analyses
+        dict: Results for different area analyses including Lift
     """
     import numpy as np
     
@@ -1949,75 +1891,33 @@ def compute_topk_positive_capture_with_ratios(probs_all, y_true, k_ratios, k_val
     sorted_labels = y_true[sorted_indices]
     sorted_probs = probs_all[sorted_indices]
     
-    ratio_summaries = []
-    ratio_results = {}
-    for ratio in k_ratios:
-        if ratio <= 0:
-            continue
-        k_effective = max(1, int(ratio * n_positives))  # At least 1
-        k_effective = min(k_effective, n_total)  # At most total samples
-        
-        # Count positives in top K
-        positives_in_topk = sorted_labels[:k_effective].sum()
-        capture_rate = positives_in_topk / n_positives if n_positives > 0 else 0.0
-        precision = positives_in_topk / k_effective if k_effective > 0 else 0.0
-        
-        ratio_results[f"ratio_{ratio:.2f}"] = {
-            'k_effective': int(k_effective),
-            'positives_captured': int(positives_in_topk),
-            'capture_rate': float(capture_rate),
-            'precision': float(precision),
-            'area_fraction': k_effective / n_total
-        }
-        ratio_summaries.append({'ratio': ratio, 'capture': capture_rate, 'precision': precision})
-    
-    results['ratios'] = ratio_results
-    # Keep verbose summary suppressed to avoid log spam
-    
-    # Absolute K values
-    absolute_summaries = []
-    absolute_results = {}
-    for k in k_values:
-        k_effective = min(k, n_total)
-        
-        positives_in_topk = sorted_labels[:k_effective].sum()
-        capture_rate = positives_in_topk / n_positives if n_positives > 0 else 0.0
-        precision = positives_in_topk / k_effective if k_effective > 0 else 0.0
-        
-        absolute_results[f"k_{k}"] = {
-            'k_effective': int(k_effective),
-            'positives_captured': int(positives_in_topk),
-            'capture_rate': float(capture_rate),
-            'precision': float(precision),
-            'area_fraction': k_effective / n_total
-        }
-        absolute_summaries.append({'k': k, 'capture': capture_rate})
-    
-    results['absolute'] = absolute_results
-    # Logging muted for absolute sweep
-    
     # Area percentage analysis
     area_summaries = []
     area_results = {}
     for area_pct in area_percentages:
-        k_area = max(1, int(area_pct * n_total / 100))  # Convert percentage to count
+        k_area = max(1, int(area_pct * n_total / 100.0))  # Convert percentage to count
         k_area = min(k_area, n_total)
         
         positives_in_area = sorted_labels[:k_area].sum()
         capture_rate = positives_in_area / n_positives if n_positives > 0 else 0.0
         precision = positives_in_area / k_area if k_area > 0 else 0.0
         
+        # Calculate Lift: Capture Rate / (Area % / 100)
+        # Example: 30% capture in 5% area -> 0.30 / 0.05 = 6.0
+        area_fraction = area_pct / 100.0
+        lift = capture_rate / area_fraction if area_fraction > 0 else 0.0
+        
         area_results[f"area_{area_pct:.1f}pct"] = {
             'k_effective': int(k_area),
             'positives_captured': int(positives_in_area),
             'capture_rate': float(capture_rate),
             'precision': float(precision),
-            'area_fraction': k_area / n_total
+            'lift': float(lift),
+            'area_fraction': float(area_fraction)
         }
-        area_summaries.append({'area': area_pct, 'capture': capture_rate})
+        area_summaries.append({'area': area_pct, 'capture': capture_rate, 'lift': lift})
     
     results['area_percentages'] = area_results
-    # Logging muted for area sweep
     
     # Summary statistics
     results['summary'] = {
@@ -2029,6 +1929,72 @@ def compute_topk_positive_capture_with_ratios(probs_all, y_true, k_ratios, k_val
     }
     
     return results
+
+
+def compute_fpr_at_tpr(y_true, y_score, target_tpr=0.9):
+    """Compute False Positive Rate at a specific True Positive Rate."""
+    from sklearn.metrics import roc_curve
+    fpr, tpr, thresholds = roc_curve(y_true, y_score)
+    
+    # Find index where TPR >= target_tpr
+    idx = np.searchsorted(tpr, target_tpr, side='left')
+    if idx >= len(fpr):
+        idx = len(fpr) - 1
+        
+    return float(fpr[idx])
+
+
+def compute_binary_entropy(probs):
+    """Compute binary entropy of probabilities (in bits)."""
+    # Clip probabilities to avoid log(0)
+    probs = np.clip(probs, 1e-7, 1.0 - 1e-7)
+    entropy = -probs * np.log2(probs) - (1 - probs) * np.log2(1 - probs)
+    return entropy
+
+
+def compute_pairwise_jaccard(masks):
+    """
+    Compute mean pairwise Jaccard Index (IoU) for a set of binary masks.
+    masks: (n_runs, n_samples) boolean array
+    """
+    n_runs = masks.shape[0]
+    if n_runs < 2:
+        return 0.0
+        
+    jaccard_sum = 0.0
+    count = 0
+    
+    # Compute pairwise IoU
+    # Optimization: Use matrix multiplication for intersection?
+    # Intersection: (A & B).sum()
+    # Union: (A | B).sum() = A.sum() + B.sum() - Intersection
+    
+    # Convert to float for matmul
+    masks_float = masks.astype(np.float32)
+    
+    # Intersection matrix: (n_runs, n_runs)
+    intersections = masks_float @ masks_float.T
+    
+    # Sum of ones for each mask
+    sums = masks_float.sum(axis=1)
+    
+    # Union matrix: sums[i] + sums[j] - intersection[i,j]
+    # Broadcast sums
+    sums_matrix = sums.reshape(-1, 1) + sums.reshape(1, -1)
+    unions = sums_matrix - intersections
+    
+    # Avoid division by zero
+    unions = np.maximum(unions, 1e-7)
+    
+    ious = intersections / unions
+    
+    # Exclude diagonal (self-IoU is always 1)
+    # We want average of off-diagonal elements
+    # Sum of all elements - trace
+    total_iou = ious.sum() - np.trace(ious)
+    n_pairs = n_runs * (n_runs - 1)
+    
+    return float(total_iou / n_pairs)
 
 
 def compute_pu_negative_metrics(
@@ -2182,51 +2148,21 @@ def compute_extended_meta_evaluation(
         if run_logger:
             run_logger.log(f"[compute_extended_meta_evaluation] PAUC aggregated across {len(pauc_results)} configurations")
     
-    # Compute Top-K Positive Capture if requested
-    if 'topk' in meta_eval_metrics:
-        k_ratios = meta_eval_config.topk_k_ratio or [0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 5.0, 10.0]
-        k_values = meta_eval_config.topk_k_values or [10, 50, 100, 500, 1000]
+    # Compute Top-K Positive Capture and Lift if requested
+    if 'topk' in meta_eval_metrics or 'lift' in meta_eval_metrics:
         area_percentages = meta_eval_config.topk_area_percentages or [0.1, 0.5, 1.0, 2.0, 5.0]
         
         topk_results = []
         for i, (probs, labels) in enumerate(zip(all_probabilities, all_labels)):
-            config_topk = compute_topk_positive_capture_with_ratios(
-                probs, labels, k_ratios, k_values, area_percentages, run_logger
+            config_topk = compute_topk_positive_capture_and_lift(
+                probs, labels, area_percentages, run_logger
             )
             topk_results.append(config_topk)
         
         # Aggregate TopK results across configurations
-        topk_aggregated = {'ratios': {}, 'absolute': {}, 'area_percentages': {}, 'summary': {}}
+        topk_aggregated = {'area_percentages': {}, 'summary': {}}
         
-        # Aggregate ratio-based results
-        if 'ratios' in topk_results[0] and topk_results[0]['ratios']:
-            for ratio_key in topk_results[0]['ratios'].keys():
-                ratio_data = [result['ratios'][ratio_key] for result in topk_results if 'ratios' in result and ratio_key in result['ratios']]
-                if ratio_data:
-                    topk_aggregated['ratios'][ratio_key] = {
-                        'capture_rates': [d['capture_rate'] for d in ratio_data],
-                        'precisions': [d['precision'] for d in ratio_data],
-                        'mean_capture_rate': float(np.mean([d['capture_rate'] for d in ratio_data])),
-                        'std_capture_rate': float(np.std([d['capture_rate'] for d in ratio_data])),
-                        'mean_precision': float(np.mean([d['precision'] for d in ratio_data])),
-                        'std_precision': float(np.std([d['precision'] for d in ratio_data]))
-                    }
-        
-        # Aggregate absolute K results
-        if 'absolute' in topk_results[0] and topk_results[0]['absolute']:
-            for k_key in topk_results[0]['absolute'].keys():
-                k_data = [result['absolute'][k_key] for result in topk_results if 'absolute' in result and k_key in result['absolute']]
-                if k_data:
-                    topk_aggregated['absolute'][k_key] = {
-                        'capture_rates': [d['capture_rate'] for d in k_data],
-                        'precisions': [d['precision'] for d in k_data],
-                        'mean_capture_rate': float(np.mean([d['capture_rate'] for d in k_data])),
-                        'std_capture_rate': float(np.std([d['capture_rate'] for d in k_data])),
-                        'mean_precision': float(np.mean([d['precision'] for d in k_data])),
-                        'std_precision': float(np.std([d['precision'] for d in k_data]))
-                    }
-        
-        # Aggregate area percentage results
+        # Aggregate area percentage results (includes Lift)
         if 'area_percentages' in topk_results[0] and topk_results[0]['area_percentages']:
             for area_key in topk_results[0]['area_percentages'].keys():
                 area_data = [result['area_percentages'][area_key] for result in topk_results if 'area_percentages' in result and area_key in result['area_percentages']]
@@ -2234,28 +2170,43 @@ def compute_extended_meta_evaluation(
                     topk_aggregated['area_percentages'][area_key] = {
                         'capture_rates': [d['capture_rate'] for d in area_data],
                         'precisions': [d['precision'] for d in area_data],
+                        'lifts': [d['lift'] for d in area_data],
                         'mean_capture_rate': float(np.mean([d['capture_rate'] for d in area_data])),
                         'std_capture_rate': float(np.std([d['capture_rate'] for d in area_data])),
                         'mean_precision': float(np.mean([d['precision'] for d in area_data])),
-                        'std_precision': float(np.std([d['precision'] for d in area_data]))
+                        'std_precision': float(np.std([d['precision'] for d in area_data])),
+                        'mean_lift': float(np.mean([d['lift'] for d in area_data])),
+                        'std_lift': float(np.std([d['lift'] for d in area_data]))
                     }
         
-        extended_results['topk'] = topk_aggregated
+        if 'topk' in meta_eval_metrics:
+            extended_results['topk'] = topk_aggregated
+            
+        if 'lift' in meta_eval_metrics:
+            # Extract just the lift metrics for cleaner output if specifically requested
+            lift_results = {}
+            for area_key, data in topk_aggregated['area_percentages'].items():
+                lift_results[area_key] = {
+                    'mean_lift': data['mean_lift'],
+                    'std_lift': data['std_lift'],
+                    'lifts': data['lifts']
+                }
+            extended_results['lift'] = lift_results
         
         if run_logger:
-            run_logger.log(f"[compute_extended_meta_evaluation] TopK aggregated across {len(topk_results)} configurations")
+            run_logger.log(f"[compute_extended_meta_evaluation] TopK/Lift aggregated across {len(topk_results)} configurations")
     
     # PU-based negative metrics (FPR, background rejection, NPV, FDR)
     requested_neg_metrics = [m for m in meta_eval_metrics if m in NEGATIVE_META_EVALUATION]
     if requested_neg_metrics:
-        pi_range = meta_eval_config.pu_prior_range or [0.05, 0.25]
+        pi_range = [0.05, 0.25] # Default since arg removed
         pi_values = sorted({float(pi) for pi in pi_range})
         
-        thresholds = meta_eval_config.pu_metric_thresholds
+        thresholds = None # Default since arg removed
         if thresholds:
             thresholds = np.array(sorted({float(t) for t in thresholds}))
         else:
-            threshold_count = max(5, int(meta_eval_config.pu_metric_threshold_count))
+            threshold_count = 25 # Default since arg removed
             combined_probs = np.concatenate([np.asarray(p) for p in all_probabilities]) if all_probabilities else np.array([0.0])
             quantiles = np.linspace(0.0, 1.0, threshold_count)
             thresholds = np.quantile(combined_probs, quantiles)
@@ -2289,6 +2240,59 @@ def compute_extended_meta_evaluation(
     return extended_results
 
 
+def update_meta_evaluation_results(
+    *,
+    tag_main: str,
+    new_data: Dict[str, Any],
+    common: Dict[str, Any],
+    run_logger: Optional[Any] = None
+) -> None:
+    """
+    Update existing Meta_Evaluation JSON file with new data (e.g., rigorous metrics).
+    
+    Args:
+        tag_main: Tag identifier for the experiment
+        new_data: Dictionary containing new metrics to merge
+        common: Dictionary containing cfg
+        run_logger: Optional logger
+    """
+    import json
+    from pathlib import Path
+    import os
+    
+    cfg = common['cfg']
+    output_dir = Path(cfg.output_dir) / "cls_1_training_results/meta_evaluation_results"
+    output_path = output_dir / f"{tag_main}_meta_eval.json"
+    
+    if not output_path.exists():
+        if run_logger:
+            run_logger.log(f"[update_meta_evaluation] Warning: File {output_path} not found. Creating new.")
+        current_data = {}
+    else:
+        try:
+            with open(output_path, 'r') as f:
+                current_data = json.load(f)
+        except Exception as e:
+            if run_logger:
+                run_logger.log(f"[update_meta_evaluation] Error reading {output_path}: {e}")
+            current_data = {}
+            
+    # Merge new data
+    # We use a simple top-level merge. For deeper merges, custom logic would be needed.
+    # Here we assume new_data keys are distinct (e.g., 'rigorous_evaluation')
+    
+    # Convert new data to serializable format first
+    serializable_new = _convert_to_serializable(new_data)
+    
+    current_data.update(serializable_new)
+    
+    with open(output_path, 'w') as f:
+        json.dump(current_data, f, indent=2)
+        
+    if run_logger:
+        run_logger.log(f"[update_meta_evaluation] Updated {output_path} with keys: {list(new_data.keys())}")
+
+
 # ============================================================================
 # Export Functions for External Use
 # ============================================================================
@@ -2299,9 +2303,10 @@ __all__ = [
     'train_cls_1_PN_PosDrop_MultiClustering',
     'load_and_evaluate_existing_predictions',
     'save_meta_evaluation_results',
+    'update_meta_evaluation_results',
     'create_pos_drop_schedule_unified',
     'compute_meta_evaluation_metric',
     'compute_proxy_auc_variants',
-    'compute_topk_positive_capture_with_ratios',
+    'compute_topk_positive_capture_and_lift',
     'compute_extended_meta_evaluation'
 ]

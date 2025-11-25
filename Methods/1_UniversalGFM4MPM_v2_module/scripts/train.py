@@ -138,6 +138,8 @@ from Common.cls.training import train_cls_PN_base
 
 from . inference_module import run_inference_base
 
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stage-1 overlap alignment trainer")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
@@ -168,27 +170,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mlp-dropout", type=float, default=0.2, help="Dropout probability applied to classifier MLP layers.", )
     parser.add_argument("--mlp-dropout-passes", type=int, default=5, help="Number of Monte Carlo dropout passes for uncertainty estimation in classifier inference.", )
 
-    # parser.add_argument("--read-inference", action=argparse.BooleanOptionalAction, default=False, help="Read inference on aligned datasets after training (default: false).",)
-    
     parser.add_argument("--skip-training-if-cached", action="store_true", help="Skip training if cached predictions are found and compute Meta_Evaluation from cached results.")
 
-    # Meta-evaluation parameters
-    parser.add_argument("--meta-evaluation", type=str, nargs="+", default=["PosDrop_Acc", "Focus", "topk", "pauc", "pu_tpr", "pu_fpr", "pu_npv", "background_rejection"], help="Meta-evaluation metrics to compute (space-separated). Available: PosDrop_Acc, Focus, topk, pauc")
+    # ✅ META-EVALUATION PARAMETERS
     parser.add_argument("--run-meta-evaluation", action=argparse.BooleanOptionalAction, default=True, help="Enable meta-evaluation metric computation.")
-    # ✅ Multi-clustering arguments
-    parser.add_argument("--clustering-methods", type=str, nargs="+", default=["random", "kmeans", "hierarchical"], choices=["random", "kmeans", "hierarchical"], help="Clustering methods for positive dropping (space-separated). Available: random, kmeans, hierarchical")
-    parser.add_argument("--meta-evaluation-n-clusters", type=int, nargs="+", default=[2, 3, 4, 5, 6, 7, 8, 10], help="Number of clusters/iterations for meta-evaluation (space-separated). Line search over these values.")
-    parser.add_argument("--hierarchical-linkage", type=str, default="ward", choices=["ward", "complete", "average", "single"], help="Linkage criterion for hierarchical clustering")
+    parser.add_argument("--meta-eval-methods", type=str, nargs="+", default=["posdrop", "shuffle", "stability"], choices=["posdrop", "shuffle", "stability"], help="Meta-evaluation methods to run. Available: posdrop, shuffle, stability")
+    # parser.add_argument("--meta-eval-methods", type=str, nargs="+", default=["shuffle"], choices=["posdrop", "shuffle", "stability"], help="Meta-evaluation methods to run. Available: posdrop, shuffle, stability")
+    parser.add_argument("--meta-eval-metrics", type=str, nargs="+", default=["accuracy", "focus", "topk", "lift", "pauc", "background_rejection", "spatial_entropy", "spatial_jaccard", "z_score", "fde"], help="Meta-evaluation metrics to compute (space-separated). Available: accuracy, focus, topk, lift, pauc, background_rejection, spatial_entropy, spatial_jaccard, z_score, fde")
+
+    # ✅ RIGOROUS EVALUATION PARAMETERS 1 - Positive dropout via clustering
+    parser.add_argument("--meta-eval-posdrop-clusters", type=int, nargs="+", default=[2, 3, 4, 5, 6, 7, 8, 10], help="Number of clusters/iterations for meta-evaluation (space-separated). Line search over these values.")
+    # parser.add_argument("--meta-eval-posdrop-clusters", type=int, nargs="+", default=[2], help="Number of clusters/iterations for meta-evaluation (space-separated). Line search over these values.")
+    parser.add_argument("--meta-eval-posdrop-strategy", type=str, nargs="+", default=["latent_dist", "actual_dist"], choices=["latent_dist", "actual_dist"], help="Positive dropout strategy (space-separated). Available: latent_dist, actual_dist")
+
+    # ✅ RIGOROUS EVALUATION PARAMETERS 2
+    parser.add_argument("--meta-eval-shuffle-runs", type=int, default=5, help="Number of permutation tests (Target Shuffling) to run. Default: 0 (disabled)")
+
+    # ✅ RIGOROUS EVALUATION PARAMETERS 3
+    parser.add_argument("--meta-eval-stability-runs", type=int, default=5, help="Number of subsampling tests (Stability Selection) to run. Default: 0 (disabled)")
+    parser.add_argument("--meta-eval-stability-rate", type=float, default=0.5, help="Fraction of Unlabelled data to use for Stability Selection. Default: 0.5")
+
     # ✅ TOPK PARAMETERS
-    parser.add_argument("--topk-k-ratio", type=float, nargs="+", default=[0.5, 1.0, 2.0, 4.0, 7.0, 10.0, 15.0, 20.0], help="K values as ratios of known positives for Top-K analysis")
-    parser.add_argument("--topk-k-values", type=int, nargs="+", default=[], help="Additional absolute K values for Top-K analysis (optional)")
-    parser.add_argument("--topk-area-percentages", type=float, nargs="+", default=[0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0], help="Area percentages for Top-K area-based analysis")
-    # ✅ PAUC PARAMETERS  
-    parser.add_argument("--pauc-prior-variants", type=float, nargs="+", default=[0.01, 0.05, 0.1, 0.2, 0.3], help="Prior probability variants for Proxy AUC correction")
-    # ✅ PU-based negative meta metrics
-    parser.add_argument("--pu-prior-range", type=float, nargs=2, default=[0.01, 0.05, 0.10, 0.20], help="Min/max class prior assumptions for PU negative metrics.")
-    parser.add_argument("--pu-metric-thresholds", type=float, nargs="+", default=[], help="Optional explicit probability thresholds for PU negative metrics.")
-    parser.add_argument("--pu-metric-threshold-count", type=int, default=25, help="Number of quantile-based thresholds when not specifying --pu-metric-thresholds.")
+    parser.add_argument("--meta-eval-topk-area-percent", type=float, nargs="+", default=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0], help="Area percentages for Top-K analysis")
+
+    # ✅ PAUC PARAMETERS
+    parser.add_argument("--meta-eval-pauc-prior-variants", type=float, nargs="+", default=[0.01, 0.05, 0.1, 0.2, 0.3, 0.5], help="Prior variants for PAUC calculation")
 
     return parser.parse_args()
 
@@ -204,10 +210,7 @@ def main() -> None:
     args = parse_args()
     config_path = Path(args.config).resolve()
     cfg = load_config(config_path)
-    if args.debug:
-        run_logger = _RunLogger(cfg)
-    else:
-        run_logger = None
+    run_logger = _RunLogger(cfg)
         
     meta_eval_config = train_cls_PN_base.MetaEvaluationConfig.from_args(args)
     setattr(args, "_meta_eval_config", meta_eval_config)
@@ -278,25 +281,24 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Use first cluster count for legacy compatibility
-    if args.meta_evaluation_n_clusters:
-        drop_rate = 1.0 / args.meta_evaluation_n_clusters[0]
+    if args.meta_eval_posdrop_clusters:
+        drop_rate = 1.0 / args.meta_eval_posdrop_clusters[0]
     else:
         drop_rate = 0.1  # Default fallback
     
     # Log execution mode for debugging
     is_multi_clustering = (
-        len(args.clustering_methods) > 1 or 
-        len(args.meta_evaluation_n_clusters) > 1 or
-        args.clustering_methods != ["random"]
+        len(args.meta_eval_posdrop_strategy) > 1 or 
+        len(args.meta_eval_posdrop_clusters) > 1
     )
     
     if is_multi_clustering:
         run_logger.log(f"[main] MULTI-CLUSTERING mode detected:")
-        run_logger.log(f"[main] - Methods: {args.clustering_methods}")
-        run_logger.log(f"[main] - Cluster counts: {args.meta_evaluation_n_clusters}")
-        run_logger.log(f"[main] - Hierarchical linkage: {args.hierarchical_linkage}")
+        run_logger.log(f"[main] - Strategies: {args.meta_eval_posdrop_strategy}")
+        run_logger.log(f"[main] - Cluster counts: {args.meta_eval_posdrop_clusters}")
+
     else:
-        drop_rate = 1.0 / args.meta_evaluation_n_clusters[0] if args.meta_evaluation_n_clusters else 0.1
+        drop_rate = 1.0 / args.meta_eval_posdrop_clusters[0] if args.meta_eval_posdrop_clusters else 0.1
         run_logger.log(f"[main] LEGACY mode detected with drop_rate={drop_rate}")
     
     # Set global random seed for reproducibility
@@ -329,11 +331,27 @@ def main() -> None:
     # unified_overlap_data = Unifying_METHOD1_PHI_OverlapOnly(overlap_info, device, run_logger, batch_size=1000)
     # overlap_info_pair_metadata_only = get_overlap_info_pair_metadata_only(cfg, args, device, run_logger)
 
+    ####################################### Train Classifier 1 on target_data (Original)  #######################################
+    method_name = "base"
+    data_name = target_name
+    encoder_name = "MAEViT"
+    data_use = get_original_dataset_for_training(cfg=cfg, dataset_name=data_name, run_logger=run_logger)
+
+    # Substitute labels
+    label_name = anchor_name
+    label_use = get_original_dataset_for_training(cfg=cfg, dataset_name=label_name, run_logger=run_logger)
+    data_use = _substitute_label_overlap_constrained(data=data_use,  label_source=label_use, overlap_info=overlap_info, run_logger=run_logger)
+    
+    action = None
+
+    tag = create_clean_tag(method_name, encoder_name, data_name)
+    train_save_eval_result(tag, data_use, action, common, args, cfg, run_logger, run_rigorous=True)
+    exit()
 
     ####################################### Train METHOD3 (shared; using KL; overlap) classifier #######################################
-    method_name = "M3_Uni_KL_Overlap"
+    method_name = "M3_KL"
     data_name = f"{anchor_name}_{target_name}"
-    encoder_name = "Shared_MAEViT_plus_TransDCCA"
+    encoder_name = "MAEViT_plus_TransDCCA"
 
     # Grab original + DCCA embeddings for both datasets, restricted to overlap
     anchor_original = get_original_dataset_for_training(cfg=cfg, dataset_name=anchor_name, run_logger=run_logger)
@@ -356,7 +374,7 @@ def main() -> None:
 
     action = None
     tag = create_clean_tag(method_name, encoder_name, data_name)
-    train_and_save_result(tag, data_use, action, common, args, cfg, run_logger)
+    train_save_eval_result(tag, data_use, action, common, args, cfg, run_logger, run_rigorous=True)
     exit()
 
     ####################################### Train on target [z_b | u_b] #######################################
@@ -378,27 +396,7 @@ def main() -> None:
     action = None
 
     tag = create_clean_tag(method_name, encoder_name, data_name)
-    train_and_save_result(tag, data_use, action, common, args, cfg, run_logger)
-
-
-    ####################################### Train Classifier 1 on target_data (Original)  #######################################
-    method_name = "base"
-    data_name = target_name
-    encoder_name = "MAEViT"
-    data_use = get_original_dataset_for_training(cfg=cfg, dataset_name=data_name, run_logger=run_logger)
-
-    # Substitute labels
-    label_name = anchor_name
-    label_use = get_original_dataset_for_training(cfg=cfg, dataset_name=label_name, run_logger=run_logger)
-    data_use = _substitute_label_overlap_constrained(data=data_use,  label_source=label_use, overlap_info=overlap_info, run_logger=run_logger)
-    
-    action = None
-
-    tag = create_clean_tag(method_name, encoder_name, data_name)
-    train_and_save_result(tag, data_use, action, common, args, cfg, run_logger)
-
-    exit()
-
+    train_save_eval_result(tag, data_use, action, common, args, cfg, run_logger)
 
     ####################################### Train Classifier 1 on anchor_name (Original)  #######################################
     method_name = "base"
@@ -408,7 +406,7 @@ def main() -> None:
     action = None
 
     tag = create_clean_tag(method_name, encoder_name, data_name)
-    train_and_save_result(tag, drop_rate, data_use, action, common, args, cfg, run_logger)
+    train_save_eval_result(tag, data_use, action, common, args, cfg, run_logger)
 
     ####################################### Train on anchor [z_a | u_a] #######################################
     method_name = "Method2_concat"
@@ -427,7 +425,7 @@ def main() -> None:
     action = None
 
     tag = create_clean_tag(method_name, encoder_name, data_name)
-    train_and_save_result(tag, drop_rate, data_use, action, common, args, cfg, run_logger)
+    train_save_eval_result(tag, data_use, action, common, args, cfg, run_logger)
 
     ####################################### Train Classifier 1 on anchor_name (Original; extracted)  #######################################
     method_name = "base"
@@ -438,7 +436,7 @@ def main() -> None:
     action = None
 
     tag = create_clean_tag(method_name, encoder_name, data_name)
-    train_and_save_result(tag, drop_rate, data_use, action, common, args, cfg, run_logger)
+    train_save_eval_result(tag, data_use, action, common, args, cfg, run_logger)
 
     ####################################### Train Classifier 1 on target_data (DCCA)  #######################################
     method_name = "base"
@@ -450,7 +448,7 @@ def main() -> None:
     action = None
 
     tag = create_clean_tag(method_name, encoder_name, data_name)
-    train_and_save_result(tag, drop_rate, data_use, action, common, args, cfg, run_logger)
+    train_save_eval_result(tag, data_use, action, common, args, cfg, run_logger)
 
     ####################################### Train Classifier 1 on anchor_name (Original; extracted)  #######################################
     method_name = "base"
@@ -461,7 +459,8 @@ def main() -> None:
     action = None
 
     tag = create_clean_tag(method_name, encoder_name, data_name)
-    train_and_save_result(tag, drop_rate, data_use, action, common, args, cfg, run_logger)
+    
+    train_save_eval_result(tag, data_use, action, common, args, cfg, run_logger)
 
     ####################################### Train Classifier 1 on target_data (DCCA)  #######################################
     method_name = "TransDCCA_PN_Unified"
@@ -471,12 +470,11 @@ def main() -> None:
     action = None
 
     tag = create_clean_tag(method_name, encoder_name, data_name)
-    train_and_save_result(tag, drop_rate, data_use, action, common, args, cfg, run_logger)
-
+    
+    # ✅ RIGOROUS EVALUATION FRAMEWORK
+    train_save_eval_result(tag, data_use, action, common, args, cfg, run_logger, run_rigorous=True)
 
     return
-
-
 
 #####################################################################################   #####################################################################################   #####################################################################################   
 
@@ -1084,7 +1082,7 @@ def _substitute_label_overlap_constrained(
     
     return modified_data
 
-def train_and_save_result(
+def train_save_eval_result(
     tag: str,
     data_use: Dict[str, object],
     action: object,
@@ -1092,7 +1090,10 @@ def train_and_save_result(
     args,
     cfg,
     run_logger: "_RunLogger",
-) -> None:
+    train_subset_indices: Optional[np.ndarray] = None,
+    run_rigorous: bool = False,
+    output_dir: Optional[Path] = None,
+) -> Optional[Dict[str, Any]]:
     """
     Unified training function that handles both legacy and multi-clustering modes.
     Always checks for cached predictions first before training.
@@ -1105,25 +1106,30 @@ def train_and_save_result(
         args: Arguments with training parameters
         cfg: Configuration object
         run_logger: Logger for debugging
+        train_subset_indices: Optional indices to restrict training data (for Stability Selection)
+        
+    Returns:
+        Dictionary containing training results (metrics, model, etc.) or None
     """
     
     # Extract seed from common parameters
     seed = common.get('seed', 42)
     
     # Convert meta_evaluation argument to set
-    meta_evaluation_metrics = set(args.meta_evaluation)
+    meta_evaluation_metrics = set(args.meta_eval_metrics)
     meta_eval_config = getattr(args, "_meta_eval_config", train_cls_PN_base.MetaEvaluationConfig())
     run_meta_evaluation = bool(getattr(args, "run_meta_evaluation", True))
     source_type = data_use.get("source_type")
     is_method3 = source_type == "M3_Uni_KL_Overlap"
     
+
     # Determine execution mode based on parameters
     multi_clustering_requested = (
-        len(args.clustering_methods) > 1 or 
-        len(args.meta_evaluation_n_clusters) > 1 or
-        args.clustering_methods != ["random"]
+        len(args.meta_eval_posdrop_strategy) > 1 or 
+        len(args.meta_eval_posdrop_clusters) > 1
     )
-
+    
+    inference_fn = run_inference_base
     # METHOD3 always reuses the multi-configuration path even when only a single
     # clustering config is supplied, so track that explicitly to avoid confusion.
     force_multi_for_method3 = is_method3
@@ -1134,9 +1140,9 @@ def train_and_save_result(
             run_logger.log(f"[train_and_save_result] METHOD3 (shared overlap) multi-configuration mode for '{tag}'")
         else:
             run_logger.log(f"[train_and_save_result] MULTI-CLUSTERING MODE for '{tag}'")
-        run_logger.log(f"[train_and_save_result] Methods: {args.clustering_methods}")
-        run_logger.log(f"[train_and_save_result] Cluster counts: {args.meta_evaluation_n_clusters}")
-        run_logger.log(f"[train_and_save_result] Hierarchical linkage: {args.hierarchical_linkage}")
+        run_logger.log(f"[train_and_save_result] Strategies: {args.meta_eval_posdrop_strategy}")
+        run_logger.log(f"[train_and_save_result] Cluster counts: {args.meta_eval_posdrop_clusters}")
+
 
         supports_caching = not is_method3
         cached_results = {}
@@ -1147,14 +1153,14 @@ def train_and_save_result(
         if args.skip_training_if_cached:
             run_logger.log(f"[train_and_save_result] Checking for cached multi-clustering results...")
             if supports_caching:
-                for method in args.clustering_methods:
-                    for n_clusters in args.meta_evaluation_n_clusters:
+                for method in args.meta_eval_posdrop_strategy:
+                    for n_clusters in args.meta_eval_posdrop_clusters:
                         config_name = f"{method}{n_clusters}"
 
                         cached_result = train_cls_PN_base.load_and_evaluate_existing_predictions(
                             tag_main=tag,
                             meta_evaluation_n_clusters=n_clusters,
-                            clustering_method=method,
+                            posdrop_strategy=method,
                             common=common,
                             data_use=data_use,
                             run_logger=run_logger,
@@ -1169,7 +1175,7 @@ def train_and_save_result(
                             missing_configs.append({'method': method, 'n_clusters': n_clusters, 'name': config_name})
                             run_logger.log(f"[train_and_save_result] ❌ No cached predictions for {config_name}")
 
-                total_configs = len(args.clustering_methods) * len(args.meta_evaluation_n_clusters)
+                total_configs = len(args.meta_eval_posdrop_strategy) * len(args.meta_eval_posdrop_clusters)
                 if run_meta_evaluation:
                     for config_name, result in cached_results.items():
                         method_tag = f"{tag}_{config_name}"
@@ -1199,16 +1205,16 @@ def train_and_save_result(
                 run_logger.log("[train_and_save_result] Caching not supported for METHOD3; training all configurations.")
                 missing_configs = [
                     {'method': method, 'n_clusters': n_clusters, 'name': f"{method}{n_clusters}"}
-                    for method in args.clustering_methods
-                    for n_clusters in args.meta_evaluation_n_clusters
+                    for method in args.meta_eval_posdrop_strategy
+                    for n_clusters in args.meta_eval_posdrop_clusters
                 ]
                 methods_to_train = list(set(config['method'] for config in missing_configs))
                 clusters_to_train = list(set(config['n_clusters'] for config in missing_configs))
         else:
             missing_configs = [
                 {'method': method, 'n_clusters': n_clusters, 'name': f"{method}{n_clusters}"}
-                for method in args.clustering_methods
-                for n_clusters in args.meta_evaluation_n_clusters
+                for method in args.meta_eval_posdrop_strategy
+                for n_clusters in args.meta_eval_posdrop_clusters
             ]
             methods_to_train = list(set(config['method'] for config in missing_configs))
             clusters_to_train = list(set(config['n_clusters'] for config in missing_configs))
@@ -1216,17 +1222,24 @@ def train_and_save_result(
 
         training_results = {}
         if missing_configs:
+            run_logger.log(f"[train_and_save_result] Training {len(methods_to_train)} methods x {len(clusters_to_train)} cluster counts...")
+            
+            # Update common with subset indices if provided
+            common_with_subset = common.copy()
+            if train_subset_indices is not None:
+                common_with_subset['train_subset_indices'] = train_subset_indices
+
             training_results = train_cls_PN_base.train_cls_1_PN_PosDrop_MultiClustering(
-                clustering_methods=methods_to_train,
+                posdrop_strategies=methods_to_train,
                 meta_evaluation_n_clusters_list=clusters_to_train,
-                linkage=args.hierarchical_linkage,
+
                 seed=seed,
-                common={**common, 'verbose': False},
+                common=common_with_subset,
                 data_use=data_use,
                 filter_top_pct=args.filter_top_pct,
                 negs_per_pos=args.negs_per_pos,
                 action=action,
-                inference_fn=run_inference_base,
+                inference_fn=inference_fn,
                 tag_main=tag,
                 meta_evaluation_metrics=meta_evaluation_metrics,
                 run_meta_evaluation=run_meta_evaluation,
@@ -1251,7 +1264,7 @@ def train_and_save_result(
                 method_tag = f"{tag}_{method_cluster_key}"
 
                 # Save meta evaluation results
-                if run_meta_evaluation:
+                if run_meta_evaluation and train_subset_indices is None: # Only save if not a subset run
                     train_cls_PN_base.save_meta_evaluation_results(
                         meta_evaluation=result,
                         tag_main=method_tag,
@@ -1260,12 +1273,15 @@ def train_and_save_result(
                     )
 
                 # Save full training results
-                save_training_results(
-                    result=result,
-                    tag=method_tag,
-                    output_dir=Path(cfg.output_dir) / method_tag,
-                    run_logger=run_logger
-                )
+                if train_subset_indices is None: # Only save if not a subset run
+                    save_training_results(
+                        result=result,
+                        tag=method_tag,
+                        # output_dir=Path(cfg.output_dir)/"cls_1_training_results" / method_tag,
+                        output_dir=Path(cfg.output_dir)/"cls_1_training_results"/ "meta_evaluation_results" / method_tag,
+                        run_logger=run_logger
+                    )
+                
                 run_logger.log(f"[train_and_save_result] ✅ TRAINED: {method_cluster_key}")
             else:
                 run_logger.log(f"[train_and_save_result] ❌ ERROR in {method_cluster_key}: {result['error']}")
@@ -1283,20 +1299,26 @@ def train_and_save_result(
                         metrics_group.setdefault(metric, []).append((method_cluster_key, status, data))
             for metric_name, entries in metrics_group.items():
                 run_logger.log(f"[train_and_save_result] -- {metric_name} --")
-                # for method_cluster_key, status, data in entries:
-                #     run_logger.log(f"[train_and_save_result] {method_cluster_key} ({status}): {data['mean']:.4f} ± {data['std']:.4f}")
+                for method_cluster_key, status, data in entries:
+                    if isinstance(data['mean'], (int, float)):
+                        run_logger.log(f"[train_and_save_result] {method_cluster_key} ({status}): {data['mean']:.4f} ± {data['std']:.4f}")
+                    else:
+                        # Skip logging non-scalar means (like curves)
+                        pass
             run_logger.log(f"[train_and_save_result] ===== END SUMMARY =====")
+        
+        return all_results # Return all results for multi-clustering
     
     else:
         # LEGACY MODE: Single method, single cluster count
-        clustering_method = args.clustering_methods[0]  # Should be "random"
-        n_clusters = args.meta_evaluation_n_clusters[0]  # Single value
+        posdrop_strategy = args.meta_eval_posdrop_strategy[0]  # Should be "latent_dist"
+        n_clusters = args.meta_eval_posdrop_clusters[0]  # Single value
         
         # Convert to legacy drop_rate for backward compatibility
         drop_rate = 1.0 / n_clusters
         
         run_logger.log(f"[train_and_save_result] LEGACY MODE for '{tag}'")
-        run_logger.log(f"[train_and_save_result] Method: {clustering_method}, n_clusters: {n_clusters} (drop_rate: {drop_rate:.3f})")
+        run_logger.log(f"[train_and_save_result] Strategy: {posdrop_strategy}, n_clusters: {n_clusters} (drop_rate: {drop_rate:.3f})")
         
         # ✅ CHECK FOR CACHED RESULTS FIRST (legacy mode)
         cached_meta_evaluation = None
@@ -1307,7 +1329,7 @@ def train_and_save_result(
             cached_meta_evaluation = train_cls_PN_base.load_and_evaluate_existing_predictions(
                 tag_main=tag,
                 meta_evaluation_n_clusters=n_clusters,
-                clustering_method=clustering_method,
+                posdrop_strategy=posdrop_strategy,
                 common=common,
                 data_use=data_use,
                 run_logger=run_logger,
@@ -1332,11 +1354,14 @@ def train_and_save_result(
                     # Function doesn't support legacy drop_rate parameter
                     pass
         
+        # Determine output directory
+        effective_output_dir = output_dir if output_dir is not None else cfg.output_dir
+
         if cached_meta_evaluation is not None:
-            run_logger.log(f"[train_and_save_result] ✅ Found cached predictions for '{tag}'")
+            run_logger.log(f"[train_save_eval_result] ✅ Found cached predictions for '{tag}'")
             
             # Save cached meta evaluation results
-            if run_meta_evaluation:
+            if run_meta_evaluation and train_subset_indices is None: # Only save if not a subset run
                 train_cls_PN_base.save_meta_evaluation_results(
                     meta_evaluation=cached_meta_evaluation,
                     tag_main=tag,
@@ -1344,52 +1369,232 @@ def train_and_save_result(
                     run_logger=run_logger
                 )
             
-            run_logger.log(f"[train_and_save_result] Skipping training (cached predictions used)")
+            run_logger.log(f"[train_save_eval_result] Skipping training (cached predictions used)")
             for metric, data in cached_meta_evaluation.items():
                 if isinstance(data, dict) and 'mean' in data:
                     run_logger.log(f"  {metric}: {data['mean']:.4f} ± {data['std']:.4f}")
-            return
+            result = cached_meta_evaluation # Use cached results
         else:
-            run_logger.log(f"[train_and_save_result] No cached predictions found, proceeding with training")
+            run_logger.log(f"[train_save_eval_result] No cached predictions found, proceeding with training")
         
-        # Execute single-configuration training
-        result = train_cls_PN_base.train_cls_1_PN_PosDrop(
-            meta_evaluation_n_clusters=n_clusters,
-            clustering_method=clustering_method,
-            linkage=args.hierarchical_linkage,
-            seed=seed,
-            common={**common, 'verbose': False},
-            data_use=data_use,
-            filter_top_pct=args.filter_top_pct,
-            negs_per_pos=args.negs_per_pos,
-            action=action,
-            inference_fn=run_inference_base,
-            tag_main=tag,
-            run_meta_evaluation=run_meta_evaluation,
-            meta_eval_config=meta_eval_config,
-        )
-        
-        # Save training results
-        save_training_results(
-            result=result,
-            tag=tag,
-            output_dir=Path(cfg.output_dir) / tag,
-            run_logger=run_logger
-        )
-        
-        # Save meta evaluation results
-        if run_meta_evaluation:
-            train_cls_PN_base.save_meta_evaluation_results(
-                meta_evaluation=result,
+            # Execute single-configuration training
+            # Update common with subset indices if provided
+            common_with_subset = common.copy()
+            if train_subset_indices is not None:
+                common_with_subset['train_subset_indices'] = train_subset_indices
+
+            result = train_cls_PN_base.train_cls_1_PN_PosDrop(
+                meta_evaluation_n_clusters=n_clusters,
+                posdrop_strategy=posdrop_strategy,
+
+                seed=seed,
+                common=common_with_subset,
+                data_use=data_use,
+                filter_top_pct=args.filter_top_pct,
+                negs_per_pos=args.negs_per_pos,
+                action=action,
+                inference_fn=inference_fn,
                 tag_main=tag,
+                run_meta_evaluation=run_meta_evaluation,
+                meta_eval_config=meta_eval_config,
+            )
+            
+            if run_meta_evaluation:
+                train_cls_PN_base.save_meta_evaluation_results(
+                    meta_evaluation=result,
+                    tag_main=tag,
+                    common=common,
+                    run_logger=run_logger
+                )
+
+            # ✅ SAVE FULL TRAINING RESULTS
+            save_training_results(result, tag, effective_output_dir, run_logger)
+            
+            run_logger.log(f"[train_save_eval_result] Completed training for {tag}")
+            for metric, data in result.items():
+                if isinstance(data, dict) and 'mean' in data:
+                    run_logger.log(f"  {metric}: {data['mean']:.4f} ± {data['std']:.4f}")
+
+    # ✅ RIGOROUS EVALUATION FRAMEWORK
+    if run_rigorous:
+        run_logger.log(f"\n[train_save_eval_result] ===== STARTING RIGOROUS EVALUATION SUITE =====")
+        rigorous_results = {}
+        baseline_result = result
+
+        # 2. Target Shuffling (Bias Check)
+        if "shuffle" in args.meta_eval_methods and args.meta_eval_shuffle_runs > 0:
+            run_logger.log(f"\n[train_save_eval_result] ===== STARTING TARGET SHUFFLING ({args.meta_eval_shuffle_runs} runs) =====")
+            
+            # Create subdirectory for shuffling results
+            shuffle_dir = effective_output_dir / "Rigorous_Shuffle"
+            shuffle_dir.mkdir(parents=True, exist_ok=True)
+            
+            shuffle_paucs = []
+            shuffle_fprs = []
+            
+            for i in range(args.meta_eval_shuffle_runs):
+                run_logger.log(f"[Target Shuffling] Run {i+1}/{args.meta_eval_shuffle_runs}")
+                
+                # Create shuffled data
+                data_shuffled = data_use.copy()
+                y_true = data_use['labels'].copy()
+                
+                # Shuffle labels but keep P count (random permutation)
+                np.random.shuffle(y_true)
+                data_shuffled['labels'] = y_true
+                
+                # Train on shuffled data
+                tag_shuffle = f"{tag}_TargetShuffle_run{i}"
+                
+                res = train_save_eval_result(
+                    tag=tag_shuffle,
+                    data_use=data_shuffled,
+                    action=action,
+                    common=common,
+                    args=args,
+                    cfg=cfg,
+                    run_logger=run_logger,
+                    run_rigorous=False,
+                    output_dir=shuffle_dir
+                )
+                
+                if res and 'pauc' in res:
+                    # Extract mean PAUC for the first prior
+                    pauc_data = res.get('pauc', {})
+                    if pauc_data:
+                        first_prior = list(pauc_data.keys())[0]
+                        shuffle_paucs.append(pauc_data[first_prior]['mean'])
+                
+                # Compute FPR at TPR=0.9
+                # Note: Predictions are not returned by default, so FPR calculation is skipped here.
+
+            # Compute Z-Score
+            if shuffle_paucs:
+                mean_shuffle = np.mean(shuffle_paucs)
+                std_shuffle = np.std(shuffle_paucs)
+                
+                if baseline_result:
+                    # Z-Score
+                    pauc_data = baseline_result.get('pauc', {})
+                    if pauc_data:
+                        first_prior = list(pauc_data.keys())[0]
+                        real_pauc = pauc_data[first_prior]['mean']
+                        z_score = (real_pauc - mean_shuffle) / (std_shuffle + 1e-9)
+                        
+                        run_logger.log(f"\n[Target Shuffling] Results:")
+                        run_logger.log(f"  Real PAUC: {real_pauc:.4f}")
+                        run_logger.log(f"  Shuffle PAUC: {mean_shuffle:.4f} ± {std_shuffle:.4f}")
+                        run_logger.log(f"  Z-Score: {z_score:.4f}")
+                        if z_score < 2: run_logger.log("  Interpretation: Indistinguishable from noise.")
+                        elif z_score > 5: run_logger.log("  Interpretation: Strong geological signal.")
+                    
+                    # Save Shuffling Results
+                    rigorous_results['target_shuffling'] = {
+                        'z_score': float(z_score) if 'z_score' in locals() else None,
+                        'real_pauc': float(real_pauc) if 'real_pauc' in locals() else None,
+                        'shuffle_pauc_mean': float(mean_shuffle) if 'mean_shuffle' in locals() else None,
+                        'shuffle_pauc_std': float(std_shuffle) if 'std_shuffle' in locals() else None,
+                    }
+
+        # 3. Stability Selection (Variance Check)
+        if "stability" in args.meta_eval_methods and args.meta_eval_stability_runs > 0:
+            run_logger.log(f"\n[train_save_eval_result] ===== STARTING STABILITY SELECTION ({args.meta_eval_stability_runs} runs, rate={args.meta_eval_stability_rate}) =====")
+            
+            # Create subdirectory for stability results
+            stability_dir = effective_output_dir / "Rigorous_Stability"
+            stability_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Identify Unlabelled indices
+            labels = data_use['labels']
+            is_pos = labels >= 0.9
+            u_indices = np.where(~is_pos)[0]
+            p_indices = np.where(is_pos)[0]
+            
+            n_subsample = int(len(u_indices) * args.meta_eval_stability_rate)
+            
+            all_run_predictions = []
+            stability_scalars = {
+                'accuracy': [], 'lift': [], 'pauc': [], 'br_at_tpr90': []
+            }
+            
+            for i in range(args.meta_eval_stability_runs):
+                run_logger.log(f"[Stability Selection] Run {i+1}/{args.meta_eval_stability_runs}")
+                
+                # Subsample U
+                u_subset = np.random.choice(u_indices, n_subsample, replace=False)
+                train_subset = np.concatenate([p_indices, u_subset])
+                train_subset.sort()
+                
+                tag_stability = f"{tag}_StabilitySelection_run{i}"
+                
+                res = train_save_eval_result(
+                    tag=tag_stability,
+                    data_use=data_use,
+                    action=action,
+                    common=common,
+                    args=args,
+                    cfg=cfg,
+                    run_logger=run_logger,
+                    train_subset_indices=train_subset,
+                    run_rigorous=False,
+                    output_dir=stability_dir
+                )
+                
+                if res:
+                    # Collect scalar metrics
+                    meta = res.get('meta_evaluation', res)
+                    
+                    if 'accuracy' in meta: stability_scalars['accuracy'].append(meta['accuracy'])
+                    
+                    if 'lift' in meta:
+                        topk_res = meta.get('topk', {})
+                        if topk_res and 'area_percentages' in topk_res:
+                            first_area = list(topk_res['area_percentages'].keys())[0]
+                            lift_val = topk_res['area_percentages'][first_area].get('lift')
+                            if lift_val is not None: stability_scalars['lift'].append(lift_val)
+                    
+                    if 'pauc' in meta:
+                        pauc_res = meta.get('pauc', {})
+                        if pauc_res:
+                            first_prior = list(pauc_res.keys())[0]
+                            pauc_val = pauc_res[first_prior]['mean']
+                            stability_scalars['pauc'].append(pauc_val)
+                    
+                    if 'background_rejection' in meta:
+                        br_data = meta['background_rejection']
+                        tpr_list = np.array(br_data['tpr'])
+                        br_list = np.array(br_data['background_rejection'])
+                        idx = np.searchsorted(tpr_list, 0.9, side='left')
+                        if idx < len(br_list):
+                            stability_scalars['br_at_tpr90'].append(float(br_list[idx]))
+            
+            # 4. Variance Check (Scalar Stability)
+            run_logger.log(f"\n[Stability Selection] Variance Check (Mean ± Std):")
+            for metric, values in stability_scalars.items():
+                if values:
+                    mean_val = np.mean(values)
+                    std_val = np.std(values)
+                    run_logger.log(f"  {metric}: {mean_val:.4f} ± {std_val:.4f}")
+            
+            # Save Stability Results
+            rigorous_results['stability_selection'] = {
+                'scalar_stability': {
+                    k: {'mean': float(np.mean(v)), 'std': float(np.std(v))} 
+                    for k, v in stability_scalars.items() if v
+                }
+            }
+
+        # Save Rigorous Evaluation Results
+        if rigorous_results:
+            run_logger.log(f"[train_save_eval_result] Saving rigorous evaluation results to {tag}_meta_eval.json...")
+            train_cls_PN_base.update_meta_evaluation_results(
+                tag_main=tag,
+                new_data={'rigorous_evaluation': rigorous_results},
                 common=common,
                 run_logger=run_logger
             )
-        
-        run_logger.log(f"[train_and_save_result] Completed training for {tag}")
-        for metric, data in result.items():
-            if isinstance(data, dict) and 'mean' in data:
-                run_logger.log(f"  {metric}: {data['mean']:.4f} ± {data['std']:.4f}")
+
+    return result
 
 
 def save_training_results(
@@ -1409,7 +1614,7 @@ def save_training_results(
         run_logger: Logger for debugging information
     """
     # Create results directory
-    results_dir = output_dir / "cls_1_training_results"
+    results_dir = output_dir 
     results_dir.mkdir(parents=True, exist_ok=True)
     
     # ✅ EXTRACT KEY METRICS FIRST (before serialization)

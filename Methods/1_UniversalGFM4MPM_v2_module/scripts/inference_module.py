@@ -80,6 +80,9 @@ def run_inference_base(
     np.save(model_dir / "predictions_mean.npy", mean_pred)
     np.save(model_dir / "predictions_std.npy", std_pred)
     
+    # ✅ Save model checkpoint
+    torch.save(cls.state_dict(), model_dir / "model.pt")
+    
     # ✅ MODIFIED: Only save coordinates when requested (final prediction)
     if save_coordinates:
         np.save(model_dir / "coordinates.npy", np.array(matched_coords))
