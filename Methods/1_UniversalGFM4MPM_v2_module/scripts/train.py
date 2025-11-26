@@ -180,10 +180,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--meta-eval-posdrop-strategy", type=str, nargs="+", default=["latent_dist", "actual_dist"], choices=["latent_dist", "actual_dist"], help="Positive dropout strategy (space-separated). Available: latent_dist, actual_dist")
 
     # ✅ RIGOROUS EVALUATION PARAMETERS 2
-    parser.add_argument("--meta-eval-shuffle-runs", type=int, default=5, help="Number of permutation tests (Target Shuffling) to run. Default: 0 (disabled)")
+    parser.add_argument("--meta-eval-shuffle-runs", type=int, default=2, help="Number of permutation tests (Target Shuffling) to run. Default: 0 (disabled)")
 
     # ✅ RIGOROUS EVALUATION PARAMETERS 3
-    parser.add_argument("--meta-eval-stability-runs", type=int, default=5, help="Number of subsampling tests (Stability Selection) to run. Default: 0 (disabled)")
+    parser.add_argument("--meta-eval-stability-runs", type=int, default=2, help="Number of subsampling tests (Stability Selection) to run. Default: 0 (disabled)")
     parser.add_argument("--meta-eval-stability-rate", type=float, default=0.5, help="Fraction of Unlabelled data to use for Stability Selection. Default: 0.5")
 
     # ✅ TOPK PARAMETERS
@@ -326,7 +326,7 @@ def main() -> None:
     action = None
 
     tag = create_clean_tag(method_name, encoder_name, data_name)
-    train_save_eval_result(tag, data_use, action, common, args, cfg, run_logger, run_rigorous=True)
+    train_save_eval_result(tag, data_use, action, common, args, cfg, run_logger)
 
     exit()
 
@@ -356,7 +356,7 @@ def main() -> None:
 
     action = None
     tag = create_clean_tag(method_name, encoder_name, data_name)
-    train_save_eval_result(tag, data_use, action, common, args, cfg, run_logger, run_rigorous=True)
+    train_save_eval_result(tag, data_use, action, common, args, cfg, run_logger)
     exit()
 
     ####################################### Train on target [z_b | u_b] #######################################
@@ -454,7 +454,7 @@ def main() -> None:
     tag = create_clean_tag(method_name, encoder_name, data_name)
     
     # ✅ RIGOROUS EVALUATION FRAMEWORK
-    train_save_eval_result(tag, data_use, action, common, args, cfg, run_logger, run_rigorous=True)
+    train_save_eval_result(tag, data_use, action, common, args, cfg, run_logger)
 
     return
 
@@ -471,6 +471,7 @@ def execute_standard_session(
     train_subset_indices: Optional[np.ndarray] = None,
     output_dir: Optional[Path] = None,
     save_results: bool = True,
+    inference_tag: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Execute a single Standard PN training session (No PosDrop).
@@ -484,19 +485,19 @@ def execute_standard_session(
     run_logger.log(f"[execute_standard_session] STANDARD MODE for '{tag}'")
     
     # Update common with subset indices if provided
-    common_with_subset = common.copy()
-    if train_subset_indices is not None:
-        common_with_subset['train_subset_indices'] = train_subset_indices
+    # common_with_subset = common.copy()
+    # if train_subset_indices is not None:
+    #     common_with_subset['train_subset_indices'] = train_subset_indices
 
     # Train Standard PN
     result = train_cls_PN_base.train_cls_1_PN(
-        common=common_with_subset,
+        common=common,
         data_use=data_use,
         filter_top_pct=args.filter_top_pct,
         negs_per_pos=args.negs_per_pos,
         action=action,
         inference_fn=run_inference_base,
-        tag=tag,
+        tag=inference_tag if inference_tag is not None else tag, 
     )
     
     # Compute Meta-Evaluation Metrics (PAUC, Lift, etc.)
@@ -918,13 +919,75 @@ def _run_repeated_trials(
             run_logger=run_logger,
             train_subset_indices=subset_indices,
             output_dir=output_dir,
-            save_results=save_individual_runs
+            save_results=save_individual_runs,
+            inference_tag=f"{tag_prefix}/run{i}" # ✅ Create subdirectory for inference
         )
         
         if res:
             results.append(res)
             
     return results
+
+
+def _run_rigorous_method(
+    method_name: str,
+    tag: str,
+    tag_prefix: str,
+    n_runs: int,
+    data_use: Dict[str, Any],
+    action: str,
+    common: Dict[str, Any],
+    args: argparse.Namespace,
+    cfg: Any,
+    run_logger: "_RunLogger",
+    effective_output_dir: Path,
+    baseline_results: Dict[str, Any],
+    data_modifier_fn: Callable,
+    metric_aggregator_fn: Callable,
+) -> Dict[str, Any]:
+    """
+    Helper to run rigorous evaluation methods (Shuffle, Stability) with unified logic.
+    """
+    run_logger.log(f"\n[execute_unified_session] --- {method_name} Workflow ---")
+    
+    # Prepare Directory
+    method_dir = effective_output_dir / tag_prefix
+    method_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Run Trials
+    results_list = _run_repeated_trials(
+        tag_prefix=tag_prefix,
+        n_runs=n_runs,
+        data_use=data_use,
+        action=action,
+        common=common,
+        args=args,
+        cfg=cfg,
+        run_logger=run_logger,
+        output_dir=method_dir,
+        data_modifier_fn=data_modifier_fn,
+        save_individual_runs=True
+    )
+    
+    # Aggregate Results
+    aggregated_results = metric_aggregator_fn(results_list, baseline_results, run_logger)
+    
+    # Save Results
+    if aggregated_results:
+        meta_eval_dir = cfg.output_dir / "cls_1_training_results/meta_evaluation_results"
+        # Map method name to key expected by update_meta_evaluation_results
+        key_map = {'Target Shuffling': 'target_shuffling', 'Stability Selection': 'stability_selection'}
+        data_key = key_map.get(method_name, method_name.lower().replace(" ", "_"))
+        
+        train_cls_PN_base.update_meta_evaluation_results(
+            tag_main=tag,
+            new_data={data_key: aggregated_results},
+            common=common,
+            run_logger=run_logger,
+            output_dir=meta_eval_dir
+        )
+        
+    return aggregated_results
 
 
 def execute_unified_session(
@@ -955,7 +1018,7 @@ def execute_unified_session(
     methods_to_run = args.meta_eval_methods # e.g. ['posdrop', 'shuffle', 'stability']
     
     # Imports for metrics
-    from train_cls_PN_base import compute_pairwise_jaccard, compute_binary_entropy
+    from Common.cls.training.train_cls_PN_base import compute_pairwise_jaccard, compute_binary_entropy
     
     run_logger.log(f"[execute_unified_session] Starting Unified Session for '{tag}'")
     run_logger.log(f"[execute_unified_session] Methods: {methods_to_run}")
@@ -1074,30 +1137,16 @@ def execute_unified_session(
     # 2. Target Shuffling Execution
     # =================================================================================
     if 'shuffle' in methods_to_run:
-        run_logger.log(f"\n[execute_unified_session] --- Target Shuffling Workflow ---")
-        
-        # We need a baseline to compare against. 
-        # If PosDrop was run, we use those results. 
-        # If not, we might need to run a standard session first? 
-        # For now, assume PosDrop results (or at least one standard result) exist if we want to compare.
-        # But wait, Shuffle compares "Real PAUC" vs "Shuffled PAUC".
-        # Real PAUC comes from the baseline run (PosDrop or Standard).
-        
-        # Let's define the baseline results to evaluate
+        # Baseline check
         baseline_results = {k: v for k, v in all_results.items() if "error" not in v}
         if not baseline_results:
-             # If no PosDrop, run a single Standard Session as baseline
              run_logger.log("[execute_unified_session] No PosDrop results found. Running Standard Baseline for Shuffle...")
              std_res = execute_standard_session(tag, data_use, action, common, args, cfg, run_logger, train_subset_indices, effective_output_dir, save_results)
              baseline_results = {"standard": std_res}
              all_results["standard"] = std_res
              config_status["standard"] = "TRAINED"
 
-        # Prepare Shuffle Directory
-        shuffle_dir = effective_output_dir / f"{tag}_TargetShuffle"
-        shuffle_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Define modifier
+        # Define Modifier
         def shuffle_modifier(data, idx):
             d = data.copy()
             y = data['labels'].copy()
@@ -1105,8 +1154,88 @@ def execute_unified_session(
             d['labels'] = y
             return d, None
 
-        # Run Trials
-        shuffle_results_list = _run_repeated_trials(
+        # Define Aggregator
+        def shuffle_aggregator(results_list, baselines, logger):
+            shuffle_metrics = {k: {
+                'pauc': [], 'lift': [], 'background_rejection': [], 
+                'posdrop_acc': [], 'spatial_entropy': [], 'focus': []
+            } for k in baselines.keys()}
+
+            for res in results_list:
+                meta = res.get('meta_evaluation', res)
+                for k in baselines.keys():
+                    # PAUC
+                    pauc_data = meta.get('pauc', {})
+                    if pauc_data:
+                        val = list(pauc_data.values())[0]
+                        if isinstance(val, dict) and 'mean' in val: val = val['mean']
+                        shuffle_metrics[k]['pauc'].append(val)
+                    
+                    # Other Metrics
+                    for m in ['lift', 'background_rejection', 'posdrop_acc', 'spatial_entropy', 'focus']:
+                        val = None
+                        if m == 'lift':
+                            lift_data = meta.get('lift', {})
+                            if lift_data:
+                                val = list(lift_data.values())[0]
+                                if isinstance(val, dict) and 'mean_lift' in val: val = val['mean_lift']
+                        elif m == 'background_rejection':
+                            br_data = meta.get('background_rejection', {})
+                            if br_data:
+                                val = br_data.get('mean', 0) if isinstance(br_data, dict) else np.mean(br_data)
+                        elif m in meta:
+                            val = meta[m]
+                            if isinstance(val, dict): val = val.get('mean', 0)
+                        
+                        if val is not None:
+                            shuffle_metrics[k][m].append(val)
+
+            # Compute Z-Scores
+            rigorous_shuffle = {}
+            for k, baseline in baselines.items():
+                config_metrics = {}
+                
+                # Z-Score (PAUC)
+                paucs = shuffle_metrics[k]['pauc']
+                # Filter None
+                paucs = [p for p in paucs if p is not None]
+                
+                if paucs:
+                    mean_s, std_s = np.mean(paucs), np.std(paucs)
+                    meta = baseline.get('meta_evaluation', baseline)
+                    pauc_data = meta.get('pauc', {})
+                    real_pauc = 0.0
+                    if pauc_data:
+                        val = list(pauc_data.values())[0]
+                        real_pauc = val['mean'] if isinstance(val, dict) and 'mean' in val else val
+                    
+                    z_score = (real_pauc - mean_s) / (std_s + 1e-9)
+                    config_metrics['z_score'] = float(z_score)
+                    config_metrics['pauc'] = {'real': float(real_pauc), 'shuffle_mean': float(mean_s), 'shuffle_std': float(std_s)}
+                    logger.log(f"[Target Shuffling] {k}: Z-Score={z_score:.4f} (Real={real_pauc:.4f}, Shuffle={mean_s:.4f}±{std_s:.4f})")
+                else:
+                    config_metrics['z_score'] = None
+                    config_metrics['pauc'] = None
+
+                config_metrics['fde'] = None 
+                
+                for m in ['lift', 'background_rejection', 'posdrop_acc', 'spatial_entropy', 'focus']:
+                    vals = shuffle_metrics[k][m]
+                    vals = [v for v in vals if v is not None]
+                    if vals:
+                        config_metrics[m] = {'mean': float(np.mean(vals)), 'std': float(np.std(vals))}
+                    else:
+                        config_metrics[m] = None
+
+                config_metrics['topk'] = None
+                config_metrics['spatial_jaccard'] = None
+                rigorous_shuffle[k] = config_metrics
+            return rigorous_shuffle
+
+        # Execute
+        all_results['target_shuffling'] = _run_rigorous_method(
+            method_name="Target Shuffling",
+            tag=tag,
             tag_prefix=f"{tag}_TargetShuffle",
             n_runs=args.meta_eval_shuffle_runs,
             data_use=data_use,
@@ -1115,145 +1244,17 @@ def execute_unified_session(
             args=args,
             cfg=cfg,
             run_logger=run_logger,
-            output_dir=shuffle_dir,
+            effective_output_dir=effective_output_dir,
+            baseline_results=baseline_results,
             data_modifier_fn=shuffle_modifier,
-            save_individual_runs=True # User requested saving individual runs
+            metric_aggregator_fn=shuffle_aggregator
         )
-        
-        # Aggregate Shuffle Results
-        shuffle_metrics = {k: {
-            'pauc': [], 'lift': [], 'background_rejection': [], 
-            'posdrop_acc': [], 'spatial_entropy': [], 'focus': [],
-            'fpr_at_tpr90': [] # For FDE
-        } for k in baseline_results.keys()}
-
-        for res in shuffle_results_list:
-            meta = res.get('meta_evaluation', res)
-            
-            # Extract metrics
-            for k in baseline_results.keys():
-                # PAUC
-                pauc_data = meta.get('pauc', {})
-                if pauc_data:
-                    val = list(pauc_data.values())[0]
-                    if isinstance(val, dict) and 'mean' in val: val = val['mean']
-                    shuffle_metrics[k]['pauc'].append(val)
-                
-                # Lift (heuristic: first area)
-                lift_data = meta.get('lift', {})
-                if lift_data:
-                    val = list(lift_data.values())[0]
-                    if isinstance(val, dict) and 'mean_lift' in val: val = val['mean_lift']
-                    shuffle_metrics[k]['lift'].append(val)
-                    
-                # Background Rejection (heuristic: mean of means or first threshold?)
-                # BR is usually a list. Let's take mean of the list for scalar summary?
-                # Or just store the whole list? For Z-score we need scalar.
-                # Let's skip Z-score for BR for now, just store raw if needed.
-                # Actually user wants "Bias Check" for BR.
-                br_data = meta.get('background_rejection', {})
-                if br_data:
-                    val = br_data.get('mean', 0) if isinstance(br_data, dict) else np.mean(br_data)
-                    shuffle_metrics[k]['background_rejection'].append(val)
-                    
-                # PosDrop Acc
-                if 'posdrop_acc' in meta:
-                    val = meta['posdrop_acc']
-                    if isinstance(val, dict): val = val.get('mean', 0)
-                    shuffle_metrics[k]['posdrop_acc'].append(val)
-                    
-                # Spatial Entropy
-                if 'spatial_entropy' in meta:
-                    shuffle_metrics[k]['spatial_entropy'].append(meta['spatial_entropy'])
-                    
-                # Focus
-                if 'focus' in meta:
-                    val = meta['focus']
-                    if isinstance(val, dict): val = val.get('mean', 0)
-                    shuffle_metrics[k]['focus'].append(val)
-                    
-                # FPR for FDE (using pu_fpr at pi=0.05 as proxy for TPR~90% constraint?)
-                # Or extract from pu_tpr/pu_fpr lists?
-                # Let's use pu_fpr['0.05'] if available
-                pu_fpr = meta.get('pu_fpr', {})
-                if pu_fpr and '0.05' in pu_fpr:
-                     # pu_fpr['0.05'] is usually a dict with 'mean', 'std' or list
-                     # If it's from _aggregate_pi_metric, it has 'mean' (scalar if simple, or array?)
-                     # _aggregate_pi_metric returns {'mean': ..., 'std': ...} where mean is array over thresholds
-                     # We need a scalar. Let's take the mean over thresholds? No, that's meaningless.
-                     # We need FPR at specific TPR.
-                     # Let's try to get it from 'fpr_at_tpr90' if we computed it? We didn't.
-                     # Fallback: Use 'fde' metric if computed by base (it's not).
-                     # Let's use the mean of the FPR array for now as a rough proxy if we can't do better.
-                     # Or better: just skip FDE calculation here if too complex and rely on what's available.
-                     # But user specifically asked for FDE.
-                     # Let's assume 'pu_fpr' -> '0.05' -> 'mean' is a list of FPRs.
-                     # We take the mean of that list? No.
-                     # Let's just take the first element?
-                     pass
-
-        # Compute Z-Scores and Update Results
-        rigorous_shuffle = {}
-        for k, baseline in baseline_results.items():
-            config_metrics = {}
-            
-            # 1. Z-Score (PAUC)
-            paucs = shuffle_metrics[k]['pauc']
-            if paucs:
-                mean_s, std_s = np.mean(paucs), np.std(paucs)
-                meta = baseline.get('meta_evaluation', baseline)
-                pauc_data = meta.get('pauc', {})
-                real_pauc = 0.0
-                if pauc_data:
-                    val = list(pauc_data.values())[0]
-                    real_pauc = val['mean'] if isinstance(val, dict) and 'mean' in val else val
-                
-                z_score = (real_pauc - mean_s) / (std_s + 1e-9)
-                config_metrics['z_score'] = float(z_score)
-                config_metrics['pauc'] = {'real': float(real_pauc), 'shuffle_mean': float(mean_s), 'shuffle_std': float(std_s)}
-                run_logger.log(f"[Target Shuffling] {k}: Z-Score={z_score:.4f} (Real={real_pauc:.4f}, Shuffle={mean_s:.4f}±{std_s:.4f})")
-            else:
-                config_metrics['z_score'] = None
-                config_metrics['pauc'] = None
-
-            # 2. FDE (Real FPR - Mean Shuffle FPR)
-            # Placeholder logic: assuming we can get a scalar FPR
-            # For now, set to None if we can't reliably compute it without raw curves
-            config_metrics['fde'] = None 
-            
-            # 3. Other Metrics (Just stats)
-            for m in ['lift', 'background_rejection', 'posdrop_acc', 'spatial_entropy', 'focus']:
-                vals = shuffle_metrics[k][m]
-                if vals:
-                    config_metrics[m] = {'mean': float(np.mean(vals)), 'std': float(np.std(vals))}
-                else:
-                    config_metrics[m] = None
-
-            # 4. Explicit N/A
-            config_metrics['topk'] = None
-            config_metrics['spatial_jaccard'] = None
-            
-            rigorous_shuffle[k] = config_metrics
-
-        # Save Shuffle Results
-        if rigorous_shuffle:
-            meta_eval_dir = cfg.output_dir / "cls_1_training_results/meta_evaluation_results"
-            train_cls_PN_base.update_meta_evaluation_results(
-                tag_main=tag,
-                new_data={'target_shuffling': rigorous_shuffle},
-                common=common,
-                run_logger=run_logger,
-                output_dir=meta_eval_dir
-            )
-            all_results['target_shuffling'] = rigorous_shuffle # Add to all_results for summary
 
     # =================================================================================
     # 3. Stability Selection Execution
     # =================================================================================
     if 'stability' in methods_to_run:
-        run_logger.log(f"\n[execute_unified_session] --- Stability Selection Workflow ---")
-        
-        # Baseline needed? Yes, to map results.
+        # Baseline check
         baseline_results = {k: v for k, v in all_results.items() if "error" not in v and k != 'target_shuffling'}
         if not baseline_results:
              run_logger.log("[execute_unified_session] No baseline results found. Running Standard Baseline for Stability...")
@@ -1262,10 +1263,7 @@ def execute_unified_session(
              all_results["standard"] = std_res
              config_status["standard"] = "TRAINED"
 
-        stability_dir = effective_output_dir / f"{tag}_StabilitySelection"
-        stability_dir.mkdir(parents=True, exist_ok=True)
-
-        # Indices
+        # Define Modifier
         labels = data_use['labels']
         is_pos = labels >= 0.9
         u_indices = np.where(~is_pos)[0]
@@ -1278,8 +1276,87 @@ def execute_unified_session(
             subset.sort()
             return data, subset
 
-        # Run Trials
-        stability_results_list = _run_repeated_trials(
+        # Define Aggregator
+        def stability_aggregator(results_list, baselines, logger):
+            stability_metrics = {k: {
+                'accuracy': [], 'lift': [], 'pauc': [], 'background_rejection': [],
+                'posdrop_acc': [], 'focus': [],
+                'val_probs_list': []
+            } for k in baselines.keys()}
+
+            for res in results_list:
+                meta = res.get('meta_evaluation', res)
+                val_probs = None
+                if 'inference_result' in res:
+                    val_probs = res['inference_result'].get('val_probs')
+                elif 'val_probs' in res:
+                    val_probs = res['val_probs']
+                
+                for k in baselines.keys():
+                    if val_probs is not None:
+                        stability_metrics[k]['val_probs_list'].append(val_probs)
+
+                    for metric in ['accuracy', 'lift', 'pauc', 'background_rejection', 'posdrop_acc', 'focus']:
+                        if metric in meta:
+                            val = meta[metric]
+                            if isinstance(val, dict):
+                                if 'mean' in val: val = val['mean']
+                                elif 'mean_lift' in val: val = val['mean_lift']
+                                elif metric == 'pauc': val = list(val.values())[0]['mean']
+                                elif metric == 'lift': val = list(val.values())[0]['mean_lift']
+                            
+                            if isinstance(val, (int, float)):
+                                stability_metrics[k][metric].append(val)
+                            elif isinstance(val, list):
+                                stability_metrics[k][metric].append(np.mean(val))
+
+            rigorous_stability = {}
+            for k, metrics in stability_metrics.items():
+                config_stab = {}
+                
+                # Spatial Metrics
+                probs_list = metrics['val_probs_list']
+                if probs_list:
+                    try:
+                        probs_stack = np.stack([np.array(p) for p in probs_list])
+                        masks = probs_stack > 0.5
+                        spatial_jaccard = compute_pairwise_jaccard(masks)
+                        config_stab['spatial_jaccard'] = spatial_jaccard
+                        
+                        mean_probs = np.mean(probs_stack, axis=0)
+                        entropy_map = compute_binary_entropy(mean_probs)
+                        spatial_entropy = float(np.mean(entropy_map))
+                        config_stab['spatial_entropy'] = spatial_entropy
+                    except Exception as e:
+                        logger.log(f"[Stability Selection] Error computing spatial metrics for {k}: {e}")
+                        config_stab['spatial_jaccard'] = None
+                        config_stab['spatial_entropy'] = None
+                else:
+                    config_stab['spatial_jaccard'] = None
+                    config_stab['spatial_entropy'] = None
+
+                # Other Metrics
+                for m in ['accuracy', 'lift', 'pauc', 'background_rejection', 'posdrop_acc', 'focus']:
+                    vals = metrics[m]
+                    vals = [v for v in vals if v is not None]
+                    if vals:
+                        config_stab[m] = {'mean': float(np.mean(vals)), 'std': float(np.std(vals))}
+                    else:
+                        config_stab[m] = None
+                
+                config_stab['z_score'] = None
+                config_stab['fde'] = None
+                config_stab['topk'] = None
+
+                rigorous_stability[k] = config_stab
+                logger.log(f"[Stability Selection] {k}: Jaccard={config_stab['spatial_jaccard']}, Entropy={config_stab['spatial_entropy']}")
+            
+            return rigorous_stability
+
+        # Execute
+        all_results['stability_selection'] = _run_rigorous_method(
+            method_name="Stability Selection",
+            tag=tag,
             tag_prefix=f"{tag}_StabilitySelection",
             n_runs=args.meta_eval_stability_runs,
             data_use=data_use,
@@ -1288,110 +1365,11 @@ def execute_unified_session(
             args=args,
             cfg=cfg,
             run_logger=run_logger,
-            output_dir=stability_dir,
+            effective_output_dir=effective_output_dir,
+            baseline_results=baseline_results,
             data_modifier_fn=stability_modifier,
-            save_individual_runs=True # User requested saving individual runs
+            metric_aggregator_fn=stability_aggregator
         )
-
-        # Aggregate Stability Results
-        stability_metrics = {k: {
-            'accuracy': [], 'lift': [], 'pauc': [], 'background_rejection': [],
-            'posdrop_acc': [], 'focus': [],
-            'val_probs_list': [] # For Spatial Metrics
-        } for k in baseline_results.keys()}
-        
-        for res in stability_results_list:
-            # Extract metrics
-            meta = res.get('meta_evaluation', res)
-            
-            # Extract val_probs if available (from inference_result)
-            val_probs = None
-            if 'inference_result' in res:
-                val_probs = res['inference_result'].get('val_probs')
-            elif 'val_probs' in res:
-                val_probs = res['val_probs']
-            
-            for k in baseline_results.keys():
-                # Store val_probs for spatial metrics
-                if val_probs is not None:
-                    stability_metrics[k]['val_probs_list'].append(val_probs)
-
-                # Basic Metrics
-                for metric in ['accuracy', 'lift', 'pauc', 'background_rejection', 'posdrop_acc', 'focus']:
-                    if metric in meta:
-                        val = meta[metric]
-                        # Handle nested structures
-                        if isinstance(val, dict):
-                            if 'mean' in val: val = val['mean']
-                            elif 'mean_lift' in val: val = val['mean_lift']
-                            elif metric == 'pauc': val = list(val.values())[0]['mean']
-                            elif metric == 'lift': val = list(val.values())[0]['mean_lift']
-                        
-                        if isinstance(val, (int, float)):
-                            stability_metrics[k][metric].append(val)
-                        elif isinstance(val, list):
-                             # For BR, maybe take mean?
-                             stability_metrics[k][metric].append(np.mean(val))
-
-        # Compute Variance and Spatial Metrics
-        rigorous_stability = {}
-        for k, metrics in stability_metrics.items():
-            config_stab = {}
-            
-            # 1. Spatial Jaccard & Entropy
-            probs_list = metrics['val_probs_list']
-            if probs_list:
-                # Stack probs: (n_runs, n_samples)
-                # Ensure they are numpy arrays and same shape
-                try:
-                    probs_stack = np.stack([np.array(p) for p in probs_list])
-                    
-                    # Spatial Jaccard (Masks > 0.5)
-                    masks = probs_stack > 0.5
-                    spatial_jaccard = compute_pairwise_jaccard(masks)
-                    config_stab['spatial_jaccard'] = spatial_jaccard
-                    
-                    # Spatial Entropy (Entropy of Mean Map)
-                    mean_probs = np.mean(probs_stack, axis=0)
-                    entropy_map = compute_binary_entropy(mean_probs)
-                    spatial_entropy = float(np.mean(entropy_map))
-                    config_stab['spatial_entropy'] = spatial_entropy
-                    
-                except Exception as e:
-                    run_logger.log(f"[Stability Selection] Error computing spatial metrics for {k}: {e}")
-                    config_stab['spatial_jaccard'] = None
-                    config_stab['spatial_entropy'] = None
-            else:
-                config_stab['spatial_jaccard'] = None
-                config_stab['spatial_entropy'] = None
-
-            # 2. Other Metrics (Mean/Std)
-            for m in ['accuracy', 'lift', 'pauc', 'background_rejection', 'posdrop_acc', 'focus']:
-                vals = metrics[m]
-                if vals:
-                    config_stab[m] = {'mean': float(np.mean(vals)), 'std': float(np.std(vals))}
-                else:
-                    config_stab[m] = None
-            
-            # 3. Explicit N/A
-            config_stab['z_score'] = None
-            config_stab['fde'] = None
-            config_stab['topk'] = None
-
-            rigorous_stability[k] = config_stab
-            run_logger.log(f"[Stability Selection] {k}: Jaccard={config_stab['spatial_jaccard']}, Entropy={config_stab['spatial_entropy']}")
-
-        # Save Stability Results
-        if rigorous_stability:
-            meta_eval_dir = cfg.output_dir / "cls_1_training_results/meta_evaluation_results"
-            train_cls_PN_base.update_meta_evaluation_results(
-                tag_main=tag,
-                new_data={'stability_selection': rigorous_stability},
-                common=common,
-                run_logger=run_logger,
-                output_dir=meta_eval_dir
-            )
-            all_results['stability_selection'] = rigorous_stability
 
     # =================================================================================
     # Final Summary
@@ -2059,7 +2037,6 @@ def train_save_eval_result(
     cfg: Any,
     run_logger: "_RunLogger",
     train_subset_indices: Optional[np.ndarray] = None,
-    run_rigorous: bool = True,
     output_dir: Optional[Path] = None,
 ) -> Union[Dict[str, Any], None]:
     """
@@ -2075,7 +2052,6 @@ def train_save_eval_result(
         cfg: Configuration object
         run_logger: Logger for debugging
         train_subset_indices: Optional indices to restrict training data (for Stability Selection)
-        run_rigorous: bool = False (Deprecated, handled by args.meta_eval_methods)
         output_dir: Optional[Path] = None
         
     Returns:

@@ -108,7 +108,16 @@ def summarise_meta_eval_interactive(
         with path.open("r", encoding="utf-8") as handle:
             data = json.load(handle)
         method, cluster = infer_method_cluster(path, clustering_methods, cluster_counts)
+        
+        # Extract rigorous evaluation data before filtering
+        rigorous_data = data.get('rigorous_evaluation')
+        
         cleaned = filter_metrics(data, metrics_to_keep)
+        
+        # Re-attach rigorous data if present
+        if rigorous_data:
+            cleaned['rigorous_evaluation'] = rigorous_data
+            
         tag_main = derive_tag_main(path, method, cluster, override=tag_override, allowed_tags=allowed_set)
         summary.setdefault(tag_main, {}).setdefault(method, {})[str(cluster)] = cleaned
     return summary
@@ -556,6 +565,7 @@ plot_pu_npv(
 
 
 
+# %% [code] Cell 17
 def print_rigorous_metrics(summary_data):
     """Helper to print rigorous evaluation metrics from the summary."""
     for tag, methods in summary_data.items():
@@ -569,19 +579,156 @@ def print_rigorous_metrics(summary_data):
                     if 'target_shuffling' in rig:
                         ts = rig['target_shuffling']
                         print(f"    Target Shuffling:")
-                        print(f"      Z-Score: {ts.get('z_score')}")
-                        print(f"      FDE: {ts.get('fde')}")
-                        print(f"      Real BR: {ts.get('real_br')}")
+                        # Handle nested structure where keys might be method names
+                        for k, v in ts.items():
+                            if isinstance(v, dict):
+                                print(f"      [{k}] Z-Score: {v.get('z_score')}")
                         
                     if 'stability_selection' in rig:
                         ss = rig['stability_selection']
                         print(f"    Stability Selection:")
-                        print(f"      Spatial Entropy: {ss.get('spatial_entropy')}")
-                        print(f"      Spatial Jaccard: {ss.get('spatial_jaccard')}")
-                        if 'scalar_stability' in ss:
-                            print("      Scalar Stability (Mean ± Std):")
-                            for k, v in ss['scalar_stability'].items():
-                                print(f"        {k}: {v['mean']:.4f} ± {v['std']:.4f}")
+                        for k, v in ss.items():
+                             if isinstance(v, dict):
+                                print(f"      [{k}] Spatial Entropy: {v.get('spatial_entropy')}")
+                                print(f"      [{k}] Spatial Jaccard: {v.get('spatial_jaccard')}")
 
-# Example Usage:
-# print_rigorous_metrics(summary)
+# %% [code] Cell 18
+import matplotlib.pyplot as plt
+import numpy as np
+
+def plot_shuffle_zscore(summary_dict, include_tags=None):
+    """
+    Plot Z-Scores from Target Shuffling.
+    """
+    include_tags = set(include_tags) if include_tags else None
+    
+    data_points = []
+    
+    for tag_main, methods_dict in summary_dict.items():
+        if include_tags and tag_main not in include_tags:
+            continue
+            
+        # We usually just need one representative entry per tag if they are all the same run
+        # But structure is hierarchical. Let's iterate.
+        for method, clusters_dict in methods_dict.items():
+            for cluster, metrics in clusters_dict.items():
+                rig = metrics.get('rigorous_evaluation', {})
+                shuffle = rig.get('target_shuffling', {})
+                
+                # shuffle keys are the baseline methods (e.g. 'standard', 'posdrop_...')
+                for baseline_key, res in shuffle.items():
+                    if res and 'z_score' in res and res['z_score'] is not None:
+                        label = f"{tag_main} [{baseline_key}]"
+                        data_points.append((label, res['z_score']))
+                        
+    if not data_points:
+        print("No Z-Score data found.")
+        return
+
+    # Sort by Z-Score
+    data_points.sort(key=lambda x: x[1], reverse=True)
+    
+    labels = [x[0] for x in data_points]
+    values = [x[1] for x in data_points]
+    
+    plt.figure(figsize=(10, 6))
+    bars = plt.barh(labels, values, color='skyblue')
+    plt.axvline(x=1.96, color='r', linestyle='--', label='p=0.05 (Z=1.96)')
+    plt.xlabel('Z-Score (Higher is better)')
+    plt.title('Target Shuffling Z-Scores')
+    plt.legend()
+    plt.grid(axis='x', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.show()
+
+# Example
+# plot_shuffle_zscore(summary)
+
+# %% [code] Cell 19
+def plot_stability_jaccard(summary_dict, include_tags=None):
+    """
+    Plot Spatial Jaccard Index from Stability Selection.
+    """
+    include_tags = set(include_tags) if include_tags else None
+    
+    data_points = []
+    
+    for tag_main, methods_dict in summary_dict.items():
+        if include_tags and tag_main not in include_tags:
+            continue
+            
+        for method, clusters_dict in methods_dict.items():
+            for cluster, metrics in clusters_dict.items():
+                rig = metrics.get('rigorous_evaluation', {})
+                stability = rig.get('stability_selection', {})
+                
+                for baseline_key, res in stability.items():
+                    if res and 'spatial_jaccard' in res and res['spatial_jaccard'] is not None:
+                        label = f"{tag_main} [{baseline_key}]"
+                        data_points.append((label, res['spatial_jaccard']))
+                        
+    if not data_points:
+        print("No Spatial Jaccard data found.")
+        return
+
+    data_points.sort(key=lambda x: x[1], reverse=True)
+    
+    labels = [x[0] for x in data_points]
+    values = [x[1] for x in data_points]
+    
+    plt.figure(figsize=(10, 6))
+    plt.barh(labels, values, color='lightgreen')
+    plt.xlabel('Spatial Jaccard Index (Higher is more stable)')
+    plt.title('Stability Selection: Spatial Jaccard')
+    plt.xlim(0, 1.0)
+    plt.grid(axis='x', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.show()
+
+# Example
+# plot_stability_jaccard(summary)
+
+# %% [code] Cell 20
+def plot_stability_entropy(summary_dict, include_tags=None):
+    """
+    Plot Spatial Entropy from Stability Selection.
+    """
+    include_tags = set(include_tags) if include_tags else None
+    
+    data_points = []
+    
+    for tag_main, methods_dict in summary_dict.items():
+        if include_tags and tag_main not in include_tags:
+            continue
+            
+        for method, clusters_dict in methods_dict.items():
+            for cluster, metrics in clusters_dict.items():
+                rig = metrics.get('rigorous_evaluation', {})
+                stability = rig.get('stability_selection', {})
+                
+                for baseline_key, res in stability.items():
+                    if res and 'spatial_entropy' in res and res['spatial_entropy'] is not None:
+                        label = f"{tag_main} [{baseline_key}]"
+                        data_points.append((label, res['spatial_entropy']))
+                        
+    if not data_points:
+        print("No Spatial Entropy data found.")
+        return
+
+    data_points.sort(key=lambda x: x[1]) # Lower entropy might be better (more certain)? Or higher (more informative)? 
+    # Usually lower entropy = more confident predictions.
+    
+    labels = [x[0] for x in data_points]
+    values = [x[1] for x in data_points]
+    
+    plt.figure(figsize=(10, 6))
+    plt.barh(labels, values, color='salmon')
+    plt.xlabel('Spatial Entropy (Lower is more confident)')
+    plt.title('Stability Selection: Spatial Entropy')
+    plt.grid(axis='x', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.show()
+
+# Example
+# plot_stability_entropy(summary)
+
