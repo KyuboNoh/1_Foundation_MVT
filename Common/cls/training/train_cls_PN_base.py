@@ -146,10 +146,14 @@ def compute_meta_evaluation_metric(
             all_pos_idx=all_pos_idx,
             pos_indices_this_iter=pos_indices_this_iter
         )
-    elif metric_name == "Focus":
+    elif metric_name == "Focus" or metric_name == "focus":
         return compute_focus(predictions_mean=predictions_mean)
+    elif metric_name == "spatial_entropy":
+        # Compute mean binary entropy
+        entropy_map = compute_binary_entropy(predictions_mean)
+        return float(np.mean(entropy_map))
     else:
-        raise ValueError(f"Unknown meta-evaluation metric: {metric_name}. Available: ['PosDrop_Acc', 'Focus']")
+        raise ValueError(f"Unknown meta-evaluation metric: {metric_name}. Available: ['accuracy', 'Focus', 'spatial_entropy']")
 
 
 # ============================================================================
@@ -1789,10 +1793,23 @@ def save_meta_evaluation_results(
     
     output_path = output_dir / f"{tag_main}_meta_eval.json"
     
+    # Define standard metrics to ensure consistent output format
+    STANDARD_METRICS = [
+        "accuracy", "focus", "topk", "lift", "pauc", 
+        "background_rejection", "pu_tpr", "spatial_entropy", 
+        "spatial_jaccard", "z_score", "fde"
+    ]
+
     # Convert numpy types to native Python types for JSON serialization
     serializable_meta = {}
-    for metric_name, metric_data in meta_evaluation.items():
-        if isinstance(metric_data, dict):
+    
+    # 1. First, populate standard metrics (ensure all 11 are present)
+    for metric_name in STANDARD_METRICS:
+        metric_data = meta_evaluation.get(metric_name)
+        
+        if metric_data is None:
+            serializable_meta[metric_name] = None
+        elif isinstance(metric_data, dict):
             # Handle simple metric structure (PosDrop_Acc, Focus)
             if 'scores' in metric_data and 'mean' in metric_data and 'std' in metric_data:
                 serializable_meta[metric_name] = {
@@ -1809,7 +1826,21 @@ def save_meta_evaluation_results(
                 serializable_meta[metric_name] = _convert_to_serializable(metric_data)
         else:
             # Handle scalar values
-            serializable_meta[metric_name] = float(metric_data) if metric_data is not None else None
+            serializable_meta[metric_name] = float(metric_data)
+            
+    # 2. Add any other metrics present in meta_evaluation but not in standard list (optional, for flexibility)
+    for metric_name, metric_data in meta_evaluation.items():
+        if metric_name not in STANDARD_METRICS:
+             # Use same serialization logic or simple fallback
+             if isinstance(metric_data, dict):
+                 serializable_meta[metric_name] = _convert_to_serializable(metric_data)
+             elif metric_data is None:
+                 serializable_meta[metric_name] = None
+             else:
+                 try:
+                     serializable_meta[metric_name] = float(metric_data)
+                 except (ValueError, TypeError):
+                     serializable_meta[metric_name] = str(metric_data)
     
     with open(output_path, 'w') as f:
         json.dump(serializable_meta, f, indent=2)

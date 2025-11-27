@@ -177,15 +177,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--meta-eval-metrics", type=str, nargs="+", default=["accuracy", "focus", "topk", "lift", "pauc", "background_rejection", "pu_tpr", "spatial_entropy", "spatial_jaccard", "z_score", "fde"], help="Meta-evaluation metrics to compute (space-separated). Available: accuracy, focus, topk, lift, pauc, background_rejection, pu_tpr, spatial_entropy, spatial_jaccard, z_score, fde")
 
     # ✅ RIGOROUS EVALUATION PARAMETERS 1 - Positive dropout via clustering
-    # parser.add_argument("--meta-eval-posdrop-clusters", type=int, nargs="+", default=[2, 3, 4, 5, 6, 7, 8, 10], help="Number of clusters/iterations for meta-evaluation (space-separated). Line search over these values.")
-    parser.add_argument("--meta-eval-posdrop-clusters", type=int, nargs="+", default=[2], help="Number of clusters/iterations for meta-evaluation (space-separated). Line search over these values.")
+    parser.add_argument("--meta-eval-posdrop-clusters", type=int, nargs="+", default=[2, 3, 4, 5, 6, 7, 8, 10], help="Number of clusters/iterations for meta-evaluation (space-separated). Line search over these values.")
+    # parser.add_argument("--meta-eval-posdrop-clusters", type=int, nargs="+", default=[2], help="Number of clusters/iterations for meta-evaluation (space-separated). Line search over these values.")
     parser.add_argument("--meta-eval-posdrop-strategy", type=str, nargs="+", default=["latent_dist", "actual_dist"], choices=["latent_dist", "actual_dist"], help="Positive dropout strategy (space-separated). Available: latent_dist, actual_dist")
 
     # ✅ RIGOROUS EVALUATION PARAMETERS 2
-    parser.add_argument("--meta-eval-shuffle-runs", type=int, default=2, help="Number of permutation tests (Target Shuffling) to run. Default: 0 (disabled)")
+    parser.add_argument("--meta-eval-shuffle-runs", type=int, default=10, help="Number of permutation tests (Target Shuffling) to run. Default: 0 (disabled)")
 
     # ✅ RIGOROUS EVALUATION PARAMETERS 3
-    parser.add_argument("--meta-eval-stability-runs", type=int, default=2, help="Number of subsampling tests (Stability Selection) to run. Default: 0 (disabled)")
+    parser.add_argument("--meta-eval-stability-runs", type=int, default=10, help="Number of subsampling tests (Stability Selection) to run. Default: 0 (disabled)")
     parser.add_argument("--meta-eval-stability-rate", type=float, default=0.5, help="Fraction of Unlabelled data to use for Stability Selection. Default: 0.5")
 
     # ✅ TOPK PARAMETERS
@@ -522,15 +522,33 @@ def execute_standard_session(
         meta_eval_config = getattr(args, "_meta_eval_config", train_cls_PN_base.MetaEvaluationConfig())
         metrics_to_compute = set(args.meta_eval_metrics)
         
-        # 1. Compute Basic Metrics (Focus)
+        # 1. Compute Basic Metrics (Focus, Spatial Entropy, Accuracy)
         if "Focus" in metrics_to_compute or "focus" in metrics_to_compute:
-             # Note: compute_focus is available in train_cls_PN_base but not exported in __all__ maybe?
-             # It is available as train_cls_PN_base.compute_focus
              try:
                  val = train_cls_PN_base.compute_focus(predictions_mean=predictions_mean)
                  meta_evaluation['focus'] = {'mean': val, 'std': 0.0}
              except Exception as e:
                  run_logger.log(f"[execute_standard_session] Error computing Focus: {e}")
+
+        if "spatial_entropy" in metrics_to_compute:
+             try:
+                 # Ensure compute_binary_entropy is available (imported in execute_unified_session, but we are in execute_standard_session)
+                 # It's in train_cls_PN_base
+                 entropy_map = train_cls_PN_base.compute_binary_entropy(predictions_mean)
+                 val = float(np.mean(entropy_map))
+                 meta_evaluation['spatial_entropy'] = {'mean': val, 'std': 0.0}
+             except Exception as e:
+                 run_logger.log(f"[execute_standard_session] Error computing Spatial Entropy: {e}")
+        
+        # Add Accuracy (PosDrop Accuracy equivalent)
+        # Standard training computes accuracy on validation set (which is Real Val for Shuffle)
+        # It's in result['accuracy'] usually, or result['metrics']['accuracy']?
+        # train_cls_1_PN returns result dict. Let's check what keys it has.
+        # Usually 'accuracy' is top level if computed.
+        if 'accuracy' in result:
+             meta_evaluation['accuracy'] = result['accuracy'] # Scalar or dict? Usually scalar from train_cls_1_PN
+             meta_evaluation['posdrop_acc'] = result['accuracy'] # Alias for consistency
+
 
         # 2. Compute Extended Metrics (PAUC, Lift, TopK, etc.)
         # compute_extended_meta_evaluation expects lists of arrays (one per config)
@@ -1160,11 +1178,55 @@ def execute_unified_session(
         def shuffle_aggregator(results_list, baselines, logger):
             shuffle_metrics = {k: {
                 'pauc': [], 'lift': [], 'background_rejection': [], 
-                'posdrop_acc': [], 'spatial_entropy': [], 'focus': []
+                'posdrop_acc': [], 'spatial_entropy': [], 'focus': [], 'accuracy': [], 'fde': []
             } for k in baselines.keys()}
 
             for res in results_list:
                 meta = res.get('meta_evaluation', res)
+                
+                # Extract Val Probs for FDE if needed
+                val_probs = None
+                if 'inference_result' in res:
+                    val_probs = res['inference_result'].get('val_probs')
+                elif 'val_probs' in res:
+                    val_probs = res['val_probs']
+                
+                # Calculate FDE if possible (FPR at TPR=90%)
+                fde_val = meta.get('fde')
+                if fde_val is None and val_probs is not None:
+                    try:
+                        # Assumes labels are available in data_use or common
+                        # We need labels to compute FPR/TPR. 
+                        # In shuffle runs, we evaluate on REAL validation set, so labels are fixed.
+                        # We can access labels from common['val_loader'].dataset or similar, but simpler:
+                        # We assume val_probs aligns with data_use['labels'] (which is the validation set labels)
+                        y_true = data_use['labels']
+                        if len(y_true) == len(val_probs):
+                            # Compute FPR at TPR >= 0.9
+                            # Sort by probs descending
+                            desc_score_indices = np.argsort(val_probs)[::-1]
+                            y_score_desc = val_probs[desc_score_indices]
+                            y_true_desc = y_true[desc_score_indices]
+                            
+                            n_pos = np.sum(y_true == 1)
+                            n_neg = np.sum(y_true == 0)
+                            
+                            # Cumulative sums
+                            tps = np.cumsum(y_true_desc)
+                            fps = np.cumsum(1 - y_true_desc)
+                            
+                            tpr = tps / n_pos
+                            fpr = fps / n_neg
+                            
+                            # Find index where TPR >= 0.9
+                            idx = np.searchsorted(tpr, 0.9)
+                            if idx < len(fpr):
+                                fde_val = fpr[idx]
+                            else:
+                                fde_val = 1.0 # Should not happen if 0.9 is reachable
+                    except Exception as e:
+                        pass # FDE calculation failed
+
                 for k in baselines.keys():
                     # PAUC
                     pauc_data = meta.get('pauc', {})
@@ -1173,8 +1235,12 @@ def execute_unified_session(
                         if isinstance(val, dict) and 'mean' in val: val = val['mean']
                         shuffle_metrics[k]['pauc'].append(val)
                     
+                    # FDE
+                    if fde_val is not None:
+                        shuffle_metrics[k]['fde'].append(fde_val)
+
                     # Other Metrics
-                    for m in ['lift', 'background_rejection', 'posdrop_acc', 'spatial_entropy', 'focus']:
+                    for m in ['lift', 'background_rejection', 'posdrop_acc', 'spatial_entropy', 'focus', 'accuracy']:
                         val = None
                         if m == 'lift':
                             lift_data = meta.get('lift', {})
@@ -1188,49 +1254,142 @@ def execute_unified_session(
                         elif m in meta:
                             val = meta[m]
                             if isinstance(val, dict): val = val.get('mean', 0)
+                        elif m == 'accuracy' and 'accuracy' in res:
+                             # Fallback to finding accuracy in res root if not in meta
+                             val = res['accuracy']
+                        elif m == 'posdrop_acc' and 'accuracy' in res:
+                             # Fallback for posdrop_acc alias
+                             val = res['accuracy']
                         
                         if val is not None:
                             shuffle_metrics[k][m].append(val)
 
-            # Compute Z-Scores
+            # Compute Z-Scores and Aggregate
             rigorous_shuffle = {}
             for k, baseline in baselines.items():
                 config_metrics = {}
+                base_meta = baseline.get('meta_evaluation', baseline)
                 
+                # Helper to get Real value
+                def get_real_value(metric_name):
+                    if metric_name == 'pauc':
+                        d = base_meta.get('pauc', {})
+                        if d:
+                            v = list(d.values())[0]
+                            return v['mean'] if isinstance(v, dict) and 'mean' in v else v
+                    elif metric_name == 'lift':
+                        d = base_meta.get('lift', {})
+                        if d:
+                            v = list(d.values())[0]
+                            return v['mean_lift'] if isinstance(v, dict) and 'mean_lift' in v else v
+                    elif metric_name == 'background_rejection':
+                        d = base_meta.get('background_rejection', {})
+                        if d:
+                            return d.get('mean', 0) if isinstance(d, dict) else np.mean(d)
+                    elif metric_name == 'fde':
+                        # Calculate Real FDE if not present
+                        if 'fde' in base_meta and base_meta['fde'] is not None:
+                            return base_meta['fde']
+                        # Try to compute from baseline inference result
+                        val_probs = None
+                        if 'inference_result' in baseline:
+                            val_probs = baseline['inference_result'].get('val_probs')
+                        elif 'val_probs' in baseline:
+                            val_probs = baseline['val_probs']
+                        if val_probs is not None:
+                             # Compute FDE (same logic as above)
+                             try:
+                                 y_true = data_use['labels']
+                                 desc_score_indices = np.argsort(val_probs)[::-1]
+                                 y_score_desc = val_probs[desc_score_indices]
+                                 y_true_desc = y_true[desc_score_indices]
+                                 n_pos = np.sum(y_true == 1)
+                                 n_neg = np.sum(y_true == 0)
+                                 tps = np.cumsum(y_true_desc)
+                                 fps = np.cumsum(1 - y_true_desc)
+                                 tpr = tps / n_pos
+                                 fpr = fps / n_neg
+                                 idx = np.searchsorted(tpr, 0.9)
+                                 return float(fpr[idx]) if idx < len(fpr) else 1.0
+                             except:
+                                 return None
+                        return None
+                    elif metric_name in ['spatial_entropy', 'focus', 'posdrop_acc', 'accuracy']:
+                        val = base_meta.get(metric_name)
+                        if val is None and metric_name in ['posdrop_acc', 'accuracy']:
+                            val = baseline.get('accuracy') # Fallback to root
+                        
+                        if isinstance(val, dict):
+                            return val.get('mean')
+                        return val
+                    else:
+                        v = base_meta.get(metric_name)
+                        return v.get('mean', 0) if isinstance(v, dict) else v
+                    return None
+
                 # Z-Score (PAUC)
                 paucs = shuffle_metrics[k]['pauc']
-                # Filter None
                 paucs = [p for p in paucs if p is not None]
                 
-                if paucs:
+                real_pauc = get_real_value('pauc')
+                
+                if paucs and real_pauc is not None:
                     mean_s, std_s = np.mean(paucs), np.std(paucs)
-                    meta = baseline.get('meta_evaluation', baseline)
-                    pauc_data = meta.get('pauc', {})
-                    real_pauc = 0.0
-                    if pauc_data:
-                        val = list(pauc_data.values())[0]
-                        real_pauc = val['mean'] if isinstance(val, dict) and 'mean' in val else val
-                    
                     z_score = (real_pauc - mean_s) / (std_s + 1e-9)
                     config_metrics['z_score'] = float(z_score)
                     config_metrics['pauc'] = {'real': float(real_pauc), 'shuffle_mean': float(mean_s), 'shuffle_std': float(std_s)}
                     logger.log(f"[Target Shuffling] {k}: Z-Score={z_score:.4f} (Real={real_pauc:.4f}, Shuffle={mean_s:.4f}±{std_s:.4f})")
                 else:
                     config_metrics['z_score'] = None
-                    config_metrics['pauc'] = None
+                    config_metrics['pauc'] = {'real': real_pauc} if real_pauc is not None else None
 
-                config_metrics['fde'] = None 
-                
-                for m in ['lift', 'background_rejection', 'posdrop_acc', 'spatial_entropy', 'focus']:
+                # Other Metrics
+                for m in ['lift', 'background_rejection', 'posdrop_acc', 'spatial_entropy', 'focus', 'accuracy', 'fde']:
                     vals = shuffle_metrics[k][m]
                     vals = [v for v in vals if v is not None]
+                    real_val = get_real_value(m)
+                    
+                    metric_entry = {}
+                    if real_val is not None:
+                        if isinstance(real_val, (int, float)):
+                            metric_entry['real'] = float(real_val)
+                        else:
+                            metric_entry['real'] = real_val # Keep as list/object
+                    
                     if vals:
-                        config_metrics[m] = {'mean': float(np.mean(vals)), 'std': float(np.std(vals))}
+                        # Check if values are scalars or lists (curves)
+                        is_list = isinstance(vals[0], (list, np.ndarray))
+                        if is_list:
+                            try:
+                                # Aggregate curves
+                                arr = np.array(vals)
+                                metric_entry['shuffle_mean'] = np.mean(arr, axis=0).tolist()
+                                metric_entry['shuffle_std'] = np.std(arr, axis=0).tolist()
+                            except:
+                                metric_entry['shuffle_mean'] = "Error aggregating lists"
+                                metric_entry['shuffle_std'] = None
+                        else:
+                            metric_entry['shuffle_mean'] = float(np.mean(vals))
+                            metric_entry['shuffle_std'] = float(np.std(vals))
+                        
+                        # For backward compatibility or simple view, set 'mean' to real or shuffle?
+                        # Usually 'mean' implies the result of the method. For Target Shuffling, the "result" is the Z-score or the comparison.
+                        # But to avoid breaking other things, let's keep 'mean' as shuffle_mean? Or maybe Real?
+                        # Let's set 'mean' to Real if available, else shuffle_mean.
+                        # Actually, for Target Shuffling, the "metric" is often the Z-score.
+                        # But for display, we want both.
+                        metric_entry['mean'] = metric_entry.get('real', metric_entry['shuffle_mean'])
+                    
+                    if metric_entry:
+                        config_metrics[m] = metric_entry
                     else:
                         config_metrics[m] = None
 
+                # Explicitly set N/A metrics to None
                 config_metrics['topk'] = None
                 config_metrics['spatial_jaccard'] = None
+                config_metrics['pu_tpr'] = None
+                
                 rigorous_shuffle[k] = config_metrics
             return rigorous_shuffle
 
@@ -1346,9 +1505,11 @@ def execute_unified_session(
                     else:
                         config_stab[m] = None
                 
+                # Explicitly set N/A metrics to None
                 config_stab['z_score'] = None
                 config_stab['fde'] = None
                 config_stab['topk'] = None
+                config_stab['pu_tpr'] = None
 
                 rigorous_stability[k] = config_stab
                 logger.log(f"[Stability Selection] {k}: Jaccard={config_stab['spatial_jaccard']}, Entropy={config_stab['spatial_entropy']}")
